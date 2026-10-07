@@ -8,6 +8,10 @@ The active workflows are `ci.yml` and `fhir-benchmark.yml`. Their existing
 resource-intensive configurations are retained for now; slimming CI and
 adapting the benchmark to Cassandra/PostgreSQL remain follow-up work.
 
+`cassandra-integration.yml` is intentionally empty. Implement its triggers and
+jobs before moving it into `.github/workflows/`; an empty active workflow would
+fail validation.
+
 To restore an inherited workflow, move its YAML file into `.github/workflows/`
 and restore any necessary caller jobs or dependencies. Calls from `ci.yml` to
 HTS conformance, extended CI, and deployment workflows have been removed.
