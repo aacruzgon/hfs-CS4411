@@ -123,6 +123,32 @@ subject where helpful, e.g. `feat(search): ...`.
 When a change only touches documentation or other non-compiled files, include
 `[skip ci]` in the commit message to avoid unnecessary CI builds.
 
+## Dependency Updates
+
+[Dependabot](.github/dependabot.yml) checks for new versions every Monday at
+09:00 in `America/Toronto` once its configuration is merged into `main`.
+It monitors the Cargo workspace, active GitHub Actions, the two browser-test
+packages, CodeMirror's vendoring package, Python tooling in `crates/pysof`,
+the root Dockerfile, and the three Docker Compose environments under `docker/`.
+Cargo and Python checks also include transitive dependencies.
+
+Routine minor and patch updates are grouped by area. Major upgrades and
+security updates are proposed separately, and all update PRs require review
+and the checks appropriate to the affected packages before merging. Dependabot
+opens PRs; it does not merge them or replace the test suite. Dependabot alerts
+and security updates must also be enabled in the repository's security settings;
+security updates run independently of the weekly version-update schedule.
+
+CodeMirror updates require regenerating and committing the checked-in JavaScript
+bundle with the manifest and lockfile changes. Follow the
+[vendoring procedure](crates/ui/vendor/codemirror/README.md#regenerating-the-bundle)
+before merging. For `crates/hts-ui/e2e`, keep both npm and pnpm lockfiles in sync.
+
+Versions embedded in workflow commands or action inputs, manually vendored
+assets without a package manifest, and packages installed inside container
+images still need manual maintenance. Mutable Docker tags do not produce an
+update PR when the image contents change without a tag change.
+
 ## License
 
 By contributing, you agree that your contributions will be licensed under the

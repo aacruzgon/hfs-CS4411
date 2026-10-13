@@ -4,11 +4,22 @@ These inherited workflows are outside the Cassandra project scope and are
 preserved here for reference. GitHub Actions only loads workflows from
 `.github/workflows/`, so the YAML files in this directory do not run.
 
-No workflows are currently active. `ci.yml` and `fhir-benchmark.yml` were
+The standalone `.github/workflows/coverage.yml` workflow is active and runs
+on standard GitHub-hosted Linux runners. It measures the default Rust workspace
+build (R4 / SQLite), excluding `pysof`, generated FHIR models, and SMTP
+integration tests. Optional backend integration coverage is not yet enabled.
+It uploads reports to Codecov using the `CODECOV_TOKEN` repository secret
+(tokenless for fork PRs); no remote Docker host is needed. Install the
+[Codecov GitHub app](https://github.com/apps/codecov) for this repository and
+connect it at [Codecov](https://app.codecov.io/gh/aacruzgon/hfs-CS4411) to finish
+the service setup. Coverage runs on pushes to `main`, pull requests targeting
+`main`, and manual dispatches.
+
+`ci.yml` and `fhir-benchmark.yml` were
 archived as well: every job in them targets `self-hosted` runner labels, and
 `ci.yml` also needs a remote Docker host (`DOCKER_HOST` secret) for
 testcontainers. This fork has neither, so their jobs queued indefinitely.
-Writing CI that runs on GitHub-hosted runners, and adapting the benchmark to
+Broader CI on GitHub-hosted runners, and adapting the benchmark to
 Cassandra/PostgreSQL, remain follow-up work.
 
 `cassandra-integration.yml` is intentionally empty. Implement its triggers and
