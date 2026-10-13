@@ -8,8 +8,8 @@ The standalone `.github/workflows/coverage.yml` workflow is active and runs
 on standard GitHub-hosted Linux runners. It measures the default Rust workspace
 build (R4 / SQLite), excluding `pysof`, generated FHIR models, and SMTP
 integration tests. Optional backend integration coverage is not yet enabled.
-It uploads reports to Codecov using GitHub OIDC (tokenless for fork PRs), so no
-`CODECOV_TOKEN` secret or remote Docker host is needed. Install the
+It uploads reports to Codecov using the `CODECOV_TOKEN` repository secret
+(tokenless for fork PRs); no remote Docker host is needed. Install the
 [Codecov GitHub app](https://github.com/apps/codecov) for this repository and
 connect it at [Codecov](https://app.codecov.io/gh/aacruzgon/hfs-CS4411) to finish
 the service setup. Coverage runs on pushes to `main`, pull requests targeting

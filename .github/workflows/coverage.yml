@@ -27,9 +27,6 @@ jobs:
     name: Rust coverage (R4 / SQLite)
     runs-on: ubuntu-24.04
     timeout-minutes: 90
-    permissions:
-      contents: read
-      id-token: write
     steps:
       - name: Checkout code
         uses: actions/checkout@v5
@@ -75,6 +72,6 @@ jobs:
           files: lcov.info
           disable_search: true
           fail_ci_if_error: true
-          # Fork PRs use Codecov's public-repository tokenless upload support.
-          # Other runs authenticate with GitHub OIDC; no CODECOV_TOKEN secret.
-          use_oidc: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+          # Fork PRs cannot access this secret and use Codecov's public
+          # repository tokenless upload support instead.
+          token: ${{ secrets.CODECOV_TOKEN }}
