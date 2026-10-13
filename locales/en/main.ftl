@@ -151,6 +151,33 @@ tenants-delete-confirm = Deregister tenant "{ $id }"? Its stored data is kept un
 tenants-row-provisioning = Provisioning… this may take a moment.
 tenants-row-failed = Could not provision the tenant.
 tenants-dismiss = Dismiss
+tenants-stat-total-sub-partial = { $count ->
+    [one] { $count } registered · discovery incomplete
+   *[other] { $count } registered · discovery incomplete
+}
+tenants-stat-resources-sub-stale = across all tenants · may be out of date
+tenants-stat-pending = Counting…
+tenants-stat-unavailable = Not available right now
+tenants-stat-unsupported = Not available on this storage
+tenants-counts-pending = Counting resources across tenants…
+tenants-counts-refreshing = Updating resource counts; showing counts from { $time }.
+tenants-counts-ready = Resources counted at { $time }.
+tenants-counts-partial = Resources counted at { $time }, but not every tenant could be checked.
+tenants-counts-stale = Counts from { $time } may be out of date: the latest count failed.
+tenants-counts-unavailable = Resource counts are not available right now.
+tenants-counts-unsupported = This storage cannot count resources per tenant.
+tenants-counts-presence = This storage reports which tenants hold data, not how many resources.
+tenants-counts-approx-pointers = Counts are approximate: storage pointers, deleted resources included.
+tenants-counts-approx-index = Counts come from the search index and may lag recent writes.
+tenants-counts-refresh = Refresh
+tenants-count-pending = Counting…
+tenants-count-unknown = Not known
+tenants-count-unsupported = Not counted on this storage
+tenants-count-unavailable = Count unavailable
+tenants-count-present = has data
+tenants-count-present-note = Holds data; this storage does not count it
+tenants-count-stale = may be out of date
+tenants-count-approx = approximate, not an exact count of live resources
 
 tenant-heading = Tenants
 tenant-all = All tenants
@@ -190,6 +217,8 @@ chart-pending-retry = Retry now
 # #1078: measured, but counted from in-memory write counters rather than an
 # exact storage read. A label, not a warning.
 chart-approximate-note = Approximate: counted from recent writes and still being reconciled with storage.
+chart-approximate-history-note = Approximate: counted from recent writes and still being reconciled with storage. A dashed line shows only the writes recorded since the counters were read from storage; its earlier history is still loading.
+chart-legend-history-loading = history loading
 # #1078: the storage backend cannot count resources at all (e.g. an S3
 # primary). Shown in the chart area; the notice line below explains it.
 chart-counts-unsupported = Resource counts are not available for this storage backend.
@@ -523,13 +552,15 @@ editor-id-exists-confirm = Save new version
 # the confirm shown for in-page closes (a modal, an addbox disclosure).
 unsaved-changes = Unsaved changes
 unsaved-discard-confirm = You have unsaved changes. Discard them and close?
+unsaved-leave-confirm = You have unsaved changes. Discard them and leave this page?
+unsaved-leave-action = Discard and leave
 # The shared in-page confirmation's confirm button (#1667); its cancel
 # button reuses action-cancel.
 confirm-dialog-ok = Confirm
 editor-load-error = Could not load that resource.
 editor-confirm-delete = Delete this resource? This cannot be undone.
 editor-invalid-json = That is not valid JSON, so it cannot be edited as a form. Your text is untouched.
-editor-source-hint = Edit the source directly. Switching back to the guided form parses it.
+editor-source-hint = Edit here or in the guided form: both always show the same document.
 editor-format = Format
 editor-format-title = Format the document (Shift+Alt+F)
 editor-format-invalid = Fix the JSON syntax errors before formatting.
@@ -594,7 +625,6 @@ editor-primitive-extension-hint = This value carries extensions of its own (a `_
 editor-collapse-all = Collapse all
 editor-expand-all = Expand all
 json-view-toggle-fold = Toggle JSON section
-editor-edit-raw = Edit raw
 editor-versions = Versions
 editor-versions-none = No prior versions.
 
@@ -740,6 +770,11 @@ ui-combobox-removed = Removed
 ui-combobox-loading = Loading suggestions…
 ui-combobox-results-updated = Suggestions available:
 ui-combobox-error = Suggestions could not be loaded. Try again.
+ui-combobox-name-now = now { $name }
+ui-combobox-footer-total = { $count } matches · scroll for more
+ui-combobox-footer-more = More matches · scroll for more
+ui-combobox-footer-end = End of results
+ui-combobox-loading-more = Loading more matches…
 editor-orphans-title = These issues have no field yet — add the elements to fix them
 editor-hint-date = FHIR date: YYYY, YYYY-MM, or YYYY-MM-DD
 editor-hint-datetime = FHIR dateTime: YYYY, YYYY-MM, YYYY-MM-DD, or a full timestamp with timezone (2024-05-17T14:30:00+02:00)
@@ -1983,3 +2018,9 @@ auth-bearer-only = Authentication is enabled on this server, but no browser sign
 batch-sign-in-required = This server has no browser sign-in configured, so this page cannot authenticate the request. Set HFS_UI_LOGIN_CLIENT_ID to execute bundles from here.
 batch-too-large = The bundle is larger than this server accepts. Split it into smaller bundles, or raise HFS_MAX_BODY_SIZE on the server.
 batch-connection-dropped = The connection closed before the server answered. If your session has expired, sign in again; the bundle may also be larger than this server accepts.
+
+# SQL Library selection and unavailable collection states (#1884).
+sql-library-select-title = Select a query or view
+sql-library-select-lede = Choose an item from the list or create a new one.
+sql-library-unavailable-title = The selection is unavailable
+sql-library-unavailable-lede = The available queries and views could not be verified.

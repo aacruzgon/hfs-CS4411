@@ -4,7 +4,12 @@
 //! `/export/{job-id}/status`, and GET `/export/{job-id}/{file}` endpoints
 //! using an in-memory SQLite backend and InMemoryController.
 
+#[allow(dead_code)]
+#[path = "common/sof_ordering.rs"]
+mod sof_ordering;
+
 mod sof_export_tests {
+    use super::sof_ordering;
     use axum::http::{HeaderName, StatusCode};
     use axum_test::TestServer;
     use helios_fhir::FhirVersion;
@@ -3725,5 +3730,78 @@ mod sof_export_tests {
             "{}",
             other.text()
         );
+    }
+    #[tokio::test]
+    async fn reference_parameters_export_rejects_unusable_body_entries() {
+        let (server, _backend) = create_test_server_with_export().await;
+        for name in ["patient", "group"] {
+            for value in [
+                json!({"valueReference": {"identifier": {"value": "v"}}}),
+                json!({"valueReference": {"display": "target"}}),
+                json!({"valueReference": {}}),
+                json!({"valueReference": {"reference": ""}}),
+                json!({"valueString": " \t "}),
+                json!({"valueUri": "Patient/p1"}),
+                json!({"valueIdentifier": {"value": "v"}}),
+                json!({"valueInteger": 1}),
+                json!({}),
+                json!({"valueReference": {"reference": " "}, "valueString": "Patient/p1"}),
+            ] {
+                let mut entry = value;
+                entry["name"] = json!(name);
+                let response = submit_export_body_with(&server, entry.clone()).await;
+                assert_eq!(
+                    response.status_code(),
+                    StatusCode::BAD_REQUEST,
+                    "{entry}: {}",
+                    response.text()
+                );
+                let outcome: Value = response.json();
+                assert_eq!(outcome["resourceType"], "OperationOutcome");
+                assert_eq!(outcome["issue"][0]["code"], "invalid");
+                assert!(
+                    outcome["issue"][0]["details"]["text"]
+                        .as_str()
+                        .unwrap()
+                        .contains(name),
+                    "{outcome}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn total_order_export_manifest_shards_sqlite() {
+        let backend = Arc::new(SqliteBackend::with_config(":memory:", Default::default()).unwrap());
+        backend.init_schema().unwrap();
+        let runner = backend.sof_runner().unwrap();
+        let controller = InMemoryController::with_shard_rows(
+            runner.clone(),
+            InMemorySink::new("http://localhost"),
+            None,
+            Some(7),
+        );
+        let config = ServerConfig {
+            base_url: "http://localhost".into(),
+            ..ServerConfig::for_testing()
+        };
+        let state = helios_rest::AppState::new(backend.clone(), config)
+            .with_sof_runner(runner.clone())
+            .with_export_controller(Arc::new(controller));
+        let server =
+            TestServer::new(helios_rest::routing::fhir_routes::create_routes(state)).unwrap();
+        let tenant = test_tenant();
+        let mut fixture = sof_ordering::exact_fixture();
+        fixture.extend(sof_ordering::cell_fixture());
+        let resources = sof_ordering::seed_fixture(backend.as_ref(), &tenant, fixture).await;
+        sof_ordering::export_acceptance(
+            &server,
+            runner.as_ref(),
+            &tenant,
+            "test-tenant",
+            &resources,
+            sof_ordering::ExportOrder::LastUpdatedThenId,
+        )
+        .await;
     }
 }

@@ -1127,6 +1127,8 @@ pub struct ServerConfig {
     /// [`bulk_write_concurrency`] capped by this value: it can lower what a
     /// backend declared it tolerates, never raise it. Raising a backend's
     /// tolerance is a backend setting (connection pool size, for instance).
+    /// A composite reports its primary's value, raised to at least 8 when it
+    /// syncs search synchronously.
     ///
     /// This exists to keep a large batch inside `request_timeout`: entries run
     /// sequentially at a bound of 1, so wall clock is the sum of every entry's
@@ -1336,6 +1338,17 @@ pub struct ServerConfig {
     #[arg(long, env = "HFS_ELASTICSEARCH_REINDEX_REFRESH")]
     pub elasticsearch_reindex_refresh: Option<String>,
 
+    /// Threads that extract search values for one Elasticsearch `$reindex`
+    /// page (the composite deployments' rebuild). `0` (the default) uses
+    /// cores − 1, clamped to 1–4; `1` extracts on the page's own thread, as
+    /// before #1250; an explicit value is capped at 64.
+    #[arg(
+        long,
+        env = "HFS_ELASTICSEARCH_REINDEX_PREPARE_THREADS",
+        default_value = "0"
+    )]
+    pub elasticsearch_reindex_prepare_threads: usize,
+
     /// Page size of the automatic search-index rebuild that runs after a
     /// deferred-indexing bulk import. `POST $reindex` keeps its own
     /// `batchSize` parameter.
@@ -1355,29 +1368,49 @@ pub struct ServerConfig {
     #[arg(long, env = "HFS_REINDEX_BATCH_BYTES", default_value = "33554432")]
     pub reindex_batch_bytes: u64,
 
+    /// Whether the search-index rebuild fetches the next page from the
+    /// primary while the current one is written (`true`, the default), or
+    /// keeps the strictly serial fetch → write loop (`false`). Applies to
+    /// `POST $reindex` and the automatic post-import rebuild alike, on every
+    /// backend whose source allows the overlap: standalone MongoDB and
+    /// `mongo-es` (id phase), and `sqlite-es`, `postgres-es` and `s3-es`,
+    /// where search is offloaded so the page read and the Elasticsearch
+    /// write touch disjoint stores (#1250). `HFS_MONGODB_REINDEX_PREFETCH`
+    /// stays the MongoDB-specific switch underneath.
+    #[arg(
+        long,
+        env = "HFS_REINDEX_PREFETCH",
+        default_value = "true",
+        action = clap::ArgAction::Set,
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    pub reindex_prefetch: bool,
+
     /// Enable SQL-on-FHIR operations ($sql-run, $sql-export).
     /// When enabled, the configured storage backend MUST provide an in-DB
     /// SOF runner (sqlite or postgres) — there is no in-process fallback.
     #[arg(long, env = "HFS_SOF_ENABLED", default_value = "true")]
     pub sof_enabled: bool,
 
-    /// Mount the web UI at `/ui`.
+    /// Mount the web UI at `/ui` and run its dashboard's background work.
     ///
     /// On by default. Headless deployments (behind an API gateway, or anywhere
     /// an HTML surface should not listen at all) opt out with
     /// `HFS_UI_ENABLED=false`; `/ui` and everything under it then answer
     /// `404` + OperationOutcome rather than falling through to the FHIR
-    /// router. This replaces the former `headless` *build* feature, which was
-    /// a negative Cargo feature and so was tripped accidentally by
-    /// `--all-features` (see issue #975).
+    /// router, and the Home dashboard performs no startup seed or background
+    /// reconcile storage reads. This replaces the former `headless` *build*
+    /// feature, which was a negative Cargo feature and so was tripped
+    /// accidentally by `--all-features` (see issue #975).
     ///
-    /// Has no effect on a binary built without the `ui` feature — there the UI
-    /// is not compiled in at all and `/ui` always answers `404`.
+    /// A `hfs` binary built without the `ui` feature normalizes this flag to
+    /// `false`: `/ui` always answers `404`, and dashboard background work is
+    /// skipped. The shared REST configuration's default remains `true`.
     #[arg(long, env = "HFS_UI_ENABLED", default_value = "true")]
     pub ui_enabled: bool,
 
     /// Seconds between the web UI dashboard's background reconcile passes
-    /// (#1078).
+    /// (#1078). Used only when the web UI is served.
     ///
     /// Each pass re-reads the per-type totals of the tenants that are due and
     /// re-seeds their charted history, so the dashboard's in-memory counters
@@ -1661,9 +1694,11 @@ impl Default for ServerConfig {
             elasticsearch_request_timeout_ms: 30_000,
             elasticsearch_bulk_max_bytes: 10 * 1024 * 1024,
             elasticsearch_bulk_concurrency: 1,
+            elasticsearch_reindex_prepare_threads: 0,
             elasticsearch_reindex_refresh: None,
             reindex_batch_size: 1000,
             reindex_batch_bytes: 32 * 1024 * 1024,
+            reindex_prefetch: true,
             sof_enabled: true,
             ui_enabled: true,
             dashboard_reconcile_interval_secs: 30,
@@ -1942,9 +1977,11 @@ impl ServerConfig {
             elasticsearch_request_timeout_ms: 30_000,
             elasticsearch_bulk_max_bytes: 10 * 1024 * 1024,
             elasticsearch_bulk_concurrency: 1,
+            elasticsearch_reindex_prepare_threads: 0,
             elasticsearch_reindex_refresh: None,
             reindex_batch_size: 1000,
             reindex_batch_bytes: 32 * 1024 * 1024,
+            reindex_prefetch: true,
             sof_enabled: true,
             ui_enabled: true,
             dashboard_reconcile_interval_secs: 30,
@@ -2595,6 +2632,10 @@ mod tests {
             assert_eq!(config.elasticsearch_reindex_refresh, None);
             assert_eq!(config.reindex_batch_size, 1000);
             assert_eq!(config.reindex_batch_bytes, 32 * 1024 * 1024);
+            assert!(
+                config.reindex_prefetch,
+                "HFS_REINDEX_PREFETCH is on by default (#1250)"
+            );
             assert_eq!(config.elasticsearch_bulk_concurrency, 1);
         }
     }
@@ -2621,6 +2662,8 @@ mod tests {
             "false",
             "--reindex-batch-size",
             "250",
+            "--reindex-prefetch",
+            "off",
         ])
         .unwrap();
         assert_eq!(parsed.elasticsearch_request_timeout_ms, 120_000);
@@ -2630,12 +2673,14 @@ mod tests {
             Some("false")
         );
         assert_eq!(parsed.reindex_batch_size, 250);
+        assert!(!parsed.reindex_prefetch);
         assert!(parsed.validate().is_ok());
 
         for (flag, value) in [
             ("--elasticsearch-request-timeout-ms", "soon"),
             ("--elasticsearch-bulk-max-bytes", "-1"),
             ("--reindex-batch-size", "many"),
+            ("--reindex-prefetch", "sideways"),
         ] {
             assert!(
                 ServerConfig::try_parse_from(["rest-server", flag, value]).is_err(),

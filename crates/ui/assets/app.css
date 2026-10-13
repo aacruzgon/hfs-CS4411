@@ -165,6 +165,10 @@
   --surface: linear-gradient(180deg, #fafafa 0%, #f8f8f8 100%);
   --surface-border: #eaeaea;
   --surface-shadow: 0 4px 4px rgb(0 0 0 / 3%);
+  /* Floating panels that open over a card: one step above --surface. */
+  --popover: #ffffff;
+  --popover-border: #d6d6d6;
+  --popover-shadow: 0 16px 40px rgb(0 0 0 / 16%), 0 2px 8px rgb(0 0 0 / 8%);
   /* Text */
   --text: #101010;
   --text-strong: #000000;
@@ -289,6 +293,10 @@
   --bg-content: #1d1d1d;
   --surface: linear-gradient(180deg, #222222 0%, #242424 100%);
   --surface-border: rgb(255 255 255 / 8%);
+  /* Floating panels that open over a card: one step above --surface. */
+  --popover: #2e2e2e;
+  --popover-border: rgb(255 255 255 / 16%);
+  --popover-shadow: 0 16px 40px rgb(0 0 0 / 60%), 0 2px 8px rgb(0 0 0 / 40%);
   --text: #ffffff;
   --text-strong: #ffffff;
   /* On the dark surfaces the lighter grey already clears 4.5:1; keep it (the
@@ -1271,13 +1279,26 @@ button.pill {
   outline-offset: 1px;
 }
 
-/* Series palette: slot N styles both the polyline and its legend dot. */
-.chart .series--1 { stroke: var(--series-1); }
-.chart .series--2 { stroke: var(--series-2); }
-.chart .series--3 { stroke: var(--series-3); }
-.chart .series--4 { stroke: var(--series-4); }
-.chart .series--5 { stroke: var(--series-5); }
-.chart .series--6 { stroke: var(--series-6); }
+/* A series whose history is still loading (#1603): only the buckets its
+   counters recorded are drawn, dashed, and its current point is marked so a
+   lone bucket is still visible. Nothing is drawn where nothing was measured. */
+.chart .series--partial { stroke-dasharray: 6 4; }
+.chart .series-end { stroke: none; fill: currentColor; }
+
+/* Series palette: slot N styles the polyline, its end marker (via color) and
+   its legend dot. */
+.chart .series--1 { stroke: var(--series-1); color: var(--series-1); }
+.chart .series--2 { stroke: var(--series-2); color: var(--series-2); }
+.chart .series--3 { stroke: var(--series-3); color: var(--series-3); }
+.chart .series--4 { stroke: var(--series-4); color: var(--series-4); }
+.chart .series--5 { stroke: var(--series-5); color: var(--series-5); }
+.chart .series--6 { stroke: var(--series-6); color: var(--series-6); }
+
+.chart-legend__loading {
+  font-size: 0.8em;
+  color: var(--muted);
+  font-style: italic;
+}
 
 .chart-legend__dot {
   width: 8px;
@@ -1987,6 +2008,49 @@ body:has(.run-busy:not([hidden])) #run-notice > * {
   font-family: "IBM Plex Mono", ui-monospace, Consolas, monospace;
   font-size: 12px;
   color: var(--muted);
+}
+
+/* The Tenants resources column (#1851) reserves room for its widest cell:
+   a compact figure ("≈842.1K") or the presence label on storage that only
+   reports which tenants hold data (de "enthält Daten", 13 characters). So a
+   cell turning from "…" into its value never shifts the columns beside it. */
+#tenant-rows .data-table .col-num {
+  width: 14ch;
+  white-space: nowrap;
+}
+
+/* A resources cell with something to say beyond its figure: pending,
+   unknown, unsupported, unavailable, presence only, approximate or stale.
+   The dotted underline marks the title that says which; screen readers hear
+   it in place of the glyph. */
+.count-note {
+  text-decoration: underline dotted;
+  text-underline-offset: 3px;
+  cursor: help;
+}
+
+.count-note--muted {
+  color: var(--muted);
+}
+
+.count-note--error {
+  color: var(--danger);
+}
+
+/* The count status line between the toolbar and the table (#1851): the
+   counts' state, as-of time and provenance. Deliberately not .busy-status,
+   which belongs to the provisioning rows. A reserved line height keeps the
+   table still when its text changes. */
+.counts-status {
+  min-height: 20px;
+  margin: 0 0 12px;
+  font-size: 13px;
+  line-height: 20px;
+  color: var(--muted);
+}
+
+.counts-status__refresh {
+  margin-left: 8px;
 }
 
 }
@@ -5042,23 +5106,11 @@ tr:hover .result-id__copy,
 }
 
 /* The JSON card hands the height it was stretched to (above) to its content,
-   so the raw textarea fills the card instead of leaving a blank band under
-   the hint when the guided form is the taller of the two (#1648).
-   `:not([hidden])` because a `display` here would otherwise override the
-   `hidden` attribute the Edit raw toggle relies on. */
+   so the editor fills the card instead of leaving a blank band under the
+   hint when the guided form is the taller of the two (#1648). */
 .editor-json {
   display: flex;
   flex-direction: column;
-}
-
-.editor-json__raw:not([hidden]) {
-  display: flex;
-  flex: 1 1 auto;
-  flex-direction: column;
-}
-
-.editor-json__raw .editor__source {
-  flex: 1 1 auto;
 }
 
 /* View Definitions' editor + guided-form pairing (#843): the two cards grow
@@ -5261,16 +5313,8 @@ details.card > summary.card-head::-webkit-details-marker {
   overflow: visible;
 }
 
-/* Form ↔ JSON cross-highlight (editor-sync.js): hovering or focusing a form
+/* Form ↔ JSON cross-highlight (editor-pair.js): hovering or focusing a form
    row lights the JSON lines that hold that node, and vice versa. */
-.json-line--hit {
-  background: var(--accent-soft);
-}
-
-.json-line[data-jpath] .json-line__code {
-  cursor: pointer;
-}
-
 .editor-row--hit {
   background: var(--accent-soft);
   border-radius: 8px;
@@ -5790,9 +5834,14 @@ details.card > summary.card-head::-webkit-details-marker {
 
 /* ---- source view & validity rail ---- */
 
-.editor__source {
-  width: 100%;
-  min-height: 460px;
+/* The JSON pane's plain textarea (#1756): visible only when the code editor
+   did not mount (no bundle, or JavaScript off), where it is the pane. Same
+   footprint as the mounted editor (`.code-editor--resource`). */
+.editor-json__source {
+  flex: 1 1 auto;
+  min-height: 320px;
+  max-height: 70vh;
+  margin: 0 14px;
   padding: 12px;
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 12px;
@@ -5805,48 +5854,8 @@ details.card > summary.card-head::-webkit-details-marker {
   resize: vertical;
 }
 
-/* Raw-mode highlight (editor-sync.js): a mirror <pre> sits behind the
-   textarea with identical metrics; its text is invisible and only the <mark>
-   around the hovered node's range shows through the textarea, whose own
-   background goes transparent while the mirror is present. */
-.editor-json__raw {
-  position: relative;
-}
-
-.editor-json__raw--mirrored .editor__source {
-  position: relative;
-  z-index: 1;
-  background: transparent;
-}
-
-.editor__source-mirror {
-  position: absolute;
-  top: 0;
-  left: 0;
-  width: 100%;
-  height: 100%;
-  margin: 0;
-  pointer-events: none;
-  padding: 12px;
-  box-sizing: border-box;
-  overflow: hidden;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  font-size: 12px;
-  line-height: 1.5;
-  white-space: pre-wrap;
-  overflow-wrap: break-word;
-  word-break: normal;
-  color: transparent;
-  background: var(--input-bg);
-  border: 1px solid transparent;
-  border-radius: 10px;
-}
-
-.editor__source-mirror mark {
-  color: transparent;
-  background: var(--accent-soft);
-  border-radius: 3px;
-  box-shadow: 0 0 0 2px var(--accent-soft);
+.editor-json__source:focus-visible {
+  border-color: var(--accent);
 }
 
 .editor__source-hint {
@@ -5855,11 +5864,11 @@ details.card > summary.card-head::-webkit-details-marker {
   color: var(--muted);
 }
 
-/* In the Resource Editor's raw pane the hint is a direct child of a card with
-   no padding of its own, so it needs the card's inset (`.card-head`'s 14px)
-   to clear the border and the rounded corner (#1648). The SQL pages' hints
-   sit inside a padded `.card__body` and keep the rule above. */
-.editor-json__raw .editor__source-hint {
+/* In the Resource Editor's JSON pane the hint is a direct child of a card
+   with no padding of its own, so it needs the card's inset (`.card-head`'s
+   14px) to clear the border and the rounded corner (#1648). The SQL pages'
+   hints sit inside a padded `.card__body` and keep the rule above. */
+.editor-json .editor__source-hint {
   margin: 8px 14px 12px;
 }
 
@@ -6846,10 +6855,11 @@ details.card > summary.card-head::-webkit-details-marker {
   max-height: 280px;
   padding: 5px;
   overflow-y: auto;
-  border: 1px solid var(--surface-border);
+  overscroll-behavior: contain;
+  border: 1px solid var(--popover-border);
   border-radius: 10px;
-  background: var(--surface);
-  box-shadow: 0 12px 30px rgb(0 0 0 / 12%);
+  background: var(--popover);
+  box-shadow: var(--popover-shadow);
 }
 
 .combobox__message:not([hidden]) {
@@ -6877,6 +6887,72 @@ details.card > summary.card-head::-webkit-details-marker {
 
 .combobox__option[aria-selected="true"] {
   color: var(--muted);
+}
+
+/* Fixed choices share the lookup popup, with an enduring selection marker
+   independent of the keyboard's active option. */
+.combobox__trigger {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  cursor: pointer;
+  text-align: left;
+}
+.combobox__chevron {
+  display: flex;
+  flex-shrink: 0;
+  width: 16px;
+  height: 16px;
+  color: var(--muted);
+}
+.combobox__chevron svg { width: 100%; height: 100%; }
+.combobox--fixed .combobox__option {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.combobox--fixed .combobox__option[aria-selected="true"] {
+  color: var(--text-strong);
+  font-weight: 600;
+}
+.combobox--fixed .combobox__option[aria-selected="true"]::after {
+  content: "✓";
+  color: var(--accent-text);
+}
+
+/* The words of a Patient name the query matched. --accent-text is the
+   AA-contrast accent on both themes (the plain --accent is not on light). */
+.combobox__match {
+  background: none;
+  color: var(--accent-text);
+  font-weight: 600;
+}
+
+/* Pinned under the scrolled options; the negative offsets cancel the
+   listbox's own 5px padding so it sits flush with the edges. */
+.combobox__footer {
+  position: sticky;
+  bottom: -5px;
+  margin: 0 -5px -5px;
+  padding: 7px 12px;
+  border-top: 1px solid var(--popover-border);
+  background: var(--popover);
+  color: var(--muted);
+  font-size: 12px;
+}
+
+/* Page load in flight: spinner + label (#1755). */
+.combobox__footer--loading {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* Infinite-scroll sentinel — the page script observes it. */
+.combobox__more {
+  height: 1px;
 }
 
 .combobox__chip {
@@ -7511,10 +7587,8 @@ body.app-shell .pane {
 
 /* Row -> editor cross-highlight (#843, vd-editor.js): a CodeMirror line
    decoration (its own `cm-line` wrapper gains this class alongside), the
-   same `--accent-soft` wash `.json-line--hit`/`.editor-row--hit` below use
-   for the Resource Editor's own JSON<->form link — View Definitions' JSON
-   pane is CodeMirror, with no server-rendered `.json-line[data-jpath]` to
-   paint instead. */
+   same `--accent-soft` wash `.editor-row--hit` uses for the form side of the
+   JSON<->form link. */
 .code-editor .cm-line--hit {
   background: var(--accent-soft);
 }
@@ -8008,6 +8082,26 @@ body.app-shell .pane {
 .editor__grid--stretch .editor__doc textarea.json-editor {
   flex: 1;
   max-height: none;
+}
+
+/* The Resource Editor's JSON pane (#1756, page and Resources modal): the code
+   editor fills the body of the `.editor-json` card — inset like the card's
+   header — at the footprint the read-only view had: at least 320px, at most
+   ~70vh, scrolling inside itself (`.cm-scroller`), never the page. The card is
+   stretched to the guided form's height by the grid, so `height: 100%` lets
+   the editor take whatever that is up to the cap. Unlayered, beside the
+   `.cm-editor` rules it overrides. */
+.editor-json .code-editor--resource {
+  flex: 1 1 auto;
+  width: auto;
+  min-height: 0;
+  margin: 0 14px;
+}
+
+.editor-json .code-editor--resource .cm-editor {
+  height: 100%;
+  min-height: 320px;
+  max-height: 70vh;
 }
 
 /* ---------------------------------------------------------------------------

@@ -7,7 +7,7 @@
 use std::collections::VecDeque;
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 
@@ -22,7 +22,8 @@ use crate::core::{DailyResourceCount, PurgableStorage, ResourceStorage, WriteMar
 use crate::error::{BackendError, ResourceError, StorageError, StorageResult};
 use crate::search::converters::IndexValue;
 use crate::search::extractor::ExtractedValue;
-use crate::search::reindex::{ReindexSource, ReindexTarget, ResourcePage};
+use crate::search::reindex::{ReindexPageStats, ReindexSource, ReindexTarget, ResourcePage};
+use crate::search::reindex_prepare::{PrepareEnv, extract_range, tokio_multi_thread_runtime};
 use crate::search::{DateEnd, FhirDateValue, StorageResolution, indexed_end};
 use crate::tenant::{Operation, TenantContext};
 use crate::types::{DatePrecision, StoredResource};
@@ -38,6 +39,10 @@ use super::search_impl::{
 /// budget ([`ElasticsearchConfig::bulk_max_bytes`](super::backend::ElasticsearchConfig::bulk_max_bytes)).
 /// Small resources hit this count first, so a load does not pay one refresh
 /// wait per handful of documents; large ones hit the byte budget first (#1125).
+/// Smallest page the writer sends to the prepare pool (#1250); below it
+/// the pool's hand-off costs more than the extraction it would spread.
+const REINDEX_POOL_MIN_PAGE: usize = 16;
+
 const BULK_OPS_PER_REQUEST: usize = 500;
 
 /// Upper bound on resource IDs per delete-by-query in a resource-scoped clear
@@ -436,11 +441,19 @@ fn merge_composite_component(entry: &mut Value, origin: ValueOrigin<'_>, value: 
     }
 }
 
+/// The search document for one stored resource. `last_updated` is the
+/// resource's own `meta.lastUpdated` instant — the one the primary store
+/// holds and the one `_lastUpdated` searches and sorts answer from — never
+/// the time the document is built: the same builder serves the write paths
+/// and the `$reindex` page writer, and indexing the build time made every
+/// resource of a rebuilt type look modified at the rebuild (#1593).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_es_document(
     tenant_id: &str,
     resource_type: &str,
     resource_id: &str,
     version_id: &str,
+    last_updated: DateTime<Utc>,
     content: &Value,
     fhir_version: FhirVersion,
     extracted_values: &[ExtractedValue],
@@ -597,7 +610,7 @@ pub(crate) fn build_es_document(
         "resource_id": resource_id,
         "tenant_id": tenant_id,
         "version_id": version_id,
-        "last_updated": Utc::now().to_rfc3339(),
+        "last_updated": last_updated.to_rfc3339(),
         "fhir_version": fhir_version.as_mime_param(),
         "is_deleted": false,
         "content": content,
@@ -636,6 +649,7 @@ pub(crate) fn build_es_contained_document(
     local_id: &str,
     contained_content: &Value,
     version_id: &str,
+    last_updated: DateTime<Utc>,
     fhir_version: FhirVersion,
     extracted_values: &[ExtractedValue],
 ) -> Value {
@@ -645,6 +659,7 @@ pub(crate) fn build_es_contained_document(
         contained_type,
         &synthetic_id,
         version_id,
+        last_updated,
         contained_content,
         fhir_version,
         extracted_values,
@@ -1004,6 +1019,7 @@ impl ElasticsearchBackend {
         resource: &Value,
         fhir_version: FhirVersion,
         version_id: &str,
+        last_updated: DateTime<Utc>,
         delete_first: bool,
     ) -> StorageResult<()> {
         if delete_first {
@@ -1020,6 +1036,7 @@ impl ElasticsearchBackend {
                 &contained.local_id,
                 &contained.content,
                 version_id,
+                last_updated,
                 fhir_version,
                 &contained.values,
             );
@@ -1099,12 +1116,15 @@ impl ResourceStorage for ElasticsearchBackend {
             .extract(&resource, resource_type)
             .unwrap_or_default();
 
-        // Build ES document
+        // The resource's instant: indexed as `last_updated` and returned as
+        // the stored resource's `meta.lastUpdated`, so the two agree (#1593).
+        let now = Utc::now();
         let doc = build_es_document(
             tenant_id,
             resource_type,
             &id,
             version_id,
+            now,
             &resource,
             fhir_version,
             &extracted_values,
@@ -1141,12 +1161,12 @@ impl ResourceStorage for ElasticsearchBackend {
                 &resource,
                 fhir_version,
                 version_id,
+                now,
                 false,
             )
             .await?;
         }
 
-        let now = Utc::now();
         Ok(StoredResource::from_storage(
             resource_type,
             &id,
@@ -1198,6 +1218,10 @@ impl ResourceStorage for ElasticsearchBackend {
         let tenant_id = tenant.tenant_id().as_str();
         let version_id = "1";
         let extractor = self.tenant_extractor(tenant_id);
+        // One instant for the batch: indexed as every document's
+        // `last_updated` and returned as each stored resource's
+        // `meta.lastUpdated` (#1593).
+        let now = Utc::now();
 
         // Every document each resource contributes — its own, plus one per
         // `contained` entry — addressed by (index, doc id). Built up front so
@@ -1235,6 +1259,7 @@ impl ResourceStorage for ElasticsearchBackend {
                         resource_type,
                         &id,
                         version_id,
+                        now,
                         &resource,
                         fhir_version,
                         &extracted_values,
@@ -1256,6 +1281,7 @@ impl ResourceStorage for ElasticsearchBackend {
                             &contained.local_id,
                             &contained.content,
                             version_id,
+                            now,
                             fhir_version,
                             &contained.values,
                         ),
@@ -1295,7 +1321,6 @@ impl ResourceStorage for ElasticsearchBackend {
             .send_bulk_index(&ops, prepared.len(), self.write_refresh_param())
             .await;
 
-        let now = Utc::now();
         prepared
             .into_iter()
             .zip(failures)
@@ -1405,11 +1430,15 @@ impl ResourceStorage for ElasticsearchBackend {
             .extract(&resource, resource_type)
             .unwrap_or_default();
 
+        // The resource's instant: indexed as `last_updated` and returned as
+        // the stored resource's `meta.lastUpdated`, so the two agree (#1593).
+        let now = Utc::now();
         let doc = build_es_document(
             tenant_id,
             resource_type,
             id,
             &version_id,
+            now,
             &resource,
             fhir_version,
             &extracted_values,
@@ -1437,11 +1466,11 @@ impl ResourceStorage for ElasticsearchBackend {
             &resource,
             fhir_version,
             &version_id,
+            now,
             true,
         )
         .await?;
 
-        let now = Utc::now();
         Ok((
             StoredResource::from_storage(
                 resource_type,
@@ -1540,11 +1569,15 @@ impl ResourceStorage for ElasticsearchBackend {
             .extract(&resource, resource_type)
             .unwrap_or_default();
 
+        // The resource's instant: indexed as `last_updated` and returned as
+        // the stored resource's `meta.lastUpdated`, so the two agree (#1593).
+        let now = Utc::now();
         let doc = build_es_document(
             tenant_id,
             resource_type,
             id,
             &version_id,
+            now,
             &resource,
             fhir_version,
             &extracted_values,
@@ -1575,11 +1608,11 @@ impl ResourceStorage for ElasticsearchBackend {
             &resource,
             fhir_version,
             &version_id,
+            now,
             true,
         )
         .await?;
 
-        let now = Utc::now();
         Ok(StoredResource::from_storage(
             resource_type,
             id,
@@ -1672,8 +1705,9 @@ impl ResourceStorage for ElasticsearchBackend {
     /// Every stored resource of the tenant, counted per type in one
     /// aggregation over the tenant's indices — what the dashboard needs from
     /// a composite whose primary keeps no counts (#1280). Contained documents
-    /// are synthetic copies and do not count; a tenant with no indices is an
-    /// empty list, a failed request an error, never zeros (#1364).
+    /// are synthetic copies and do not count; a tenant with no indices — the
+    /// cluster's zero-shard 200 for a glob that matches nothing (#1906), or a
+    /// 404 — is an empty list, a failed request an error, never zeros (#1364).
     async fn count_all_types(&self, tenant: &TenantContext) -> StorageResult<Vec<(String, u64)>> {
         let tenant_id = tenant.tenant_id().as_str();
         let pattern = tenant_index_pattern(self, tenant_id);
@@ -1682,7 +1716,7 @@ impl ResourceStorage for ElasticsearchBackend {
             "query": stored_documents_of(tenant_id),
             "aggs": { "types": { "terms": { "field": "resource_type", "size": 1000 } } }
         });
-        let Some(body) = send_read_with_retry(self, ReadOp::Search, &pattern, body).await? else {
+        let Some(body) = send_aggregation_search(self, &pattern, body).await? else {
             return Ok(Vec::new());
         };
         aggregation_buckets(&body, "types")?
@@ -1700,8 +1734,15 @@ impl ResourceStorage for ElasticsearchBackend {
         true
     }
 
+    fn type_count_basis(&self) -> Option<crate::core::CountBasis> {
+        // Index documents, exact relative to the index only: it may lag or
+        // omit the primary store (#1518, #1850).
+        Some(crate::core::CountBasis::IndexedLiveDocuments)
+    }
+
     /// Stored resources of `resource_type` per UTC day of their `last_updated`
     /// — the day of each resource's current version, as the contract asks.
+    /// A missing index is an empty list (its 404 is read as such).
     async fn count_by_day(
         &self,
         tenant: &TenantContext,
@@ -1724,7 +1765,10 @@ impl ResourceStorage for ElasticsearchBackend {
                 "min_doc_count": 1
             } } }
         });
-        let Some(body) = send_read_with_retry(self, ReadOp::Search, &index, body).await? else {
+        // The concrete index never answers zero shards on a real cluster (a
+        // missing one is a 404, a closed one an error); the wrapper keeps this
+        // read uniform with the glob reads should one ever do so (#1906).
+        let Some(body) = send_aggregation_search(self, &index, body).await? else {
             return Ok(Vec::new());
         };
         aggregation_buckets(&body, "days")?
@@ -1748,7 +1792,9 @@ impl ResourceStorage for ElasticsearchBackend {
 
     /// The newest `last_updated` across the tenant's documents, plus how many
     /// were written since `recent_since` when asked — one aggregation request
-    /// over the tenant's indices, no scan.
+    /// over the tenant's indices, no scan. A tenant with no indices — the
+    /// cluster's zero-shard 200 for a glob that matches nothing (#1906), or a
+    /// 404 — has no latest write and, when asked, `0` recent ones.
     async fn latest_write_marker(
         &self,
         tenant: &TenantContext,
@@ -1769,7 +1815,7 @@ impl ResourceStorage for ElasticsearchBackend {
             }},
             "aggs": aggs
         });
-        let Some(body) = send_read_with_retry(self, ReadOp::Search, &pattern, body).await? else {
+        let Some(body) = send_aggregation_search(self, &pattern, body).await? else {
             return Ok(Some(WriteMarker {
                 latest: None,
                 recent_writes: recent_since.map(|_| 0),
@@ -2419,10 +2465,30 @@ impl ReindexTarget for ElasticsearchBackend {
     /// Under `refresh=wait_for` the saving is larger still: that policy blocks
     /// each write until the next scheduled refresh, so per-document writes cost
     /// one refresh wait each while a bulk request costs one for the page.
+    /// Delegates to [`Self::write_search_entries_page_timed`] with a
+    /// throwaway `ReindexPageStats`, as the trait requires, so the driver's
+    /// path and the composite ingest sink's never diverge.
     async fn write_search_entries_page(
         &self,
         tenant: &TenantContext,
         resources: &[StoredResource],
+    ) -> Vec<StorageResult<usize>> {
+        let mut stats = ReindexPageStats::default();
+        self.write_search_entries_page_timed(tenant, resources, &mut stats)
+            .await
+    }
+
+    /// One page: extract every resource's documents (on the prepare pool
+    /// when the page is large enough and the runtime allows, #1250), make
+    /// sure each index touched exists, then send the documents in `_bulk`
+    /// requests. `stats.extract` is the extraction, `stats.insert` the
+    /// `_bulk` round trips, `inserted_entries` the documents sent;
+    /// `pool_sub_batches` says whether the page ran on the pool.
+    async fn write_search_entries_page_timed(
+        &self,
+        tenant: &TenantContext,
+        resources: &[StoredResource],
+        stats: &mut ReindexPageStats,
     ) -> Vec<StorageResult<usize>> {
         if resources.is_empty() {
             return Vec::new();
@@ -2431,78 +2497,103 @@ impl ReindexTarget for ElasticsearchBackend {
         let extractor = self.tenant_extractor(tenant_id);
 
         // Every document each resource contributes, plus the value count its
-        // successful outcome reports.
+        // successful outcome reports and the index types it touched.
         struct Prepared {
             values: usize,
             docs: Vec<(String, String, Value)>,
             failure: Option<String>,
+            types: Vec<String>,
         }
-        let mut types_touched: Vec<String> = Vec::new();
-        let prepared: Vec<Prepared> = resources
-            .iter()
-            .map(|resource| {
-                let resource_type = resource.resource_type();
-                let id = resource.id();
-                let content = resource.content();
-                let fhir_version = resource.fhir_version();
-                let extracted_values = match extractor.extract(content, resource_type) {
-                    Ok(values) => values,
-                    Err(e) => {
-                        return Prepared {
-                            values: 0,
-                            docs: Vec::new(),
-                            failure: Some(format!("Search parameter extraction failed: {e}")),
-                        };
-                    }
-                };
-                types_touched.push(resource_type.to_string());
-                let mut docs = vec![(
-                    self.index_name(tenant_id, resource_type),
-                    Self::document_id(resource_type, id),
-                    build_es_document(
+        let prepare = |i: usize| -> Prepared {
+            let resource = &resources[i];
+            let resource_type = resource.resource_type();
+            let id = resource.id();
+            let content = resource.content();
+            let fhir_version = resource.fhir_version();
+            let extracted_values = match extractor.extract(content, resource_type) {
+                Ok(values) => values,
+                Err(e) => {
+                    return Prepared {
+                        values: 0,
+                        docs: Vec::new(),
+                        failure: Some(format!("Search parameter extraction failed: {e}")),
+                        types: Vec::new(),
+                    };
+                }
+            };
+            let mut types = vec![resource_type.to_string()];
+            let mut docs = vec![(
+                self.index_name(tenant_id, resource_type),
+                Self::document_id(resource_type, id),
+                build_es_document(
+                    tenant_id,
+                    resource_type,
+                    id,
+                    resource.version_id(),
+                    resource.last_modified(),
+                    content,
+                    fhir_version,
+                    &extracted_values,
+                ),
+            )];
+            for contained in extractor.extract_contained(content) {
+                types.push(contained.contained_type.clone());
+                docs.push((
+                    self.index_name(tenant_id, &contained.contained_type),
+                    Self::document_id(
+                        &contained.contained_type,
+                        &contained_resource_id(id, &contained.local_id),
+                    ),
+                    build_es_contained_document(
                         tenant_id,
                         resource_type,
                         id,
+                        &contained.contained_type,
+                        &contained.local_id,
+                        &contained.content,
                         resource.version_id(),
-                        content,
+                        resource.last_modified(),
                         fhir_version,
-                        &extracted_values,
+                        &contained.values,
                     ),
-                )];
-                for contained in extractor.extract_contained(content) {
-                    types_touched.push(contained.contained_type.clone());
-                    docs.push((
-                        self.index_name(tenant_id, &contained.contained_type),
-                        Self::document_id(
-                            &contained.contained_type,
-                            &contained_resource_id(id, &contained.local_id),
-                        ),
-                        build_es_contained_document(
-                            tenant_id,
-                            resource_type,
-                            id,
-                            &contained.contained_type,
-                            &contained.local_id,
-                            &contained.content,
-                            resource.version_id(),
-                            fhir_version,
-                            &contained.values,
-                        ),
-                    ));
-                }
-                Prepared {
-                    values: extracted_values.len(),
-                    docs,
-                    failure: None,
-                }
-            })
-            .collect();
+                ));
+            }
+            Prepared {
+                values: extracted_values.len(),
+                docs,
+                failure: None,
+                types,
+            }
+        };
+
+        // Extraction is pure CPU and, page after page, what HFS spends its
+        // one busy core on during a rebuild (#1250). A page of at least
+        // `REINDEX_POOL_MIN_PAGE` resources on a multi-thread runtime goes to
+        // the prepare pool, in input order; anything smaller, a
+        // current-thread runtime, a width-1 configuration or a pool already
+        // busy with another page extracts inline, exactly as before.
+        let n = resources.len();
+        let multi_thread = tokio_multi_thread_runtime();
+        self.log_reindex_writer_configuration(multi_thread);
+        let started = Instant::now();
+        let (prepared, on_pool) = if multi_thread && n >= REINDEX_POOL_MIN_PAGE {
+            let env = PrepareEnv {
+                pool: self.reindex_prepare_pool(),
+                gate: self.reindex_prepare_gate(),
+            };
+            extract_range(&env, 0..n, &prepare)
+        } else {
+            ((0..n).map(&prepare).collect(), false)
+        };
+        stats.extract += started.elapsed();
+        stats.sub_batches += 1;
+        stats.pool_sub_batches += u64::from(on_pool);
 
         // Ensure every index touched exists, once each — not once per resource.
         let mut ensured = std::collections::HashSet::new();
-        for ty in types_touched {
-            if ensured.insert(ty.clone())
-                && let Err(e) = schema::ensure_index(self, tenant_id, &ty).await
+        for ty in prepared.iter().flat_map(|p| p.types.iter()) {
+            if ensured.insert(ty.as_str())
+                && let Err(e) = schema::ensure_index(self, tenant_id, ty).await
             {
                 // Keep whether it was an outage: the rebuild retries an
                 // unreachable cluster, not a rejected resource (#1125).
@@ -2530,9 +2621,14 @@ impl ReindexTarget for ElasticsearchBackend {
                     .map(move |(index, doc_id, doc)| (i, index.as_str(), doc_id.as_str(), doc))
             })
             .collect();
+        let documents = ops.len() as u64;
+        let send_started = Instant::now();
         let failures = self
             .send_bulk_index(&ops, prepared.len(), self.reindex_refresh_param())
             .await;
+        stats.insert += send_started.elapsed();
+        stats.inserted_entries += documents;
+        stats.db_wait = Some(stats.insert);
 
         prepared
             .into_iter()
@@ -2566,14 +2662,16 @@ impl ReindexTarget for ElasticsearchBackend {
             .extract(content, resource_type)
             .map_err(|e| internal_error(format!("Search parameter extraction failed: {e}")))?;
 
-        // The document carries version_id and fhir_version, neither of which is
-        // recoverable from the resource JSON — which is why ReindexTarget hands
-        // over the whole StoredResource rather than just its content.
+        // The document carries version_id, last_updated and fhir_version, none
+        // of which is recoverable from the resource JSON — which is why
+        // ReindexTarget hands over the whole StoredResource rather than just
+        // its content.
         let doc = build_es_document(
             tenant_id,
             resource_type,
             resource_id,
             resource.version_id(),
+            resource.last_modified(),
             content,
             fhir_version,
             &extracted_values,
@@ -2601,6 +2699,7 @@ impl ReindexTarget for ElasticsearchBackend {
             content,
             fhir_version,
             resource.version_id(),
+            resource.last_modified(),
             true,
         )
         .await?;
@@ -2849,18 +2948,84 @@ fn bucket_doc_count(bucket: &Value) -> StorageResult<u64> {
         .ok_or_else(|| internal_error(format!("Aggregation bucket carries no doc_count: {bucket}")))
 }
 
+/// Whether a 2xx search answer is the cluster saying it searched nothing: an
+/// index pattern that matched no index (`allow_no_indices` defaults to true)
+/// answers `200` with `_shards.total: 0` and no `aggregations` at all (#1906).
+///
+/// Only that exact shape counts — `_shards.total` present and `0`, no failed
+/// shard, not timed out, no `aggregations` key. Anything else missing its
+/// aggregations (no `_shards`, shards searched, a shard failure, a timeout)
+/// stays a malformed answer and an error, never "no data" (#1364).
+///
+/// Accepted edge: under the default `expand_wildcards=open`, a tenant glob
+/// matching only closed indices also searches zero shards and reads as empty,
+/// the same answer as a tenant with no index. A closed *concrete* index is
+/// not this case: it answers a non-2xx `index_closed_exception`.
+fn searched_no_shards(body: &Value) -> bool {
+    let Some(shards) = body.get("_shards") else {
+        return false;
+    };
+    let total_is_zero = shards.get("total").and_then(Value::as_u64) == Some(0);
+    let none_failed = match shards.get("failed") {
+        None => true,
+        Some(failed) => failed.as_u64() == Some(0),
+    };
+    let timed_out = body.get("timed_out").and_then(Value::as_bool) == Some(true);
+    total_is_zero && none_failed && !timed_out && body.get("aggregations").is_none()
+}
+
+/// An aggregation `_search` over `index`: `send_read_with_retry`, plus a
+/// zero-shard answer read as "no index" (`None`) like the 404 it stands for
+/// (#1906). The count reads use this; the shared classifier, and the FHIR
+/// search paths that already read `hits` from such an answer, are untouched.
+async fn send_aggregation_search(
+    backend: &ElasticsearchBackend,
+    index: &str,
+    body: Value,
+) -> StorageResult<Option<Value>> {
+    let answer = send_read_with_retry(backend, ReadOp::Search, index, body).await?;
+    Ok(answer.filter(|body| !searched_no_shards(body)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         BULK_BACKOFF_BASE, BULK_BACKOFF_MAX, ValueOrigin, backoff_delay, build_es_document,
         chunk_ranges, describe_item_error, error_detail, es_index_date, is_transient_bulk_status,
-        is_unavailable,
+        is_unavailable, searched_no_shards,
     };
     use crate::error::{BackendError, StorageError};
     use crate::search::converters::IndexValue;
     use crate::search::extractor::ExtractedValue;
+    use chrono::{DateTime, Utc};
     use helios_fhir::FhirVersion;
     use serde_json::json;
+
+    /// A fixed resource instant, nowhere near "now".
+    fn test_instant() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-09-28T19:39:53.005Z")
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    /// #1593: the document's `last_updated` is the resource's own instant,
+    /// never the time the document was built — the same builder serves the
+    /// `$reindex` page writer, where "now" is the rebuild time.
+    #[test]
+    fn document_carries_the_resources_own_last_updated() {
+        let doc = build_es_document(
+            "t1",
+            "Patient",
+            "p1",
+            "3",
+            test_instant(),
+            &json!({ "resourceType": "Patient", "id": "p1" }),
+            FhirVersion::default(),
+            &[],
+        );
+        assert_eq!(doc["last_updated"], json!("2026-09-28T19:39:53.005+00:00"));
+        assert_eq!(doc["version_id"], json!("3"));
+    }
 
     fn index_date(raw: &str) -> Option<String> {
         let origin = ValueOrigin {
@@ -2957,6 +3122,7 @@ mod tests {
             "Patient",
             "p1",
             "1",
+            test_instant(),
             &json!({ "resourceType": "Patient", "id": "p1" }),
             FhirVersion::default(),
             &[
@@ -3012,6 +3178,7 @@ mod tests {
             "Encounter",
             "e1",
             "1",
+            test_instant(),
             &json!({ "resourceType": "Encounter", "id": "e1" }),
             FhirVersion::default(),
             &[
@@ -3063,6 +3230,7 @@ mod tests {
             "Encounter",
             "e1",
             "1",
+            test_instant(),
             &json!({ "resourceType": "Encounter", "id": "e1" }),
             FhirVersion::default(),
             &[
@@ -3189,5 +3357,50 @@ mod tests {
         });
         assert!(!is_unavailable(&rejection));
         assert!(error_detail(&rejection).contains("mapper_parsing_exception"));
+    }
+
+    /// #1906: a cluster-stated zero-shard answer without aggregations — what a
+    /// tenant glob matching no index gets — is the only 2xx read as "no index".
+    #[test]
+    fn searched_no_shards_is_only_a_clean_zero_shard_answer() {
+        let zero = json!({
+            "took": 0,
+            "timed_out": false,
+            "_shards": { "total": 0, "successful": 0, "skipped": 0, "failed": 0 },
+            "hits": { "total": { "value": 0, "relation": "eq" }, "max_score": null, "hits": [] }
+        });
+        assert!(searched_no_shards(&zero));
+        // `failed` and `timed_out` may be absent.
+        assert!(searched_no_shards(&json!({ "_shards": { "total": 0 } })));
+
+        let mut searched = zero.clone();
+        searched["_shards"] = json!({ "total": 2, "successful": 2, "skipped": 0, "failed": 0 });
+        assert!(!searched_no_shards(&searched), "shards were searched");
+
+        assert!(
+            !searched_no_shards(&json!({ "hits": { "total": { "value": 3 } } })),
+            "no _shards at all is a malformed answer"
+        );
+        assert!(
+            !searched_no_shards(&json!({ "_shards": { "failed": 0 } })),
+            "no _shards.total"
+        );
+
+        let mut failed = zero.clone();
+        failed["_shards"]["failed"] = json!(1);
+        assert!(!searched_no_shards(&failed), "a shard failure");
+        failed["_shards"]["failed"] = json!("1");
+        assert!(!searched_no_shards(&failed), "an unreadable failed count");
+
+        let mut timed_out = zero.clone();
+        timed_out["timed_out"] = json!(true);
+        assert!(!searched_no_shards(&timed_out), "a timeout");
+
+        let mut with_aggs = zero.clone();
+        with_aggs["aggregations"] = json!({ "types": { "buckets": [] } });
+        assert!(
+            !searched_no_shards(&with_aggs),
+            "an answer with aggregations is read as such"
+        );
     }
 }

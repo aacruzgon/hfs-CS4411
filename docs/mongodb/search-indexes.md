@@ -83,11 +83,149 @@ Outside those limits, a resource can keep stale search rows until it is next wri
 
 The walk's position lives in memory: after a restart, a rebuild starts every type from the beginning.
 
+## Missing-parameter metadata
+
+MongoDB stores `missing_params` on each `resources` document, outside the
+FHIR payload. It is a sorted, deduplicated array of supported search-parameter
+codes for which extraction found no indexed value. For example,
+`missing_params: ["method"]` records that this resource has no indexed
+`method` value. It does not create a separate `search_index` row for absence.
+An empty array is different from an absent field: an absent field means the
+resource has no absence metadata and requires the compatibility path.
+Parameters that fail extraction are not recorded as confirmed absence.
+Other parameters can still produce rows and metadata, so a present field does
+not prove that every parameter extracted successfully. Affected missing-field
+results can remain incomplete until the extraction problem is corrected and
+the resource is rewritten or reindexed. This metadata describes top-level
+resources; it does not add contained `:missing` support.
+
+The shared `idx_resources_missing_params` multikey index has this key order:
+
+```javascript
+{ tenant_id: 1, resource_type: 1, is_deleted: 1,
+  missing_params: 1, last_updated: 1, id: 1 }
+```
+
+On an existing deployment its first build scans every `resources` document
+(about 10.5 GB at 12M resources), so HFS builds it after boot under
+`HFS_MONGODB_INDEX_BUILD`, in its own task beside the `search_index` builder
+(#2001):
+
+| value | behaviour |
+|---|---|
+| `background` (default) | Boot returns and the node serves while the index builds; the build is logged at `info` when it starts and finishes. |
+| `inline` | Boot waits for the build. |
+| `off` | Nothing is built. A missing (or still-building) index is logged at `warn` with the command that builds it. |
+
+To pre-build it in a maintenance window, run this in `mongosh` against the HFS
+database, then restart:
+
+```javascript
+db.resources.createIndex(
+  { tenant_id: 1, resource_type: 1, is_deleted: 1,
+    missing_params: 1, last_updated: 1, id: 1 },
+  { name: "idx_resources_missing_params" }
+);
+```
+
+Until the builder has seen the index built and visible, every
+`:missing=true` and `:missing=false` search uses the value-index route that
+unsupported parameters use, and never names the index in a hint. Results are
+the same on both routes; only the plan differs. HFS checks once per boot: an
+index that an operator builds while the node runs (with `off`, or after a
+failed build) is used from the next start.
+
+Readiness (`/health/ready`, #1686) follows the same rule. While the index is
+absent or building, the node is ready: no query hints it. Once the builder has
+reported it ready, readiness requires it, like the other hinted indexes: if it
+is later dropped or hidden, the node reports not ready, naming the index, until
+it is restored (unhidden, or rebuilt and the node restarted). An index under
+this name with a different key or options is logged at `error` and left
+alone; searches keep the value-index route.
+
+The array and its index entries add storage and write work; an unchanged
+numeric schema version does not mean the stored representation is unchanged.
+
+### Search and write behavior
+
+For supported `parameter:missing=true` searches, HFS uses absence metadata on
+resources and checks the existing typed value index for resources whose
+metadata field is absent. Old and new resources can therefore coexist without
+requiring an immediate reindex. This fallback uses stored index rows, not a
+fresh extraction from the FHIR payload. Unsupported metadata parameters retain
+their existing search behavior. `:missing=false` uses typed value presence.
+Ordinary queries do not acquire a missing-metadata lookup, although writes
+still maintain the array and its index.
+
+Selective positive predicates keep candidate-driven execution. When the
+planner has chosen a metadata-aware resource plan, search and count retain it
+instead of first collecting every matching resource ID. Eligible ID-sorted
+pages with positive predicates use bounded candidate checks; timestamp pages
+can use the metadata index. Pages still enforce tenant, type and deletion
+scope. This does not guarantee that every search is covered or faster.
+
+Create, update, restore, transaction writes and non-deferred bulk ingestion
+carry metadata from the same extraction that produces value-index rows.
+Deferred or offloaded indexing leaves metadata unknown and removes any old
+array on update; a whole-resource extraction failure does the same. Reindex
+updates metadata only when the resource version still matches the version
+read for that page.
+
+Reindex can write metadata even when that resource's value-index insertion
+fails. The resource is reported as failed, but its index may remain incomplete
+until a successful rewrite. Check job errors and repair failed resources;
+metadata is not proof that all value-index writes succeeded. Metadata-update
+time is included in the insert timing statistic.
+
+### Upgrade and definition maintenance
+
+1. Drain older writers before allowing metadata-aware writers to update the
+   same resources. Older writers do not maintain or invalidate this field;
+   they can leave stale metadata on a resource previously written by a newer
+   node. The same restriction applies to a writer downgrade.
+2. Start the upgraded nodes. They serve while `idx_resources_missing_params`
+   builds (see above); wait for the `resources index build complete` log line
+   before judging `:missing=true` latency. Existing resources without metadata
+   remain searchable through the compatibility path while their value indexes
+   remain valid.
+3. Run the tenant's `POST /$reindex` to populate metadata for existing resources.
+   Poll `GET /$reindex-status/{job_id}` on the same node and resolve reported
+   failures before treating the rebuild as complete.
+
+There is no definition fingerprint or automatic metadata invalidation when a
+SearchParameter is added, changed or removed. Coordinate definition
+maintenance across all nodes serving the affected tenant:
+
+1. Pause affected searches and drain writers, including background indexing.
+2. Apply the definition change and refresh or restart every affected node so
+   they use the same definitions.
+3. Remove the complete `missing_params` field for the affected tenant and
+   resource types, using an explicitly scoped MongoDB update, for example:
+
+   ```javascript
+   db.resources.updateMany(
+     { tenant_id: "TENANT_ID", resource_type: { $in: ["Observation"] } },
+     { $unset: { missing_params: "" } }
+   );
+   ```
+
+4. Reindex the affected resources with the new definitions, check job errors,
+   and resume requests after the rebuild succeeds.
+
+Do not merely remove one parameter name from the array: a present array would
+still be trusted, so that would claim the parameter is not absent instead of
+marking its state unknown. Unsetting the field restores compatibility checks,
+but those checks cannot repair value-index rows extracted from old definitions;
+the rebuild is still required. Include every affected type when a definition
+applies to an abstract base or multiple resource types.
+
 ## Composite parameters
 
 Composite search (`code-value-quantity`, `component-code-value-quantity`, ...) uses the existing value indexes for matching (#1206). The extractor writes one row per component value in `search_index`, or in `search_index_contained` for a contained resource. Rows in one composite instance share `param_name` (the composite's code) and `composite_group` (the base-instance index). Each row also has a `composite_slot`, the component's position among components of the same type. The existing value indexes bound each component predicate by its type and value.
 
-For standard searches, the driver arm is the component filter with the lowest probe count. Each candidate batch is then checked against the other components within the same `composite_group`. Contained searches group matching rows by contained entity and `composite_group`. When components share a type, both paths require the matching `composite_slot`, so `A$B` does not match rows for `B$A`. SQLite ordinary searches also group components by `composite_group`, but their rows have no slot, so same-type components remain ambiguous there. PostgreSQL ordinary searches in the denormalized layout preserve positions in folded rows with per-type component columns; its legacy layout uses grouped rows. Its contained rows remain unfolded, and both SQLite and PostgreSQL contained rows lack equal-type component positions: `_contained=true|both` composites with repeated declared component types return HTTP 400 (`InvalidComposite`) instead of potentially matching a reversed pair. Distinct-type contained composites remain supported in both SQL backends. Reindexing does not remove this SQL restriction.
+For standard searches, the driver arm is the component filter with the lowest probe count. Each candidate batch is then checked against the other components within the same `composite_group`. Contained searches group matching rows by contained entity and `composite_group`. When components share a type, both paths require the matching `composite_slot`, so `A$B` does not match rows for `B$A`. SQLite and PostgreSQL unfolded composite rows now retain these per-type slots too (SQLite schema 38, PostgreSQL schema 48), so repeated-type ordinary and contained SQL searches preserve positions. PostgreSQL ordinary Denormalized searches retain folded rows with at most two Token or Number components and one of each other family; shapes beyond that remain unsupported for ordinary or `_contained=both` searches and cannot be repaired by reindexing. Its Legacy reader accepts slotted unfolded rows and valid transitional folded Token/Number rows. Contained SQL searches use unfolded rows in either layout.
+
+SQL's legacy guard is conservative for positional matching of the parameter: any ambiguous unfolded row in the tenant/type/parameter and requested top-level or contained scope causes a named 400 asking for `$reindex`, even for a value with no matches or count zero. Ordinary composite `:missing=true|false` is presence-only and bypasses SQL positional shape checks and legacy-slot probes; contained `:missing` remains unsupported. MongoDB's guard below is value-dependent. SQL startup builds sparse legacy-probe indexes; PostgreSQL's ordinary family-aware probes are created only when initializing Legacy, while its contained probe exists in both layouts. These builds can lengthen the first startup after upgrading. See [SQL composite upgrade recovery](../../crates/persistence/README.md#sql-composite-slots-and-upgrade-recovery).
 
 Older MongoDB composite rows lack `composite_slot`. A same-type composite query that encounters a matching old row fails with an error asking for `$reindex` rather than silently omitting a match. The preflight probe uses `idx_search_composite_slot_probe` on `search_index` or `idx_search_contained_composite_slot_probe` on `search_index_contained`. Both indexes lead with tenant, searched resource type and parameter name, then `composite_slot`. They include only rows where `composite_group` exists, but retain rows with a missing slot. HFS builds them before serving, including when `HFS_MONGODB_INDEX_BUILD=off`; on a large database, build them ahead of deployment to avoid a longer startup. The contained pre-build script above includes its probe index. To pre-build the standard probe index, run this in `mongosh` against the HFS database:
 
@@ -101,7 +239,7 @@ db.search_index.createIndex(
 );
 ```
 
-After every writer runs the slot-writing version, send `POST /$reindex` for the affected tenant. With no body, `clearExisting` defaults to `false`; the job rewrites the resources' index rows without clearing the entire tenant index first. The response has a `jobId`. Poll `GET /$reindex-status/{job_id}` on the same server node until its `status` parameter is `completed` and `errorCount` is zero. The operation requires the `system/reindex` scope when authentication is enabled.
+For SQL and MongoDB, after every writer runs the slot-writing version, send `POST /$reindex` for the affected tenant. With no body, `clearExisting` defaults to `false`; the job rewrites the resources' index rows without clearing the entire tenant index first. The response has a `jobId`. Poll `GET /$reindex-status/{job_id}` on the same server node until its `status` parameter is `completed` and `errorCount` is zero. The operation requires the `system/reindex` scope when authentication is enabled.
 
 Use the tenant-wide route even when the repeated-type parameter belongs to `Observation`. A contained Observation is indexed under its container's resource type, so `POST /Observation/$reindex` does not rebuild its rows when the container is another type. Keep older writers from writing to that tenant during and after the rebuild; they would create rows without slots again.
 

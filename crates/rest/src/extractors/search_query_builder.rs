@@ -819,26 +819,23 @@ fn parse_has_level(
     }
 
     // `_has:Observation:subject:code:not=…` — what follows the terminal
-    // parameter is its search modifier. `ReverseChainedParameter` carries it
-    // inside `search_param`, as written (see `terminal_param`); the chain
-    // resolver applies it to the terminal search and checks it against the
-    // parameter's type. Here it only has to *be* a modifier. (In the
-    // `_has=Type:ref:param:value` form the fourth part is the value.)
-    let search_param = match parts.get(3) {
+    // parameter is its search modifier. The chain resolver applies it to the
+    // terminal search and checks it against the parameter's type. Here it only
+    // has to *be* a modifier. (In the `_has=Type:ref:param:value` form the
+    // fourth part is the value.)
+    let modifier = match parts.get(3) {
         Some(suffix) if name != "_has" => {
             let modifier = parse_terminal_modifier(key, &search_param, suffix, types)?;
             check_missing_literal(key, Some(&modifier), value)?;
-            format!("{search_param}:{suffix}")
+            Some(modifier)
         }
-        _ => search_param,
+        _ => None,
     };
 
-    Ok(Some(ReverseChainedParameter::terminal(
-        source_type,
-        reference_param,
-        search_param,
-        search_value,
-    )))
+    let mut chain =
+        ReverseChainedParameter::terminal(source_type, reference_param, search_param, search_value);
+    chain.modifier = modifier;
+    Ok(Some(chain))
 }
 
 /// Parses _include/_revinclude directive.
@@ -1537,19 +1534,20 @@ mod tests {
     }
 
     /// #1302: `_has:Type:ref:param:modifier` keeps the modifier, in
-    /// `search_param`, for the chain resolver to apply.
+    /// `modifier`, for the chain resolver to apply.
     #[test]
     fn test_parse_has_parameter_terminal_modifier() {
         let chain = parse_has_parameter("_has:Observation:subject:code:not", "1234-5")
             .unwrap()
             .unwrap();
-        assert_eq!(chain.search_param, "code:not");
-        assert_eq!(chain.terminal_param(), ("code", Some("not")));
+        assert_eq!(chain.search_param, "code");
+        assert_eq!(chain.modifier, Some(SearchModifier::Not));
 
         let plain = parse_has_parameter("_has:Observation:subject:code", "1234-5")
             .unwrap()
             .unwrap();
-        assert_eq!(plain.terminal_param(), ("code", None));
+        assert_eq!(plain.search_param, "code");
+        assert_eq!(plain.modifier, None);
 
         let nested = parse_has_parameter(
             "_has:Encounter:subject:_has:Observation:encounter:code:not",
@@ -1557,9 +1555,10 @@ mod tests {
         )
         .unwrap()
         .unwrap();
+        let inner = nested.nested.as_ref().unwrap();
         assert_eq!(
-            nested.nested.as_ref().unwrap().terminal_param(),
-            ("code", Some("not"))
+            (inner.search_param.as_str(), &inner.modifier),
+            ("code", &Some(SearchModifier::Not))
         );
 
         assert!(parse_has_parameter("_has:Observation:subject:code:bogus", "1").is_err());
@@ -2367,6 +2366,33 @@ mod tests {
         assert_eq!(query.parameters.len(), 2, "both name params preserved");
         assert!(name_values.contains(&"Smith"));
         assert!(name_values.contains(&"Jones"));
+    }
+
+    #[test]
+    fn test_membership_in_parses_as_a_plain_reference_parameter() {
+        // `_in` is not special-cased by the builder: the membership resolver
+        // reads it from `query.parameters`, so pin the shapes it relies on.
+        let build = |key: &str, value: &str| {
+            let sp = SearchParams::from_pairs(vec![(key.to_string(), value.to_string())]);
+            build_search_query("Patient", &sp, &test_registry()).unwrap()
+        };
+
+        let query = build("_in", "Group/1,List/2");
+        assert_eq!(query.parameters.len(), 1);
+        let param = &query.parameters[0];
+        assert_eq!(param.name, "_in");
+        assert!(param.modifier.is_none() && param.chain.is_empty());
+        let values: Vec<&str> = param.values.iter().map(|v| v.value.as_str()).collect();
+        assert_eq!(values, ["Group/1", "List/2"], "comma values are OR-ed");
+
+        let query = build("_in:Group", "x");
+        assert_eq!(
+            query.parameters[0].modifier,
+            Some(helios_persistence::types::SearchModifier::Type(
+                "Group".to_string()
+            ))
+        );
+        assert!(query.list.is_empty(), "_in must not feed the _list field");
     }
 
     #[test]

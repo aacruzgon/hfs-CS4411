@@ -6,6 +6,7 @@ use std::future::Future;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use helios_fhir::FhirVersion;
 use parking_lot::RwLock;
 
 use crate::core::{Backend, BackendCapability, BackendKind};
@@ -29,10 +30,12 @@ pub(crate) type StoredByTenant = Arc<RwLock<HashMap<String, Vec<SearchParameterD
 #[derive(Clone)]
 pub struct S3Backend {
     pub(crate) config: S3BackendConfig,
+    /// FHIR version used by the in-process SQL-on-FHIR runner.
+    pub(crate) fhir_version: FhirVersion,
     pub(crate) client: Arc<dyn S3Api>,
     /// Per-tenant search parameter registries (shared base + per-tenant
-    /// overlay). The base starts empty here — S3 has no `data_dir`/FHIR
-    /// version of its own to load embedded/spec params from, so a composite's
+    /// overlay). The base starts empty here — S3 has no `data_dir` and does
+    /// not load embedded/spec params during construction, so a composite's
     /// starter function (e.g. `start_s3_elasticsearch`) populates
     /// `tenant_registries().base()` after construction, the same way the
     /// registry used to be built standalone. What S3 *does* own is the
@@ -43,12 +46,22 @@ pub struct S3Backend {
     pub(crate) registries: Arc<TenantSearchRegistries>,
     /// Sync cache of each tenant's stored params, read by the registry loader.
     pub(crate) stored_by_tenant: StoredByTenant,
+    /// ETags of `current.json` objects a scan found to be delete tombstones,
+    /// keyed by bucket and object key. A later scan skips the GET of an object
+    /// whose listed ETag still matches, so the cost of scanning a type is the
+    /// LIST plus its live objects rather than every delete the type has ever
+    /// seen. A rewrite changes the ETag and forces a fresh read.
+    pub(crate) tombstone_etags: Arc<RwLock<HashMap<(String, String), String>>>,
 }
+
+/// Upper bound on remembered tombstones; past it scans simply read them.
+pub(crate) const TOMBSTONE_CACHE_CAP: usize = 200_000;
 
 impl std::fmt::Debug for S3Backend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("S3Backend")
             .field("config", &self.config)
+            .field("fhir_version", &self.fhir_version)
             .finish_non_exhaustive()
     }
 }
@@ -175,6 +188,13 @@ impl S3Backend {
         &self.registries
     }
 
+    /// Sets the server's FHIR version for stored-data SQL-on-FHIR runs.
+    /// Constructors use the first enabled version until explicitly configured.
+    pub fn with_fhir_version(mut self, fhir_version: FhirVersion) -> Self {
+        self.fhir_version = fhir_version;
+        self
+    }
+
     /// Creates a new S3 backend using AWS standard credential provider chain.
     pub fn new(config: S3BackendConfig) -> StorageResult<Self> {
         Self::from_env(config)
@@ -221,9 +241,11 @@ impl S3Backend {
         let (registries, stored_by_tenant) = Self::new_registries();
         let backend = Self {
             config,
+            fhir_version: FhirVersion::default_enabled(),
             client,
             registries,
             stored_by_tenant,
+            tombstone_etags: Arc::default(),
         };
 
         if backend.config.validate_buckets_on_startup {
@@ -245,9 +267,11 @@ impl S3Backend {
         let (registries, stored_by_tenant) = Self::new_registries();
         Ok(Self {
             config,
+            fhir_version: FhirVersion::default_enabled(),
             client,
             registries,
             stored_by_tenant,
+            tombstone_etags: Arc::default(),
         })
     }
 
@@ -272,8 +296,9 @@ impl S3Backend {
     /// by a key prefix derived from the tenant ID. In `BucketPerTenant` mode
     /// each tenant maps to a dedicated bucket looked up from the config map.
     ///
-    /// Returns a `TenantError` if the tenant has no bucket assignment in the
-    /// `BucketPerTenant` mapping.
+    /// Returns [`TenantError::UnmappedTenant`](crate::error::TenantError::UnmappedTenant)
+    /// if the tenant has no bucket assignment in the `BucketPerTenant` mapping
+    /// (only `__system__` falls back, to `default_system_bucket`).
     pub(crate) fn tenant_location(&self, tenant: &TenantContext) -> StorageResult<TenantLocation> {
         let global_prefix = self.global_prefix();
 
@@ -298,16 +323,59 @@ impl S3Backend {
                             None
                         }
                     })
-                    .ok_or_else(|| {
-                        StorageError::Tenant(crate::error::TenantError::InvalidTenant {
-                            tenant_id: TenantId::new(tenant_id),
-                        })
-                    })?;
+                    .ok_or_else(|| Self::unmapped_tenant(tenant_id))?;
 
                 Ok(TenantLocation {
                     bucket,
                     keyspace: S3Keyspace::new(global_prefix),
                 })
+            }
+        }
+    }
+
+    /// The error for a tenant this configuration has no bucket for.
+    pub(crate) fn unmapped_tenant(tenant_id: &str) -> StorageError {
+        StorageError::Tenant(crate::error::TenantError::UnmappedTenant {
+            tenant_id: TenantId::new(tenant_id),
+        })
+    }
+
+    /// In `BucketPerTenant` mode, rejects a tenant that is absent from the
+    /// tenant→bucket map; a no-op in `PrefixPerTenant` mode, where every tenant
+    /// has a prefix.
+    ///
+    /// `register_tenant` calls this so the registry cannot hold a tenant whose
+    /// every request would then fail with the same error: the map is the
+    /// provisioning in this mode, and the registry only mirrors it. The system
+    /// tenant never reaches here (`ensure_canonical_tenant_id` refuses reserved
+    /// ids first), so its `default_system_bucket` fallback is not consulted.
+    pub(crate) fn ensure_tenant_mapped(&self, tenant_id: &str) -> StorageResult<()> {
+        if let S3TenancyMode::BucketPerTenant {
+            tenant_bucket_map, ..
+        } = &self.config.tenancy_mode
+            && !tenant_bucket_map.contains_key(tenant_id)
+        {
+            return Err(Self::unmapped_tenant(tenant_id));
+        }
+        Ok(())
+    }
+
+    /// Tenants this configuration names statically: the keys of the
+    /// `BucketPerTenant` map, in sorted order. Empty in `PrefixPerTenant` mode,
+    /// where tenants are discovered from the bucket rather than configured.
+    ///
+    /// A binary that builds the map from its environment uses this to provision
+    /// (register and seed) the mapped tenants at startup, so the map is the one
+    /// place an operator declares a tenant.
+    pub fn mapped_tenants(&self) -> Vec<String> {
+        match &self.config.tenancy_mode {
+            S3TenancyMode::PrefixPerTenant { .. } => Vec::new(),
+            S3TenancyMode::BucketPerTenant {
+                tenant_bucket_map, ..
+            } => {
+                let mut ids: Vec<String> = tenant_bucket_map.keys().cloned().collect();
+                ids.sort();
+                ids
             }
         }
     }

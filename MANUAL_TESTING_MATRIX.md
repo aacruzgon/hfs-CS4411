@@ -33,6 +33,7 @@ issue and replace the `☐` cells.
 | `mongo-es` (MongoDB + Elasticsearch) | ☐ | ☐ | ☐ | ☐ | ☐ | N/A (501) | ☐ | ☐ | ☐ | ☐ |
 | `s3` (MinIO) | ☐ | ☐ | ☐ (batch only) | ☐ | N/A (no search) | N/A (501) | ☐ | ☐ | ☐ | ☐ |
 | `s3-es` (MinIO + Elasticsearch) | ☐ | ☐ | ☐ (batch only) | ☐ | ☐ | ☐ (5.8: 0 Patient) | ☐ | ☐ | ☐ | ☐ |
+| `s3` bucket-per-tenant (MinIO, `HFS_S3_TENANCY=bucket-per-tenant`)³ | ☐ | ☐ | ☐ (batch only) | ☐ | N/A (no search) | N/A (501) | ☐ | ☐ | ☐ | ☐ |
 
 Tester: ______  Commit: ______  Date: ______  OS/arch: ______
 
@@ -55,8 +56,10 @@ that is a failure.
 | `$reindex` | yes | yes | yes | yes | yes | yes | no (501) | yes |
 | Per-user UI settings (saved queries, export job lists) | yes | yes | yes | yes | yes | yes | yes¹ | yes¹ |
 
-¹ S3 in prefix-per-tenant mode (the default, `HFS_S3_BUCKET`). Bucket-per-tenant
-mode with no system bucket returns `501` for `$bulk-submit` and user settings.
+¹ S3 in prefix-per-tenant mode (the default, `HFS_S3_BUCKET`), or bucket-per-tenant
+with `HFS_S3_SYSTEM_BUCKET` set. Bucket-per-tenant with no system bucket returns
+`501` for `$bulk-submit`, user settings and `/admin/tenants`, and holds web login
+sessions in process.
 
 ² The ViewDefinition runner is in-DB (SQL or an aggregation pipeline) on the
 non-S3 backends. A SQL Query or SQL View subject is different: each of its
@@ -64,6 +67,19 @@ dependencies is first materialized into an embedded per-request SQLite by this
 runner, and the query's joins and `WHERE` then run in that SQLite, on every
 backend. The per-dependency row cap (`HFS_SOF_SQLQUERY_MAX_SOURCE_ROWS_PER_VD`)
 applies to that materialization.
+
+³ Same expectations as the `s3` row, plus: the tenants named in
+`HFS_S3_TENANT_BUCKETS` appear on `/ui/tenants` and `GET /admin/tenants` after
+start without being created; `POST /admin/tenants` with an id outside the map
+answers `400` "has no bucket assigned"; a request with `X-Tenant-ID` outside
+the map answers the same `400`; `default`'s resources land in `hfs-default`
+and `acme`'s in `hfs-acme` (no tenant prefix inside the bucket); the registry,
+`_system.user-settings/` and `_system.login-sessions/` objects are in
+`hfs-system`. Start once more with `HFS_S3_SYSTEM_BUCKET` unset: startup logs
+`web login sessions are held in process` (when interactive login is on) and
+the two `S3 is configured bucket-per-tenant with no default system bucket`
+warnings, `/_user/settings` and `$bulk-submit` answer `501`, and
+`GET /admin/tenants` answers `501`.
 
 The `near` (geo) search parameter is not implemented on any backend, so it is not
 part of T4.
@@ -305,6 +321,7 @@ open (#1081).
 | `mongo-es` | as `mongodb` plus `HFS_STORAGE_BACKEND=mongo-es HFS_ELASTICSEARCH_NODES=http://localhost:9200` |
 | `s3` | `HFS_STORAGE_BACKEND=s3 HFS_S3_BUCKET=hfs HFS_S3_ENDPOINT=http://localhost:9000 HFS_S3_FORCE_PATH_STYLE=true HFS_S3_REGION=us-east-1 AWS_ACCESS_KEY_ID=hfs-minio AWS_SECRET_ACCESS_KEY=hfs-minio-secret` |
 | `s3-es` | as `s3` plus `HFS_STORAGE_BACKEND=s3-es HFS_ELASTICSEARCH_NODES=http://localhost:9200` |
+| `s3` bucket-per-tenant | as `s3` but **without** `HFS_S3_BUCKET`, plus `HFS_S3_TENANCY=bucket-per-tenant HFS_S3_TENANT_BUCKETS=default=hfs-default,acme=hfs-acme HFS_S3_SYSTEM_BUCKET=hfs-system` (create the three buckets first: `mc mb --ignore-existing local/hfs-default local/hfs-acme local/hfs-system`) |
 
 Note on `s3`/`s3-es`: one process has one AWS credential chain, so MinIO as the
 primary store means the T5/T7 S3 *output* variants must also target MinIO.
@@ -856,6 +873,14 @@ For each export: **Export** → **New Export** (`/ui/bulk-export/new`), fill the
 refresh every 5 s and show the server's progress text; complete cards show **N
 files**, *finished in …*, and one download pill per resource type.
 
+The **Patients** picker (also SQL Export's **Patients** field, 11.5) searches
+`Patient?name=<text>` and `identifier=<text>`, sorted by family name, given name
+and id, eight rows at a time: the footer reads *N matches · scroll for more* and
+scrolling to the end of the list loads the next eight. A broad term can put the
+wanted patient on a later page: `Parker433` matches 38 patients here (given and
+maiden names count too, more than the 30 of row 4.1) and Cari853 is not among the
+first eight, whereas `Cari853` matches 3.
+
 Before starting an export, fill **Name**, scope, **Patients** or **Group ID**, and
 narrowing fields (**FHIR elements**, **Type filter**, **Since**, **Custom instant**,
 **Until**). Click **Clear** in **Resource types**: **All Resources** and every type
@@ -871,7 +896,7 @@ resource-type filter when submitted.
 | # | Name | Form | Expect on the card |
 |---|---|---|---|
 | 5.1 | `everything-small` | scope **Everything**; untick **All Resources** and tick only `Organization`, `Practitioner`, `Location` | **Complete · 6 files** (output is chunked at 1,000 resources per file: `Location-0` with 1,000 plus `Location-1` with 137, and likewise for the other two types); pills `Organization`, `Practitioner`, `Location`. Download `Organization-0` and `Organization-1`: 1,000 + 140 lines = 1,140 total (1,136 corpus + 4 from T2); each line is one JSON object |
-| 5.2 | `one-patient` | scope **Patients**; in **Patients** search `Parker433` and pick Cari853 Esperanza675 Parker433 (or paste `PID`); types `Patient`, `Condition`, `Observation` | **Complete · 3 files**; `Patient` file has 1 line, `Condition` 15, `Observation` 165 |
+| 5.2 | `one-patient` | scope **Patients**; in **Patients** type `Cari853` (3 matches) and pick Cari853 Esperanza675 Parker433 (or paste `PID`); types `Patient`, `Condition`, `Observation` | **Complete · 3 files**; `Patient` file has 1 line, `Condition` 15, `Observation` 165 |
 | 5.3 | `group-active-conditions` | scope **Group**, **Group ID** `manual-group`; types `Patient`, `Condition`; **Type filter** `Condition?clinical-status=active`; **FHIR elements** empty; **Since** *All time* | **Complete · 2 files**; `Patient` has 1 line; every line of `Condition` has `clinicalStatus` = `active` and belongs to `PID` (fewer than the 15 of 5.2) |
 | 5.4 | `elements-subset` | scope **Everything**; type `Patient` only; **FHIR elements** `id,gender` | **Complete · 1 file**; each Patient line has only `id`, `gender`, `meta` and the `meta.tag` `SUBSETTED` |
 | 5.5 | `cancel-me` | scope **Everything**, **All Resources** ticked | while **In progress**, click **Cancel** → chip **Cancelled** |
@@ -1135,7 +1160,7 @@ no format selector, so nothing more is needed there.
 
 | # | Name | Form | Expect |
 |---|---|---|---|
-| 7.g | `one-patient` | `patient_demographics`; **Patients**: type `Parker433` and pick Cari853 Esperanza675 Parker433 (or paste `PID`); **NDJSON** | 1 file with **1** line: `female`, `2015-12-29`, `Parker433`, `Everett`; the detail page's **Job** card lists **Patients** |
+| 7.g | `one-patient` | `patient_demographics`; **Patients**: type `Cari853` (3 matches) and pick Cari853 Esperanza675 Parker433 (or paste `PID`); **NDJSON** | 1 file with **1** line: `female`, `2015-12-29`, `Parker433`, `Everett`; the detail page's **Job** card lists **Patients** |
 | 7.h | `one-group` | `patient_demographics`; **Groups**: `manual-group`; **JSON** | 1 file holding a one-element array for `PID`; the **Job** card lists **Groups** |
 | 7.i | `since-import` | `patient_demographics`; **Since** *Custom* `<T3 start>`; **NDJSON** | **11,704** lines (the Larkin patient is older than the window); the **Job** card lists **Since** |
 | 7.j | `since-nothing` | `patient_demographics`; **Since** *Custom* `<T3 end>` | **Complete**; the output has **0** rows |

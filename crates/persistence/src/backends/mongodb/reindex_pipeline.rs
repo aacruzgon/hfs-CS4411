@@ -4,8 +4,10 @@
 //! thread extracts sub-batch *k+1* inside `tokio::task::block_in_place`, so
 //! HFS-side extraction overlaps MongoDB-side delete/insert instead of running
 //! strictly after it. This module holds the planner that sizes sub-batches,
-//! the `block_in_place` + rayon extraction helper, and the serial and
-//! overlapped writer bodies that call them; `storage.rs`'s
+//! the serial and
+//! overlapped writer bodies (the `block_in_place` + rayon extraction helper
+//! they share with the Elasticsearch writer lives in
+//! `search::reindex_prepare`); `storage.rs`'s
 //! `write_search_entries_page_timed` dispatches between the two and keeps
 //! the rest of the `ReindexTarget`/`ReindexSource` methods.
 //!
@@ -33,8 +35,6 @@ pub(super) const REINDEX_SUBBATCH_MAX: usize = 512;
 /// Mirrors PostgreSQL's reindex prepare minimum page size: the smallest page
 /// for which the serial writer still tries the rayon pool (#1403).
 pub(super) const REINDEX_SERIAL_POOL_MIN_PAGE: usize = 16;
-/// Ceiling on an explicit `HFS_MONGODB_REINDEX_PREPARE_THREADS` value (#1403).
-const REINDEX_PREPARE_MAX_THREADS: usize = 64;
 
 /// Sizes successive extraction sub-batches of one `$reindex` page so a
 /// pipeline of extraction and insert fills and drains in about one sub-batch
@@ -118,73 +118,9 @@ impl SubBatchPlanner {
     }
 }
 
-/// The pool and admission gate a page's extraction may use (#1403).
-pub(super) struct PrepareEnv<'a> {
-    pub pool: Option<&'a rayon::ThreadPool>,
-    pub gate: &'a tokio::sync::Semaphore,
-}
-
-/// Runs `prepare` over `range` in input order, returning `true` when it ran
-/// on the pool (#1403). The caller guarantees a multi-thread Tokio runtime.
-///
-/// Every sub-batch runs inside `block_in_place`, even with `pool: None`: a
-/// task spawned from this worker (the page's insert of the *previous*
-/// sub-batch) sits in this worker's LIFO slot until the worker either
-/// finishes its own synchronous work or calls `block_in_place`, which hands
-/// the LIFO slot and run queue to another worker. Without it, extraction
-/// would silently never overlap the spawned insert, even at a prepare width
-/// of one.
-fn extract_range<T: Send, F: Fn(usize) -> T + Sync>(
-    env: &PrepareEnv<'_>,
-    range: Range<usize>,
-    prepare: &F,
-) -> (Vec<T>, bool) {
-    use rayon::prelude::*;
-    tokio::task::block_in_place(|| {
-        if let Some(pool) = env.pool
-            && range.len() >= 2
-            && let Ok(permit) = env.gate.try_acquire()
-        {
-            let out = pool.install(|| range.into_par_iter().map(prepare).collect::<Vec<T>>());
-            drop(permit);
-            (out, true)
-        } else {
-            (range.map(prepare).collect(), false)
-        }
-    })
-}
-
-/// `available_parallelism − 1`, clamped to 1–4, when `configured` is `0`,
-/// mirroring PostgreSQL's reindex prepare width rule; otherwise `configured`
-/// clamped to at most `REINDEX_PREPARE_MAX_THREADS` (#1403).
-pub(super) fn resolve_prepare_width(configured: usize) -> usize {
-    if configured == 0 {
-        std::thread::available_parallelism()
-            .map(|n| n.get().saturating_sub(1).clamp(1, 4))
-            .unwrap_or(1)
-    } else {
-        configured.min(REINDEX_PREPARE_MAX_THREADS)
-    }
-}
-
-/// Whether this thread is running a multi-thread Tokio runtime, which is
-/// what lets `block_in_place` hand this worker's run queue to another worker
-/// instead of just blocking it. `block_in_place` panics only on a
-/// current-thread runtime; called with no runtime running at all, it just
-/// runs its closure inline — this backend never calls it in that case, since
-/// it always gates the pooled extraction path behind this check first.
-/// Mirrors PostgreSQL's reindex prepare path; kept as MongoDB's own copy
-/// because this backend's extraction also needs `block_in_place` for the
-/// serial (non-pooled) path and a configurable prepare width, which
-/// PostgreSQL's reindex path does not.
-pub(super) fn tokio_multi_thread_runtime() -> bool {
-    tokio::runtime::Handle::try_current().is_ok_and(|handle| {
-        matches!(
-            handle.runtime_flavor(),
-            tokio::runtime::RuntimeFlavor::MultiThread
-        )
-    })
-}
+pub(super) use crate::search::reindex_prepare::{
+    PrepareEnv, extract_range, resolve_prepare_width, tokio_multi_thread_runtime,
+};
 
 /// One sub-batch's extracted documents, split by destination collection, with
 /// page-wide resource-index owners for each document (#1403).
@@ -193,11 +129,34 @@ struct SubBatchDocs {
     own_docs: Vec<Document>,
     contained_owners: Vec<usize>,
     contained_docs: Vec<Document>,
+    missing_params: Vec<(usize, Option<Vec<String>>)>,
 }
 
 impl SubBatchDocs {
     fn len(&self) -> usize {
         self.own_docs.len() + self.contained_docs.len()
+    }
+
+    fn missing_updates(
+        &mut self,
+        tenant_id: &str,
+        resources: &[StoredResource],
+    ) -> Vec<(usize, Document)> {
+        std::mem::take(&mut self.missing_params)
+            .into_iter()
+            .map(|(owner, names)| {
+                let resource = &resources[owner];
+                (
+                    owner,
+                    doc! {
+                        "q": resource_version_filter(tenant_id, resource),
+                        "u": super::storage::with_missing_metadata_update(doc! {}, names.as_deref()),
+                        "multi": false,
+                        "upsert": false,
+                    },
+                )
+            })
+            .collect()
     }
 }
 
@@ -217,11 +176,13 @@ fn flatten_sub_batch(
         own_docs: Vec::new(),
         contained_owners: Vec::new(),
         contained_docs: Vec::new(),
+        missing_params: Vec::new(),
     };
     for (offset, (docs, failure)) in prepared.into_iter().enumerate() {
         let i = start + offset;
         doc_counts[i] = docs.own.len() + docs.contained.len();
         extract_failures[i] = failure;
+        batch.missing_params.push((i, docs.missing_params));
         for d in docs.own {
             batch.own_owners.push(i);
             batch.own_docs.push(d);
@@ -261,6 +222,81 @@ fn delete_filters(tenant_id: &str, resources: &[StoredResource]) -> Vec<Document
             }
         })
         .collect()
+}
+
+fn resource_version_filter(tenant_id: &str, resource: &StoredResource) -> Document {
+    doc! {
+        "tenant_id": tenant_id,
+        "resource_type": resource.resource_type(),
+        "id": resource.id(),
+        "version_id": resource.version_id(),
+        "is_deleted": false,
+    }
+}
+
+/// Parse the actual update-command reply, attributing statement errors to the
+/// original page owners rather than the sub-batch's local statement positions.
+fn metadata_update_result(
+    reply: &Document,
+    updates: &[(usize, Document)],
+) -> Result<(usize, HashMap<usize, String>), String> {
+    if let Some(error) = reply.get("writeConcernError") {
+        return Err(format!(
+            "Unacknowledged reindex missing metadata update: {error}"
+        ));
+    }
+    let mut failures = HashMap::new();
+    if reply.contains_key("writeErrors") {
+        let errors = reply
+            .get_array("writeErrors")
+            .map_err(|_| "Invalid reindex metadata write errors")?;
+        for error in errors {
+            let error = error
+                .as_document()
+                .ok_or("Invalid reindex metadata write error")?;
+            let index = error
+                .get_i32("index")
+                .map_err(|_| "Missing reindex metadata error index")?;
+            let owner = updates
+                .get(usize::try_from(index).map_err(|_| "Invalid reindex metadata error index")?)
+                .ok_or("Reindex metadata error index outside batch")?
+                .0;
+            failures.insert(owner, format!("Failed to update missing metadata: {error}"));
+        }
+    }
+    let matched = reply
+        .get_i64("n")
+        .or_else(|_| reply.get_i32("n").map(i64::from))
+        .map_err(|_| "Missing reindex metadata matched count")?;
+    let matched = usize::try_from(matched).map_err(|_| "Invalid reindex metadata matched count")?;
+    if matched > updates.len() {
+        return Err("Reindex metadata matched count exceeds batch".into());
+    }
+    Ok((matched, failures))
+}
+
+/// Update metadata in bounded commands, never overwriting a newer live version.
+/// A nonmatch leaves superseded, deleted or absent resources alone. The existing
+/// catch-up walk handles concurrent writes; command and acknowledgement errors fail.
+async fn update_missing_metadata(
+    db: &mongodb::Database,
+    updates: &[(usize, Document)],
+) -> Result<HashMap<usize, String>, String> {
+    let mut failures = HashMap::new();
+    for chunk in updates.chunks(REINDEX_SUBBATCH_MAX) {
+        let statements: Vec<_> = chunk.iter().map(|(_, update)| update.clone()).collect();
+        let reply = db
+            .run_command(doc! {
+                "update": super::MongoBackend::RESOURCES_COLLECTION,
+                "updates": statements,
+                "ordered": false,
+            })
+            .await
+            .map_err(|error| format!("Failed to update reindex missing metadata: {error}"))?;
+        let (_, write_failures) = metadata_update_result(&reply, chunk)?;
+        failures.extend(write_failures);
+    }
+    Ok(failures)
 }
 
 /// What a database task hands back to the page's own thread when joined:
@@ -471,6 +507,8 @@ async fn delete_page(
 async fn insert_sub_batch(
     own: mongodb::Collection<Document>,
     contained: mongodb::Collection<Document>,
+    db: mongodb::Database,
+    missing_updates: Vec<(usize, Document)>,
     docs: SubBatchDocs,
 ) -> DbTask<InsertFailures> {
     let mut stats = ReindexPageStats::default();
@@ -484,7 +522,7 @@ async fn insert_sub_batch(
     )
     .await;
     stats.insert += started.elapsed();
-    let own_failures = match own_result {
+    let mut own_failures = match own_result {
         Ok(failures) => failures,
         Err(msg) => {
             return DbTask {
@@ -514,6 +552,22 @@ async fn insert_sub_batch(
                 };
             }
         };
+    }
+    let started = std::time::Instant::now();
+    let metadata_result = update_missing_metadata(&db, &missing_updates).await;
+    stats.insert += started.elapsed();
+    match metadata_result {
+        Ok(failures) => {
+            for (owner, message) in failures {
+                own_failures.entry(owner).or_insert(message);
+            }
+        }
+        Err(message) => {
+            return DbTask {
+                stats,
+                result: Err(message),
+            };
+        }
     }
     DbTask {
         stats,
@@ -550,6 +604,7 @@ impl super::MongoBackend {
         multi_thread: bool,
     ) -> Vec<StorageResult<usize>> {
         let n = resources.len();
+
         let own = db.collection::<Document>(Self::SEARCH_INDEX_COLLECTION);
         let contained = db.collection::<Document>(Self::SEARCH_INDEX_CONTAINED_COLLECTION);
         let prepare = |i: usize| self.extract_one(tenant_id, &resources[i]);
@@ -571,7 +626,8 @@ impl super::MongoBackend {
         };
         let mut extract_failures: Vec<Option<String>> = vec![None; n];
         let mut doc_counts: Vec<usize> = vec![0; n];
-        let batch = flatten_sub_batch(0, prepared, &mut extract_failures, &mut doc_counts);
+        let mut batch = flatten_sub_batch(0, prepared, &mut extract_failures, &mut doc_counts);
+        let missing_updates = batch.missing_updates(tenant_id, resources);
         stats.extract += started.elapsed();
         stats.sub_batches += 1;
         stats.pool_sub_batches += u64::from(on_pool);
@@ -586,7 +642,7 @@ impl super::MongoBackend {
             return fan_out(n, &msg);
         }
 
-        let done = insert_sub_batch(own, contained, batch).await;
+        let done = insert_sub_batch(own, contained, db.clone(), missing_updates, batch).await;
         absorb_db_task(stats, &done.stats);
         stats.db_wait = Some(stats.delete + stats.insert);
         let insert_failures = match done.result {
@@ -619,6 +675,7 @@ impl super::MongoBackend {
         stats: &mut ReindexPageStats,
     ) -> Vec<StorageResult<usize>> {
         let n = resources.len();
+
         let own = db.collection::<Document>(Self::SEARCH_INDEX_COLLECTION);
         let contained = db.collection::<Document>(Self::SEARCH_INDEX_CONTAINED_COLLECTION);
         let pool = self.reindex_prepare_pool();
@@ -655,12 +712,13 @@ impl super::MongoBackend {
             // previous sub-batch's insert.
             let started = std::time::Instant::now();
             let (prepared, on_pool) = extract_range(&env, range.clone(), &prepare);
-            let batch = flatten_sub_batch(
+            let mut batch = flatten_sub_batch(
                 range.start,
                 prepared,
                 &mut extract_failures,
                 &mut doc_counts,
             );
+            let missing_updates = batch.missing_updates(tenant_id, resources);
             stats.extract += started.elapsed();
             stats.sub_batches += 1;
             stats.pool_sub_batches += u64::from(on_pool);
@@ -691,6 +749,8 @@ impl super::MongoBackend {
             in_flight = Some(AbortOnDrop::spawn(insert_sub_batch(
                 own.clone(),
                 contained.clone(),
+                db.clone(),
+                missing_updates,
                 batch,
             )));
         }
@@ -734,7 +794,7 @@ impl super::MongoBackend {
         let path = if overlapped { "overlapped" } else { "serial" };
         tracing::info!(
             overlap = self.config().reindex_overlap,
-            prefetch = self.config().reindex_prefetch && !self.is_search_offloaded(),
+            prefetch = self.config().reindex_prefetch,
             prepare_threads_configured,
             prepare_threads,
             pool = %pool,
@@ -748,6 +808,54 @@ impl super::MongoBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn metadata_update_errors_keep_page_owners_and_unmatched_counts() {
+        let updates = vec![(7, doc! {}), (12, doc! {})];
+        let (matched, failures) = metadata_update_result(
+            &doc! {
+                "n": 1_i32,
+                "writeErrors": [{ "index": 1, "code": 121, "errmsg": "metadata rejected" }],
+            },
+            &updates,
+        )
+        .unwrap();
+        assert_eq!(matched, 1);
+        assert_eq!(failures.len(), 1);
+        assert!(failures[&12].contains("metadata rejected"));
+        assert!(!failures.contains_key(&7));
+
+        let (matched, failures) = metadata_update_result(&doc! { "n": 0_i64 }, &updates).unwrap();
+        assert_eq!(
+            matched, 0,
+            "superseded resources do not match the guarded update"
+        );
+        assert!(failures.is_empty());
+    }
+
+    #[test]
+    fn metadata_update_requires_acknowledgement_and_valid_reply() {
+        let updates = vec![(7, doc! {})];
+        let reply = doc! {
+            "n": 1,
+            "writeConcernError": { "code": 64, "errmsg": "replication timed out" },
+        };
+        assert!(
+            metadata_update_result(&reply, &updates)
+                .unwrap_err()
+                .contains("Unacknowledged")
+        );
+        for reply in [
+            doc! {},
+            doc! { "n": -1 },
+            doc! { "n": 2 },
+            doc! { "n": 0, "writeErrors": [{ "index": 3, "errmsg": "out of range" }] },
+            doc! { "n": 0, "writeErrors": [{ "index": -1, "errmsg": "negative index" }] },
+            doc! { "n": 0, "writeErrors": "invalid" },
+        ] {
+            assert!(metadata_update_result(&reply, &updates).is_err(), "{reply}");
+        }
+    }
 
     #[test]
     fn planner_first_range_is_first_without_a_seed() {
@@ -832,67 +940,6 @@ mod tests {
     }
 
     #[test]
-    fn resolve_prepare_width_auto_explicit_and_capped() {
-        let expected_auto = std::thread::available_parallelism()
-            .map(|n| n.get().saturating_sub(1).clamp(1, 4))
-            .unwrap_or(1);
-        assert_eq!(resolve_prepare_width(0), expected_auto);
-        assert_eq!(resolve_prepare_width(1), 1);
-        assert_eq!(resolve_prepare_width(100), 64);
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn extract_range_preserves_input_order_on_the_pool_and_inline() {
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(3)
-            .build()
-            .unwrap();
-        let gate = tokio::sync::Semaphore::new(1);
-        let prepare = |i: usize| i * 10;
-
-        let pooled_env = PrepareEnv {
-            pool: Some(&pool),
-            gate: &gate,
-        };
-        let (out, on_pool) = extract_range(&pooled_env, 0..20, &prepare);
-        assert!(
-            on_pool,
-            "a range of 20 with a pool and a free gate must run on the pool"
-        );
-        assert_eq!(out, (0..20).map(|i| i * 10).collect::<Vec<_>>());
-
-        let inline_env = PrepareEnv {
-            pool: None,
-            gate: &gate,
-        };
-        let (out, on_pool) = extract_range(&inline_env, 0..20, &prepare);
-        assert!(!on_pool);
-        assert_eq!(out, (0..20).map(|i| i * 10).collect::<Vec<_>>());
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn extract_range_runs_inline_when_the_gate_is_held() {
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(3)
-            .build()
-            .unwrap();
-        let gate = tokio::sync::Semaphore::new(1);
-        let _permit = gate
-            .try_acquire()
-            .expect("a fresh semaphore has a free permit");
-        let env = PrepareEnv {
-            pool: Some(&pool),
-            gate: &gate,
-        };
-        let calling_thread = std::thread::current().id();
-        let prepare = move |_i: usize| std::thread::current().id();
-
-        let (out, on_pool) = extract_range(&env, 0..5, &prepare);
-        assert!(!on_pool, "a held gate must fall back to the calling thread");
-        assert!(out.iter().all(|id| *id == calling_thread));
-    }
-
-    #[test]
     fn flatten_moves_documents_with_page_global_owners() {
         let own_a = doc! {"a": 1};
         let contained_a = doc! {"ac": 1};
@@ -902,6 +949,7 @@ mod tests {
                 SearchIndexDocuments {
                     own: vec![own_a.clone()],
                     contained: vec![contained_a.clone()],
+                    missing_params: Some(vec!["absent".into()]),
                 },
                 None,
             ),
@@ -909,6 +957,7 @@ mod tests {
                 SearchIndexDocuments {
                     own: vec![own_b.clone()],
                     contained: Vec::new(),
+                    missing_params: None,
                 },
                 Some("boom".to_string()),
             ),
@@ -925,6 +974,10 @@ mod tests {
         assert_eq!(batch.contained_owners, vec![5]);
         assert_eq!(batch.contained_docs, vec![contained_a]);
         assert_eq!(batch.len(), 3);
+        assert_eq!(
+            batch.missing_params,
+            vec![(5, Some(vec!["absent".to_owned()])), (6, None)]
+        );
         assert_eq!(doc_counts[5], 2);
         assert_eq!(doc_counts[6], 1);
         assert_eq!(doc_counts[0], 0);

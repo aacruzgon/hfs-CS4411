@@ -4,8 +4,8 @@
 //! - Basic single-type search
 //! - Multi-type search
 //! - _include and _revinclude support
-//! - Chained search (`ChainedSearchProvider`); `search()` itself refuses a
-//!   query whose chains were not resolved first (#1389)
+//! - `search()` refuses a query whose chains were not resolved first by the
+//!   shared resolver (`crate::search::resolve_chains`, #1389)
 //! - Search parameter filtering using the search_index table
 
 use std::collections::HashSet;
@@ -16,14 +16,14 @@ use helios_fhir::FhirVersion;
 use rusqlite::params;
 
 use crate::core::{
-    ChainedSearchProvider, IncludeProvider, MultiTypeSearchProvider, ResourceStorage,
-    RevincludeProvider, SearchProvider, SearchResult,
+    IncludeProvider, MultiTypeSearchProvider, ResourceStorage, RevincludeProvider, SearchProvider,
+    SearchResult,
 };
 use crate::error::{BackendError, QueryErrorExt, SearchError, StorageError, StorageResult};
 use crate::tenant::TenantContext;
 use crate::types::{
-    CursorDirection, CursorValue, IncludeDirective, Page, PageCursor, PageInfo,
-    ReverseChainedParameter, SearchQuery, SearchValue, StoredResource,
+    CursorDirection, CursorValue, IncludeDirective, Page, PageCursor, PageInfo, SearchQuery,
+    SearchValue, StoredResource,
 };
 
 use super::SqliteBackend;
@@ -50,6 +50,7 @@ fn internal_error(message: String) -> StorageError {
 /// (#1293, #1295), so the shared date gate runs here too: an invalid value is
 /// an error, never a query the builder has to make something of.
 fn reject_unsupported_metadata_modifier(query: &SearchQuery) -> StorageResult<()> {
+    use crate::types::{ContainedMode, SearchModifier, SearchParamType};
     crate::search::reject_unsupported_metadata_modifier(query)?;
     crate::search::validate_date_values(query)?;
     // And a number or quantity value that is not a number (#1319, #1340).
@@ -62,6 +63,44 @@ fn reject_unsupported_metadata_modifier(query: &SearchQuery) -> StorageResult<()
     // answered 400 (#1236). After the empty-value check, which owns an
     // empty alternative.
     crate::search::validate_composite_values(query)?;
+    for parameter in &query.parameters {
+        if parameter.param_type != SearchParamType::Composite
+            || (query.contained == ContainedMode::Off
+                && matches!(parameter.modifier, Some(SearchModifier::Missing)))
+        {
+            continue;
+        }
+        for family in parameter
+            .components
+            .iter()
+            .map(|component| component.param_type)
+            .collect::<HashSet<_>>()
+        {
+            let count = parameter
+                .components
+                .iter()
+                .filter(|component| component.param_type == family)
+                .count();
+            if count > 1
+                && (count > u8::MAX as usize
+                    || !matches!(
+                        family,
+                        SearchParamType::Token
+                            | SearchParamType::Number
+                            | SearchParamType::Quantity
+                            | SearchParamType::String
+                            | SearchParamType::Date
+                    ))
+            {
+                return Err(StorageError::Search(SearchError::InvalidComposite {
+                    message: format!(
+                        "search parameter '{}' has unsupported repeated {family:?} components ({count}) on SQLite",
+                        parameter.name
+                    ),
+                }));
+            }
+        }
+    }
     // And a chain nobody resolved (#1389).
     reject_unresolved_chains(query)
 }
@@ -102,6 +141,143 @@ fn reject_unresolved_chains(query: &SearchQuery) -> StorageResult<()> {
 /// it describes (#1363).
 fn reject_contained_missing(query: &SearchQuery) -> StorageResult<()> {
     QueryBuilder::reject_unsupported_contained(query).map_err(StorageError::Search)
+}
+
+/// Old unfolded rows cannot prove the order of repeated component types.
+/// Probe by parameter, before paging or count-zero shortcuts, using the
+/// caller's connection so conditional transactions see their own index state.
+fn legacy_composite_probe_sql(
+    conn: &rusqlite::Connection,
+    contained: bool,
+) -> StorageResult<String> {
+    use rusqlite::OptionalExtension;
+    let (type_column, scope, index) = if contained {
+        (
+            "contained_type",
+            "is_contained = 1",
+            "idx_search_contained_composite_legacy",
+        )
+    } else {
+        (
+            "resource_type",
+            "is_contained = 0",
+            "idx_search_composite_legacy",
+        )
+    };
+    // The broader contained index can win the equality-prefix heuristic and
+    // visit every row after reindex. Prefer the sparse probe explicitly, but
+    // preserve correct reads while bulk rebuild temporarily drops it.
+    let exists = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='index' AND name=?1",
+            [index],
+            |_| Ok(()),
+        )
+        .optional()
+        .or_query_error("Failed to read composite probe index metadata")?
+        .is_some();
+    let hint = if exists {
+        format!(" INDEXED BY {index}")
+    } else {
+        String::new()
+    };
+    Ok(format!(
+        "SELECT 1 FROM search_index{hint} WHERE tenant_id = ?1 AND {type_column} = ?2 \
+                AND param_name = ?3 AND {scope} AND composite_group IS NOT NULL \
+                AND composite_slot IS NULL LIMIT 1"
+    ))
+}
+
+fn reject_legacy_composites(
+    conn: &rusqlite::Connection,
+    tenant: &TenantContext,
+    query: &SearchQuery,
+) -> StorageResult<()> {
+    use crate::types::{ContainedMode, SearchModifier, SearchParamType};
+
+    for parameter in &query.parameters {
+        if parameter.param_type != SearchParamType::Composite
+            // Ordinary :missing tests presence only, without component order.
+            || (query.contained == ContainedMode::Off
+                && matches!(parameter.modifier, Some(SearchModifier::Missing)))
+            || !parameter
+                .components
+                .iter()
+                .enumerate()
+                .any(|(position, component)| {
+                    parameter.components[..position]
+                        .iter()
+                        .any(|earlier| earlier.param_type == component.param_type)
+                })
+        {
+            continue;
+        }
+        for contained in [false, true] {
+            if (contained && query.contained == ContainedMode::Off)
+                || (!contained && query.contained == ContainedMode::On)
+            {
+                continue;
+            }
+            let sql = legacy_composite_probe_sql(conn, contained)?;
+            let legacy = run_legacy_composite_probe(
+                conn,
+                &sql,
+                tenant.tenant_id().as_str(),
+                &query.resource_type,
+                &parameter.name,
+            )
+            .or_query_error("Failed to probe legacy composite index rows")?;
+            if legacy.is_some() {
+                return Err(StorageError::Search(SearchError::InvalidComposite {
+                    message: format!(
+                        "search parameter '{}' requires $reindex: older SQLite composite index rows lack component slots; update all writers and reindex the full tenant",
+                        parameter.name
+                    ),
+                }));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn run_legacy_composite_probe(
+    conn: &rusqlite::Connection,
+    sql: &str,
+    tenant: &str,
+    resource_type: &str,
+    parameter: &str,
+) -> rusqlite::Result<Option<()>> {
+    use rusqlite::OptionalExtension;
+    let probe = |sql: &str| {
+        conn.query_row(sql, params![tenant, resource_type, parameter], |_| Ok(()))
+            .optional()
+    };
+    match probe(sql) {
+        Err(error) => {
+            // A bulk rebuild can drop the index after the metadata read. Retry
+            // only that exact missing-index error, leaving every other failure
+            // visible. A transaction that holds a schema snapshot needs no retry.
+            let missing = match &error {
+                rusqlite::Error::SqliteFailure(_, Some(message)) => {
+                    message.strip_prefix("no such index: ").filter(|name| {
+                        matches!(
+                            *name,
+                            "idx_search_composite_legacy" | "idx_search_contained_composite_legacy"
+                        )
+                    })
+                }
+                _ => None,
+            };
+            if let Some(index) = missing {
+                let hint = format!(" INDEXED BY {index}");
+                if sql.contains(&hint) {
+                    return probe(&sql.replace(&hint, ""));
+                }
+            }
+            Err(error)
+        }
+        result => result,
+    }
 }
 
 /// A `_cursor` that decoded but carries a sort value of the wrong type for its
@@ -208,6 +384,7 @@ impl SqliteBackend {
         total: Option<u64>,
     ) -> StorageResult<SearchResult> {
         reject_unsupported_metadata_modifier(query)?;
+        reject_legacy_composites(conn, tenant, query)?;
 
         let tenant_id = tenant.tenant_id().as_str();
         let resource_type = &query.resource_type;
@@ -446,6 +623,239 @@ impl SqliteBackend {
     }
 }
 
+/// The id-only page of [`SearchProvider::search_ids`], run on a blocking
+/// thread by the caller.
+fn search_ids_on(
+    conn: &rusqlite::Connection,
+    tenant: &TenantContext,
+    query: &SearchQuery,
+    cursor: Option<PageCursor>,
+) -> StorageResult<Page<String>> {
+    let tenant_id = tenant.tenant_id().as_str();
+    let resource_type = &query.resource_type;
+    let param_offset = if cursor.is_some() { 4 } else { 2 };
+    let search_filter = if !query.parameters.is_empty() {
+        let fragment = QueryBuilder::new(tenant_id, resource_type)
+            .with_param_offset(param_offset)
+            .build(query);
+        if fragment.sql.is_empty() {
+            None
+        } else {
+            Some(fragment)
+        }
+    } else {
+        None
+    };
+    let filter_clause = search_filter
+        .as_ref()
+        .map(|fragment| format!(" AND rowid IN ({})", fragment.sql))
+        .unwrap_or_default();
+    let search_params = search_filter
+        .map(|fragment| fragment.params)
+        .unwrap_or_default();
+    let cursor_clause = if cursor.is_some() {
+        " AND (last_updated < ?3 OR (last_updated = ?3 AND id > ?4))"
+    } else {
+        ""
+    };
+    let count = query.count.unwrap_or(100) as usize;
+    let sql = format!(
+        "SELECT id, last_updated FROM resources \
+             WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0{filter_clause}{cursor_clause} \
+             ORDER BY last_updated DESC, id ASC LIMIT {}",
+        count + 1
+    );
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![
+        Box::new(tenant_id.to_string()),
+        Box::new(resource_type.to_string()),
+    ];
+    if let Some(cursor) = &cursor {
+        bind_cursor_value(&mut params, SortValueKind::Timestamp, cursor)?;
+        params.push(Box::new(cursor.resource_id().to_string()));
+    }
+    for param in &search_params {
+        match param {
+            SqlParam::String(value) => params.push(Box::new(value.clone())),
+            SqlParam::Integer(value) => params.push(Box::new(*value)),
+            SqlParam::Float(value) => params.push(Box::new(*value)),
+            SqlParam::Null => params.push(Box::new(Option::<String>::None)),
+        }
+    }
+    let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|param| param.as_ref()).collect();
+    reject_legacy_composites(conn, tenant, query)?;
+    let mut stmt = conn
+        .prepare(&sql)
+        .or_query_error("Failed to prepare id-only search query")?;
+    let mut rows: Vec<(String, String)> = stmt
+        .query_map(param_refs.as_slice(), |row| Ok((row.get(0)?, row.get(1)?)))
+        .or_query_error("Failed to execute id-only search")?
+        .collect::<Result<Vec<_>, _>>()
+        .or_query_error("Failed to read id-only search row")?;
+    let has_next = rows.len() > count;
+    if has_next {
+        rows.pop();
+    }
+    let has_previous = cursor.is_some();
+    let next_cursor = if has_next {
+        rows.last().map(|(id, updated)| {
+            PageCursor::new(vec![CursorValue::String(updated.clone())], id).encode()
+        })
+    } else {
+        None
+    };
+    let previous_cursor = if has_previous {
+        rows.first().map(|(id, updated)| {
+            PageCursor::previous(vec![CursorValue::String(updated.clone())], id).encode()
+        })
+    } else {
+        None
+    };
+    Ok(Page::new(
+        rows.into_iter().map(|(id, _)| id).collect(),
+        PageInfo {
+            next_cursor,
+            previous_cursor,
+            total: None,
+            has_next,
+            has_previous,
+        },
+    ))
+}
+
+/// The count of [`SearchProvider::search_count`] for a query without
+/// `_contained`, run on a blocking thread by the caller.
+/// The distinct indexed values of `reference_param` on the current,
+/// top-level resources matching `query`, for
+/// [`SearchProvider::search_reference_values`]. One statement: the filter's
+/// candidates are evaluated once, not once per page (#1930).
+fn search_reference_values_on(
+    conn: &rusqlite::Connection,
+    tenant: &TenantContext,
+    query: &SearchQuery,
+    reference_param: &str,
+) -> StorageResult<Vec<String>> {
+    reject_legacy_composites(conn, tenant, query)?;
+    let (sql, params) = reference_values_statement(tenant, query, reference_param);
+    let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+    let mut stmt = conn
+        .prepare(&sql)
+        .or_query_error("Failed to prepare reference-value query")?;
+    let values = stmt
+        .query_map(param_refs.as_slice(), |row| row.get::<_, String>(0))
+        .or_query_error("Failed to execute reference-value query")?
+        .collect::<Result<Vec<_>, _>>()
+        .or_query_error("Failed to read reference-value row")?;
+    Ok(values)
+}
+
+/// The statement of [`search_reference_values_on`] and its bound values.
+fn reference_values_statement(
+    tenant: &TenantContext,
+    query: &SearchQuery,
+    reference_param: &str,
+) -> (String, Vec<Box<dyn rusqlite::ToSql>>) {
+    let tenant_id = tenant.tenant_id().as_str();
+    let resource_type = &query.resource_type;
+
+    let fragment = (!query.parameters.is_empty()).then(|| {
+        QueryBuilder::new(tenant_id, resource_type)
+            .with_param_offset(2)
+            .build(query)
+    });
+    let filter = fragment
+        .as_ref()
+        .filter(|fragment| !fragment.sql.is_empty())
+        .map(|fragment| format!(" AND r.rowid IN ({})", fragment.sql))
+        .unwrap_or_default();
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![
+        Box::new(tenant_id.to_string()),
+        Box::new(resource_type.to_string()),
+    ];
+    for param in fragment.iter().flat_map(|fragment| &fragment.params) {
+        match param {
+            SqlParam::String(value) => params.push(Box::new(value.clone())),
+            SqlParam::Integer(value) => params.push(Box::new(*value)),
+            SqlParam::Float(value) => params.push(Box::new(*value)),
+            SqlParam::Null => params.push(Box::new(Option::<String>::None)),
+        }
+    }
+    params.push(Box::new(reference_param.to_string()));
+    let param_name = params.len();
+
+    // Drive from the candidates and probe `search_index` per candidate:
+    // `CROSS JOIN` keeps the candidates as the outer loop, the
+    // `(tenant_id, resource_type)` prefix lets the `resource_key` probe seek
+    // `idx_search_composite` (#1197), and the unary `+` keeps the planner off
+    // `idx_search_reference`, which would read every row of the parameter.
+    let sql = format!(
+        "SELECT DISTINCT si.value_reference \
+         FROM (SELECT r.rowid AS resource_key FROM resources r \
+                WHERE r.tenant_id = ?1 AND r.resource_type = ?2 AND r.is_deleted = 0{filter}) c \
+         CROSS JOIN search_index si \
+         WHERE si.tenant_id = ?1 AND si.resource_type = ?2 \
+           AND si.resource_key = c.resource_key \
+           AND +si.param_name = ?{param_name} \
+           AND si.is_contained = 0 \
+           AND si.value_reference IS NOT NULL"
+    );
+    (sql, params)
+}
+
+fn search_count_on(
+    conn: &rusqlite::Connection,
+    tenant: &TenantContext,
+    query: &SearchQuery,
+) -> StorageResult<u64> {
+    reject_legacy_composites(conn, tenant, query)?;
+    let tenant_id = tenant.tenant_id().as_str();
+    let resource_type = &query.resource_type;
+
+    // Build the search filter if there are search parameters or a compartment.
+    let (sql, all_params): (String, Vec<Box<dyn rusqlite::ToSql>>) = if !query.parameters.is_empty()
+        || query.compartment.is_some()
+    {
+        let builder = QueryBuilder::new(tenant_id, resource_type).with_param_offset(2);
+        let fragment = builder.build(query);
+
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![
+            Box::new(tenant_id.to_string()),
+            Box::new(resource_type.to_string()),
+        ];
+
+        // Add search params
+        for param in &fragment.params {
+            match param {
+                SqlParam::String(s) => params.push(Box::new(s.clone())),
+                SqlParam::Integer(i) => params.push(Box::new(*i)),
+                SqlParam::Float(f) => params.push(Box::new(*f)),
+                SqlParam::Null => params.push(Box::new(Option::<String>::None)),
+            }
+        }
+
+        let sql = format!(
+            "SELECT COUNT(*) FROM resources WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0 AND rowid IN ({})",
+            fragment.sql
+        );
+
+        (sql, params)
+    } else {
+        let sql = "SELECT COUNT(*) FROM resources WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0".to_string();
+        let params: Vec<Box<dyn rusqlite::ToSql>> = vec![
+            Box::new(tenant_id.to_string()),
+            Box::new(resource_type.to_string()),
+        ];
+        (sql, params)
+    };
+
+    let param_refs: Vec<&dyn rusqlite::ToSql> = all_params.iter().map(|p| p.as_ref()).collect();
+
+    let count: i64 = conn
+        .query_row(&sql, param_refs.as_slice(), |row| row.get(0))
+        .or_query_error("Failed to count resources")?;
+
+    Ok(count as u64)
+}
+
 #[async_trait]
 impl SearchProvider for SqliteBackend {
     async fn search(
@@ -473,8 +883,14 @@ impl SearchProvider for SqliteBackend {
             None
         };
 
-        let conn = self.get_connection()?;
-        self.search_with_connection(&conn, tenant, query, total)
+        // On a blocking thread, so that a chain resolver draining many pages
+        // yields between them: the request timeout can then fire and a
+        // dropped request stops after the page in flight (#1930).
+        let this = self.clone();
+        let tenant = tenant.clone();
+        let query = query.clone();
+        self.run_blocking(move |conn| this.search_with_connection(conn, &tenant, &query, total))
+            .await
     }
 
     async fn search_ids(
@@ -513,96 +929,10 @@ impl SearchProvider for SqliteBackend {
 
         reject_contained_missing(query)?;
         reject_unsupported_metadata_modifier(query)?;
-        let tenant_id = tenant.tenant_id().as_str();
-        let resource_type = &query.resource_type;
-        let param_offset = if cursor.is_some() { 4 } else { 2 };
-        let search_filter = if !query.parameters.is_empty() {
-            let fragment = QueryBuilder::new(tenant_id, resource_type)
-                .with_param_offset(param_offset)
-                .build(query);
-            if fragment.sql.is_empty() {
-                None
-            } else {
-                Some(fragment)
-            }
-        } else {
-            None
-        };
-        let filter_clause = search_filter
-            .as_ref()
-            .map(|fragment| format!(" AND rowid IN ({})", fragment.sql))
-            .unwrap_or_default();
-        let search_params = search_filter
-            .map(|fragment| fragment.params)
-            .unwrap_or_default();
-        let cursor_clause = if cursor.is_some() {
-            " AND (last_updated < ?3 OR (last_updated = ?3 AND id > ?4))"
-        } else {
-            ""
-        };
-        let count = query.count.unwrap_or(100) as usize;
-        let sql = format!(
-            "SELECT id, last_updated FROM resources \
-             WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0{filter_clause}{cursor_clause} \
-             ORDER BY last_updated DESC, id ASC LIMIT {}",
-            count + 1
-        );
-        let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![
-            Box::new(tenant_id.to_string()),
-            Box::new(resource_type.to_string()),
-        ];
-        if let Some(cursor) = &cursor {
-            bind_cursor_value(&mut params, SortValueKind::Timestamp, cursor)?;
-            params.push(Box::new(cursor.resource_id().to_string()));
-        }
-        for param in &search_params {
-            match param {
-                SqlParam::String(value) => params.push(Box::new(value.clone())),
-                SqlParam::Integer(value) => params.push(Box::new(*value)),
-                SqlParam::Float(value) => params.push(Box::new(*value)),
-                SqlParam::Null => params.push(Box::new(Option::<String>::None)),
-            }
-        }
-        let param_refs: Vec<&dyn rusqlite::ToSql> =
-            params.iter().map(|param| param.as_ref()).collect();
-        let conn = self.get_connection()?;
-        let mut stmt = conn
-            .prepare(&sql)
-            .or_query_error("Failed to prepare id-only search query")?;
-        let mut rows: Vec<(String, String)> = stmt
-            .query_map(param_refs.as_slice(), |row| Ok((row.get(0)?, row.get(1)?)))
-            .or_query_error("Failed to execute id-only search")?
-            .collect::<Result<Vec<_>, _>>()
-            .or_query_error("Failed to read id-only search row")?;
-        let has_next = rows.len() > count;
-        if has_next {
-            rows.pop();
-        }
-        let has_previous = cursor.is_some();
-        let next_cursor = if has_next {
-            rows.last().map(|(id, updated)| {
-                PageCursor::new(vec![CursorValue::String(updated.clone())], id).encode()
-            })
-        } else {
-            None
-        };
-        let previous_cursor = if has_previous {
-            rows.first().map(|(id, updated)| {
-                PageCursor::previous(vec![CursorValue::String(updated.clone())], id).encode()
-            })
-        } else {
-            None
-        };
-        Ok(Page::new(
-            rows.into_iter().map(|(id, _)| id).collect(),
-            PageInfo {
-                next_cursor,
-                previous_cursor,
-                total: None,
-                has_next,
-                has_previous,
-            },
-        ))
+        let tenant = tenant.clone();
+        let query = query.clone();
+        self.run_blocking(move |conn| search_ids_on(conn, &tenant, &query, cursor))
+            .await
     }
 
     async fn search_count(
@@ -620,56 +950,45 @@ impl SearchProvider for SqliteBackend {
             return Ok(plan.top_total + plan.keys.len() as u64);
         }
 
-        let conn = self.get_connection()?;
-        let tenant_id = tenant.tenant_id().as_str();
-        let resource_type = &query.resource_type;
+        let tenant = tenant.clone();
+        let query = query.clone();
+        self.run_blocking(move |conn| search_count_on(conn, &tenant, &query))
+            .await
+    }
 
-        // Build the search filter if there are search parameters or a compartment.
-        let (sql, all_params): (String, Vec<Box<dyn rusqlite::ToSql>>) = if !query
-            .parameters
-            .is_empty()
+    async fn search_reference_values(
+        &self,
+        tenant: &TenantContext,
+        query: &SearchQuery,
+        reference_param: &str,
+    ) -> StorageResult<Option<Vec<String>>> {
+        // Only the plain single-type filter the resolver builds, over an index
+        // this backend maintains; anything else keeps the paged path.
+        if self.is_search_offloaded()
+            || !query.sort.is_empty()
+            || query.offset.is_some()
+            || query.cursor.is_some()
+            || query.contained != crate::types::ContainedMode::Off
+            || !query.includes.is_empty()
+            || query.total.is_some()
+            || query.summary.is_some()
+            || !query.elements.is_empty()
             || query.compartment.is_some()
+            || !query.list.is_empty()
+            || !query.reverse_chains.is_empty()
         {
-            let builder = QueryBuilder::new(tenant_id, resource_type).with_param_offset(2);
-            let fragment = builder.build(query);
-
-            let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![
-                Box::new(tenant_id.to_string()),
-                Box::new(resource_type.to_string()),
-            ];
-
-            // Add search params
-            for param in &fragment.params {
-                match param {
-                    SqlParam::String(s) => params.push(Box::new(s.clone())),
-                    SqlParam::Integer(i) => params.push(Box::new(*i)),
-                    SqlParam::Float(f) => params.push(Box::new(*f)),
-                    SqlParam::Null => params.push(Box::new(Option::<String>::None)),
-                }
-            }
-
-            let sql = format!(
-                "SELECT COUNT(*) FROM resources WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0 AND rowid IN ({})",
-                fragment.sql
-            );
-
-            (sql, params)
-        } else {
-            let sql = "SELECT COUNT(*) FROM resources WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0".to_string();
-            let params: Vec<Box<dyn rusqlite::ToSql>> = vec![
-                Box::new(tenant_id.to_string()),
-                Box::new(resource_type.to_string()),
-            ];
-            (sql, params)
-        };
-
-        let param_refs: Vec<&dyn rusqlite::ToSql> = all_params.iter().map(|p| p.as_ref()).collect();
-
-        let count: i64 = conn
-            .query_row(&sql, param_refs.as_slice(), |row| row.get(0))
-            .or_query_error("Failed to count resources")?;
-
-        Ok(count as u64)
+            return Ok(None);
+        }
+        reject_contained_missing(query)?;
+        reject_unsupported_metadata_modifier(query)?;
+        let tenant = tenant.clone();
+        let query = query.clone();
+        let reference_param = reference_param.to_string();
+        self.run_blocking(move |conn| {
+            search_reference_values_on(conn, &tenant, &query, &reference_param)
+        })
+        .await
+        .map(Some)
     }
 
     fn search_param_registry(
@@ -946,159 +1265,6 @@ impl RevincludeProvider for SqliteBackend {
     }
 }
 
-#[async_trait]
-impl ChainedSearchProvider for SqliteBackend {
-    async fn resolve_chain(
-        &self,
-        tenant: &TenantContext,
-        base_type: &str,
-        chain: &str,
-        value: &str,
-    ) -> StorageResult<Vec<String>> {
-        use super::search::ChainQueryBuilder;
-
-        let conn = self.get_connection()?;
-        let tenant_id = tenant.tenant_id().as_str();
-
-        if chain.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        // Create the chain query builder with registry access
-        let builder = ChainQueryBuilder::new(tenant_id, base_type, self.tenant_registry(tenant_id))
-            .with_param_offset(2); // After ?1 (tenant) and ?2 (resource_type)
-
-        // Parse the chain
-        let parsed = match builder.parse_chain(chain) {
-            Ok(p) => p,
-            Err(e) => {
-                return Err(internal_error(format!("Failed to parse chain: {}", e)));
-            }
-        };
-
-        // Build the SQL fragment. The chained value still carries its
-        // comparator prefix (`patient.birthdate=le1956-07-14`); strip it only
-        // when the terminal parameter's type admits one — date, number and
-        // quantity, explicit `eq` included — so a string or token value is
-        // never misread: not `family=Levine` as le + "vine" (#258), nor
-        // `family=nelson` as ne + "lson" (#1307).
-        let search_value = SearchValue::parse_for_type(value, parsed.terminal_type);
-        let fragment = match builder.build_forward_chain_sql(&parsed, &search_value) {
-            Ok(f) => f,
-            Err(e) => {
-                return Err(internal_error(format!("Failed to build chain SQL: {}", e)));
-            }
-        };
-
-        // Execute the query to get matching IDs
-        // The fragment generates: r.id IN (SELECT ...)
-        // We need to wrap it in a proper SELECT FROM resources
-        let sql = format!(
-            "SELECT DISTINCT r.id FROM resources r \
-             WHERE r.tenant_id = ?1 AND r.resource_type = ?2 AND r.is_deleted = 0 AND {}",
-            fragment.sql
-        );
-
-        // Bind parameters: tenant_id, resource_type, then fragment params
-        let mut stmt = conn
-            .prepare(&sql)
-            .or_query_error("Failed to prepare chain query")?;
-
-        // Build parameter vector for rusqlite
-        let mut bound_params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-        bound_params.push(Box::new(tenant_id.to_string()));
-        bound_params.push(Box::new(base_type.to_string()));
-        for param in &fragment.params {
-            match param {
-                SqlParam::String(s) => bound_params.push(Box::new(s.clone())),
-                SqlParam::Integer(i) => bound_params.push(Box::new(*i)),
-                SqlParam::Float(f) => bound_params.push(Box::new(*f)),
-                SqlParam::Null => bound_params.push(Box::new(rusqlite::types::Null)),
-            }
-        }
-
-        let params_ref: Vec<&dyn rusqlite::ToSql> =
-            bound_params.iter().map(|p| p.as_ref()).collect();
-
-        let rows = stmt
-            .query_map(params_ref.as_slice(), |row| row.get::<_, String>(0))
-            .or_query_error("Failed to execute chain query")?;
-
-        let mut ids = Vec::new();
-        for row in rows {
-            ids.push(row.or_query_error("Failed to read row")?);
-        }
-
-        Ok(ids)
-    }
-
-    async fn resolve_reverse_chain(
-        &self,
-        tenant: &TenantContext,
-        base_type: &str,
-        reverse_chain: &ReverseChainedParameter,
-    ) -> StorageResult<Vec<String>> {
-        use super::search::ChainQueryBuilder;
-
-        let conn = self.get_connection()?;
-        let tenant_id = tenant.tenant_id().as_str();
-
-        // Create the chain query builder with registry access
-        let builder = ChainQueryBuilder::new(tenant_id, base_type, self.tenant_registry(tenant_id))
-            .with_param_offset(2); // After ?1 (tenant) and ?2 (resource_type)
-
-        // Build the SQL fragment for reverse chain
-        let fragment = match builder.build_reverse_chain_sql(reverse_chain) {
-            Ok(f) => f,
-            Err(e) => {
-                return Err(internal_error(format!(
-                    "Failed to build reverse chain SQL: {}",
-                    e
-                )));
-            }
-        };
-
-        // Execute the query to get matching IDs
-        // The fragment generates: r.id IN (SELECT ...)
-        let sql = format!(
-            "SELECT DISTINCT r.id FROM resources r \
-             WHERE r.tenant_id = ?1 AND r.resource_type = ?2 AND r.is_deleted = 0 AND {}",
-            fragment.sql
-        );
-
-        let mut stmt = conn
-            .prepare(&sql)
-            .or_query_error("Failed to prepare reverse chain query")?;
-
-        // Build parameter vector for rusqlite
-        let mut bound_params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-        bound_params.push(Box::new(tenant_id.to_string()));
-        bound_params.push(Box::new(base_type.to_string()));
-        for param in &fragment.params {
-            match param {
-                SqlParam::String(s) => bound_params.push(Box::new(s.clone())),
-                SqlParam::Integer(i) => bound_params.push(Box::new(*i)),
-                SqlParam::Float(f) => bound_params.push(Box::new(*f)),
-                SqlParam::Null => bound_params.push(Box::new(rusqlite::types::Null)),
-            }
-        }
-
-        let params_ref: Vec<&dyn rusqlite::ToSql> =
-            bound_params.iter().map(|p| p.as_ref()).collect();
-
-        let rows = stmt
-            .query_map(params_ref.as_slice(), |row| row.get::<_, String>(0))
-            .or_query_error("Failed to execute reverse chain query")?;
-
-        let mut ids = Vec::new();
-        for row in rows {
-            ids.push(row.or_query_error("Failed to read row")?);
-        }
-
-        Ok(ids)
-    }
-}
-
 /// Finds the `contained[]` entry with the given local `id` in a container's
 /// content.
 fn extract_contained_resource(
@@ -1214,6 +1380,10 @@ impl SqliteBackend {
     ) -> StorageResult<ContainedPlan> {
         use crate::types::{ContainedMode, ContainedReturn, SearchParamType, SearchParameter};
 
+        {
+            let conn = self.get_connection()?;
+            reject_legacy_composites(&conn, tenant, query)?;
+        }
         let mut keys = self.contained_matches(tenant.tenant_id().as_str(), query)?;
         if query.contained_return == ContainedReturn::Container {
             for key in &mut keys {
@@ -1597,6 +1767,146 @@ mod tests {
             TenantId::new("test-tenant"),
             TenantPermissions::full_access(),
         )
+    }
+
+    #[tokio::test]
+    async fn composite_legacy_guard_uses_the_supplied_transaction_connection() {
+        use crate::types::{CompositeSearchComponent, SearchParamType, SearchValue};
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        backend.create(&tenant,"Observation",json!({"resourceType":"Observation","id":"o","status":"final","code":{"coding":[{"code":"A"}]},"valueCodeableConcept":{"coding":[{"code":"B"}]}}),FhirVersion::default()).await.unwrap();
+        let mut query = SearchQuery::new("Observation");
+        query.count = Some(0);
+        query.parameters.push(SearchParameter {
+            name: "code-value-concept".into(),
+            param_type: SearchParamType::Composite,
+            values: vec![SearchValue::eq("missing$missing")],
+            components: vec![
+                CompositeSearchComponent {
+                    param_type: SearchParamType::Token,
+                    param_name: "code".into(),
+                },
+                CompositeSearchComponent {
+                    param_type: SearchParamType::Token,
+                    param_name: "value-concept".into(),
+                },
+            ],
+            ..Default::default()
+        });
+        let explain_real_probe = |conn: &rusqlite::Connection| {
+            for contained in [false, true] {
+                let sql = format!(
+                    "EXPLAIN QUERY PLAN {}",
+                    legacy_composite_probe_sql(conn, contained).unwrap()
+                );
+                let plan = conn
+                    .prepare(&sql)
+                    .unwrap()
+                    .query_map(
+                        params![
+                            tenant.tenant_id().as_str(),
+                            "Observation",
+                            "code-value-concept"
+                        ],
+                        |row| row.get::<_, String>(3),
+                    )
+                    .unwrap()
+                    .map(Result::unwrap)
+                    .collect::<Vec<_>>()
+                    .join(" | ");
+                let index = if contained {
+                    "idx_search_contained_composite_legacy"
+                } else {
+                    "idx_search_composite_legacy"
+                };
+                assert!(plan.contains(index), "real probe {plan}");
+                assert!(!plan.contains("SCAN search_index"), "{plan}");
+            }
+        };
+        {
+            let conn = backend.get_connection().unwrap();
+            conn.execute_batch("BEGIN IMMEDIATE; UPDATE search_index SET composite_slot=NULL WHERE param_name='code-value-concept'").unwrap();
+            let error = backend
+                .search_with_connection(&conn, &tenant, &query, None)
+                .unwrap_err();
+            assert!(error.to_string().contains("$reindex"), "{error}");
+            for (missing, expected) in [(false, 1), (true, 0)] {
+                for count in [0, 100] {
+                    let mut presence = query.clone();
+                    presence.parameters[0].modifier = Some(crate::types::SearchModifier::Missing);
+                    presence.parameters[0].values = vec![SearchValue::eq(missing.to_string())];
+                    presence.count = Some(count);
+                    let result = backend
+                        .search_with_connection(&conn, &tenant, &presence, None)
+                        .unwrap();
+                    assert_eq!(
+                        result.resources.items.len(),
+                        if count == 0 { 0 } else { expected }
+                    );
+                }
+            }
+            explain_real_probe(&conn);
+            let stale_sql = legacy_composite_probe_sql(&conn, false).unwrap();
+            let definition: String = conn
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE name='idx_search_composite_legacy'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            conn.execute("DROP INDEX idx_search_composite_legacy", [])
+                .unwrap();
+            assert!(
+                run_legacy_composite_probe(
+                    &conn,
+                    &stale_sql,
+                    tenant.tenant_id().as_str(),
+                    "Observation",
+                    "code-value-concept"
+                )
+                .unwrap()
+                .is_some(),
+                "a concurrent bulk drop between metadata and prepare retains the guard"
+            );
+            assert!(
+                run_legacy_composite_probe(
+                    &conn,
+                    "SELECT invalid_column FROM search_index",
+                    tenant.tenant_id().as_str(),
+                    "Observation",
+                    "code-value-concept"
+                )
+                .is_err(),
+                "other SQL errors are not hidden by fallback"
+            );
+            conn.execute(&definition, []).unwrap();
+            conn.execute_batch("ROLLBACK").unwrap();
+            explain_real_probe(&conn);
+        }
+        assert!(backend.search(&tenant, &query).await.is_ok());
+        for component in &mut query.parameters[0].components {
+            component.param_type = SearchParamType::Reference;
+        }
+        for mode in [
+            crate::types::ContainedMode::Off,
+            crate::types::ContainedMode::On,
+            crate::types::ContainedMode::Both,
+        ] {
+            query.contained = mode;
+            let error = backend
+                .search(&tenant, &query)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("code-value-concept") && error.contains("unsupported repeated"),
+                "{error}"
+            );
+            assert!(
+                !error.contains("$reindex"),
+                "an unsupported shape cannot be repaired by reindex: {error}"
+            );
+        }
     }
 
     fn composite_query(v: &str) -> SearchQuery {
@@ -2610,734 +2920,72 @@ mod tests {
     }
 
     // ========================================================================
-    // ChainedSearchProvider Tests
+    // Chained Search Tests
     // ========================================================================
 
-    /// #258: a chained value keeps its comparator prefix when the terminal
-    /// parameter compares (dates), and never loses its head to one when it
-    /// does not (a family name starting with a valid prefix pair).
-    #[tokio::test]
-    async fn test_resolve_chain_comparator_prefix() {
+    /// #1930: the reference-value read reaches `search_index` by
+    /// `resource_key` through `idx_search_composite`, never by scanning the
+    /// table or every row of the reference parameter.
+    #[test]
+    fn reference_values_probe_the_composite_index_by_resource_key() {
         let backend = create_test_backend();
         let tenant = create_test_tenant();
-
-        backend
-            .create(
-                &tenant,
-                "Patient",
-                json!({"id": "p1", "birthDate": "1950-04-12", "name": [{"family": "Levine"}]}),
-                FhirVersion::default(),
-            )
-            .await
+        let query = SearchQuery::new("Observation").with_parameter(SearchParameter {
+            name: "code".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: None,
+            values: vec![SearchValue::eq("http://loinc.org|8302-2")],
+            chain: vec![],
+            components: vec![],
+        });
+        let (sql, params) = reference_values_statement(&tenant, &query, "patient");
+        let conn = backend.get_connection().unwrap();
+        let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+        let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        let plan: Vec<String> = stmt
+            .query_map(param_refs.as_slice(), |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<_, _>>()
             .unwrap();
-        backend
-            .create(
-                &tenant,
-                "Observation",
-                json!({"id": "o1", "subject": {"reference": "Patient/p1"}}),
-                FhirVersion::default(),
-            )
-            .await
-            .unwrap();
-
-        // The comparator reaches the date comparison: le on a later date
-        // matches, gt1900 matches everyone, le on an earlier date excludes.
-        let ids = backend
-            .resolve_chain(&tenant, "Observation", "subject.birthdate", "le1956-07-14")
-            .await
-            .unwrap();
-        assert_eq!(ids, vec!["o1".to_string()], "le includes the 1950 birth");
-        let ids = backend
-            .resolve_chain(&tenant, "Observation", "subject.birthdate", "gt1900-01-01")
-            .await
-            .unwrap();
-        assert_eq!(ids, vec!["o1".to_string()], "gt1900 matches every patient");
-        let ids = backend
-            .resolve_chain(&tenant, "Observation", "subject.birthdate", "le1940-01-01")
-            .await
-            .unwrap();
-        assert!(ids.is_empty(), "le on an earlier date excludes");
-
-        // A string value beginning with a valid prefix pair stays whole:
-        // family=Levine must not become le + "vine".
-        let ids = backend
-            .resolve_chain(&tenant, "Observation", "subject.family", "Levine")
-            .await
-            .unwrap();
-        assert_eq!(ids, vec!["o1".to_string()], "Levine matches, unclipped");
-    }
-
-    /// Seeds the #1307 fixture through the real write path. Every terminal
-    /// value that begins with a comparator pair (`ne…`, `eq…`) has a decoy
-    /// whose value is what is left once the pair is wrongly stripped, so a
-    /// misparse shows up as the decoy being returned.
-    async fn seed_chain_prefix_fixture(backend: &SqliteBackend, tenant: &TenantContext) {
-        let resources = [
-            (
-                "Patient",
-                json!({"id": "nelson-1", "birthDate": "1950-04-12", "name": [{"family": "Nelson"}]}),
-            ),
-            (
-                "Patient",
-                json!({"id": "wilson-1", "birthDate": "1960-01-01", "name": [{"family": "Wilson"}]}),
-            ),
-            (
-                "Patient",
-                json!({"id": "equus-1", "birthDate": "1970-01-01", "name": [{"family": "Equus"}]}),
-            ),
-            ("Device", json!({"id": "dev-news", "url": "news:example/1"})),
-            ("Device", json!({"id": "dev-ws", "url": "ws:example/1"})),
-            (
-                "MolecularSequence",
-                json!({"id": "ms-10", "coordinateSystem": 0, "referenceSeq": {"windowStart": 10}}),
-            ),
-            (
-                "MolecularSequence",
-                json!({"id": "ms-0", "coordinateSystem": 0, "referenceSeq": {"windowStart": 0}}),
-            ),
-            (
-                "Observation",
-                json!({
-                    "id": "o-nelson", "status": "final",
-                    "code": {"coding": [{"system": "http://example.org/c", "code": "ne123"}]},
-                    "subject": {"reference": "Patient/nelson-1"},
-                    "device": {"reference": "Device/dev-news"},
-                    "derivedFrom": [{"reference": "MolecularSequence/ms-10"}],
-                    "valueQuantity": {"value": 5.4, "unit": "mg"},
-                }),
-            ),
-            (
-                "Observation",
-                json!({
-                    "id": "o-wilson", "status": "final",
-                    "code": {"coding": [{"system": "http://example.org/c", "code": "123"}]},
-                    "subject": {"reference": "Patient/wilson-1"},
-                    "device": {"reference": "Device/dev-ws"},
-                    "derivedFrom": [{"reference": "MolecularSequence/ms-0"}],
-                    "valueQuantity": {"value": 0, "unit": "mg"},
-                }),
-            ),
-            (
-                "Observation",
-                json!({
-                    "id": "o-equus", "status": "final",
-                    "code": {"coding": [{"system": "http://example.org/c", "code": "eq77"}]},
-                    "subject": {"reference": "Patient/equus-1"},
-                    "valueQuantity": {"value": 7.0, "unit": "mg"},
-                }),
-            ),
-            (
-                "Observation",
-                json!({
-                    "id": "o-77", "status": "final",
-                    "code": {"coding": [{"system": "http://example.org/c", "code": "77"}]},
-                    "valueQuantity": {"value": 9.0, "unit": "mg"},
-                }),
-            ),
-        ];
-        for (resource_type, body) in resources {
-            backend
-                .create(tenant, resource_type, body, FhirVersion::default())
-                .await
-                .unwrap();
-        }
-        for obs in ["o-nelson", "o-wilson", "o-equus", "o-77"] {
-            backend
-                .create(
-                    tenant,
-                    "DiagnosticReport",
-                    json!({
-                        "id": obs.replacen("o-", "dr-", 1), "status": "final",
-                        "code": {"text": "panel"},
-                        "result": [{"reference": format!("Observation/{obs}")}],
-                    }),
-                    FhirVersion::default(),
-                )
-                .await
-                .unwrap();
-        }
-    }
-
-    /// #1307: through the `ChainedSearchProvider` trait API a comparator
-    /// prefix is recognised only on date / number / quantity terminals —
-    /// including an explicit `eq` — and never on string / token / reference /
-    /// uri terminals, whatever the value starts with.
-    #[tokio::test]
-    async fn test_resolve_chain_prefix_only_on_ordered_terminals() {
-        const WINDOW_START: &str = "derived-from:MolecularSequence.window-start";
-        const VALUE_QUANTITY: &str = "result.value-quantity";
-
-        let backend = create_test_backend();
-        let tenant = create_test_tenant();
-        seed_chain_prefix_fixture(&backend, &tenant).await;
-
-        let cases: &[(&str, &str, &str, &[&str])] = &[
-            // Positive controls: unprefixed values prove each terminal is
-            // indexed, so the cases below cannot pass or fail vacuously.
-            ("Observation", "subject.family", "Wilson", &["o-wilson"]),
-            ("DiagnosticReport", "result.code", "123", &["dr-wilson"]),
-            (
-                "DiagnosticReport",
-                "result.subject",
-                "wilson-1",
-                &["dr-wilson"],
-            ),
-            (
-                "Observation",
-                "device:Device.url",
-                "ws:example/1",
-                &["o-wilson"],
-            ),
-            ("DiagnosticReport", VALUE_QUANTITY, "5.4", &["dr-nelson"]),
-            ("Observation", WINDOW_START, "10", &["o-nelson"]),
-            (
-                "Observation",
-                "subject.birthdate",
-                "1950-04-12",
-                &["o-nelson"],
-            ),
-            // String terminal: `ne` + "lson" would also match Wilson.
-            ("Observation", "subject.family", "nelson", &["o-nelson"]),
-            ("Observation", "subject.family", "Nelson", &["o-nelson"]),
-            ("Observation", "subject.family", "Equus", &["o-equus"]),
-            // Token terminal: `ne` + "123" / `eq` + "77" are the decoys' codes.
-            ("DiagnosticReport", "result.code", "ne123", &["dr-nelson"]),
-            ("DiagnosticReport", "result.code", "eq77", &["dr-equus"]),
-            // Reference terminal: `ne` + "lson-1" would also match wilson-1.
-            (
-                "DiagnosticReport",
-                "result.subject",
-                "nelson-1",
-                &["dr-nelson"],
-            ),
-            // Uri terminal: `ne` + "ws:example/1" is the decoy's url.
-            (
-                "Observation",
-                "device:Device.url",
-                "news:example/1",
-                &["o-nelson"],
-            ),
-            // Quantity terminal: explicit `eq` is a prefix, as are the rest.
-            ("DiagnosticReport", VALUE_QUANTITY, "eq5.4", &["dr-nelson"]),
-            (
-                "DiagnosticReport",
-                VALUE_QUANTITY,
-                "ne5.4",
-                &["dr-77", "dr-equus", "dr-wilson"],
-            ),
-            (
-                "DiagnosticReport",
-                VALUE_QUANTITY,
-                "gt6",
-                &["dr-77", "dr-equus"],
-            ),
-            // Number terminal, likewise.
-            ("Observation", WINDOW_START, "eq10", &["o-nelson"]),
-            ("Observation", WINDOW_START, "ne10", &["o-wilson"]),
-            ("Observation", WINDOW_START, "gt5", &["o-nelson"]),
-            // Date terminal with an explicit `eq`.
-            (
-                "Observation",
-                "subject.birthdate",
-                "eq1950-04-12",
-                &["o-nelson"],
-            ),
-        ];
-
-        let mut failures = Vec::new();
-        for (base, chain, value, expected) in cases {
-            let mut ids = backend
-                .resolve_chain(&tenant, base, chain, value)
-                .await
-                .unwrap_or_else(|e| panic!("{base}?{chain}={value}: {e}"));
-            ids.sort();
-            let expected: Vec<String> = expected.iter().map(|s| s.to_string()).collect();
-            if ids != expected {
-                failures.push(format!(
-                    "{base}?{chain}={value}: got {ids:?}, want {expected:?}"
-                ));
-            }
-        }
-        assert!(failures.is_empty(), "\n{}", failures.join("\n"));
-    }
-
-    #[tokio::test]
-    async fn test_resolve_chain_simple() {
-        let backend = create_test_backend();
-        let tenant = create_test_tenant();
-        let tenant_id = tenant.tenant_id().as_str();
-
-        // Create patients
-        backend
-            .create(
-                &tenant,
-                "Patient",
-                json!({"id": "p1", "name": [{"family": "Smith"}]}),
-                FhirVersion::default(),
-            )
-            .await
-            .unwrap();
-        backend
-            .create(
-                &tenant,
-                "Patient",
-                json!({"id": "p2", "name": [{"family": "Jones"}]}),
-                FhirVersion::default(),
-            )
-            .await
-            .unwrap();
-
-        // Create observations
-        backend
-            .create(
-                &tenant,
-                "Observation",
-                json!({
-                    "id": "o1",
-                    "subject": {"reference": "Patient/p1"}
-                }),
-                FhirVersion::default(),
-            )
-            .await
-            .unwrap();
-        backend
-            .create(
-                &tenant,
-                "Observation",
-                json!({
-                    "id": "o2",
-                    "subject": {"reference": "Patient/p2"}
-                }),
-                FhirVersion::default(),
-            )
-            .await
-            .unwrap();
-
-        // Manually insert search index entries since FHIRPath extraction
-        // may not fully populate them due to unsupported functions
-        {
-            let conn = backend.get_connection().unwrap();
-            // Insert patient names
-            conn.execute(
-                "INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name, value_string)
-                 VALUES (?1, 'Patient', 'p1', 'name', 'Smith')",
-                params![tenant_id],
-            ).unwrap();
-            conn.execute(
-                "INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name, value_string)
-                 VALUES (?1, 'Patient', 'p2', 'name', 'Jones')",
-                params![tenant_id],
-            ).unwrap();
-            // Insert observation subject references
-            conn.execute(
-                "INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name, value_reference)
-                 VALUES (?1, 'Observation', 'o1', 'subject', 'Patient/p1')",
-                params![tenant_id],
-            ).unwrap();
-            conn.execute(
-                "INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name, value_reference)
-                 VALUES (?1, 'Observation', 'o2', 'subject', 'Patient/p2')",
-                params![tenant_id],
-            ).unwrap();
-        }
-
-        // Find observations where patient.name contains "Smith"
-        let matching_ids = backend
-            .resolve_chain(&tenant, "Observation", "subject.name", "Smith")
-            .await
-            .unwrap();
-
-        assert_eq!(matching_ids.len(), 1);
-        assert!(matching_ids.contains(&"o1".to_string()));
-    }
-
-    #[tokio::test]
-    async fn test_resolve_chain_no_match() {
-        let backend = create_test_backend();
-        let tenant = create_test_tenant();
-        let tenant_id = tenant.tenant_id().as_str();
-
-        // Create patient
-        backend
-            .create(
-                &tenant,
-                "Patient",
-                json!({"id": "p1", "name": [{"family": "Smith"}]}),
-                FhirVersion::default(),
-            )
-            .await
-            .unwrap();
-
-        // Create observation
-        backend
-            .create(
-                &tenant,
-                "Observation",
-                json!({
-                    "id": "o1",
-                    "subject": {"reference": "Patient/p1"}
-                }),
-                FhirVersion::default(),
-            )
-            .await
-            .unwrap();
-
-        // Manually insert search index entries
-        {
-            let conn = backend.get_connection().unwrap();
-            conn.execute(
-                "INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name, value_string)
-                 VALUES (?1, 'Patient', 'p1', 'name', 'Smith')",
-                params![tenant_id],
-            ).unwrap();
-            conn.execute(
-                "INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name, value_reference)
-                 VALUES (?1, 'Observation', 'o1', 'subject', 'Patient/p1')",
-                params![tenant_id],
-            ).unwrap();
-        }
-
-        // Search for non-existent name
-        let matching_ids = backend
-            .resolve_chain(&tenant, "Observation", "subject.name", "Nonexistent")
-            .await
-            .unwrap();
-
-        assert!(matching_ids.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_resolve_reverse_chain() {
-        let backend = create_test_backend();
-        let tenant = create_test_tenant();
-        let tenant_id = tenant.tenant_id().as_str();
-
-        // Create patients
-        backend
-            .create(
-                &tenant,
-                "Patient",
-                json!({"id": "p1"}),
-                FhirVersion::default(),
-            )
-            .await
-            .unwrap();
-        backend
-            .create(
-                &tenant,
-                "Patient",
-                json!({"id": "p2"}),
-                FhirVersion::default(),
-            )
-            .await
-            .unwrap();
-
-        // Create observations with codes
-        backend
-            .create(
-                &tenant,
-                "Observation",
-                json!({
-                    "id": "o1",
-                    "subject": {"reference": "Patient/p1"},
-                    "code": {"coding": [{"code": "8867-4"}]}
-                }),
-                FhirVersion::default(),
-            )
-            .await
-            .unwrap();
-        backend
-            .create(
-                &tenant,
-                "Observation",
-                json!({
-                    "id": "o2",
-                    "subject": {"reference": "Patient/p2"},
-                    "code": {"coding": [{"code": "other"}]}
-                }),
-                FhirVersion::default(),
-            )
-            .await
-            .unwrap();
-
-        // Manually insert search index entries since FHIRPath extraction
-        // may not fully populate them due to unsupported functions
-        {
-            let conn = backend.get_connection().unwrap();
-            // Insert subject references for observations
-            conn.execute(
-                "INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name, value_reference)
-                 VALUES (?1, 'Observation', 'o1', 'subject', 'Patient/p1')",
-                params![tenant_id],
-            ).unwrap();
-            conn.execute(
-                "INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name, value_reference)
-                 VALUES (?1, 'Observation', 'o2', 'subject', 'Patient/p2')",
-                params![tenant_id],
-            ).unwrap();
-            // Insert code tokens for observations
-            conn.execute(
-                "INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name, value_token_code)
-                 VALUES (?1, 'Observation', 'o1', 'code', '8867-4')",
-                params![tenant_id],
-            ).unwrap();
-            conn.execute(
-                "INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name, value_token_code)
-                 VALUES (?1, 'Observation', 'o2', 'code', 'other')",
-                params![tenant_id],
-            ).unwrap();
-        }
-
-        // _has:Observation:subject:code=8867-4
-        let reverse_chain = ReverseChainedParameter::terminal(
-            "Observation",
-            "subject",
-            "code",
-            crate::types::SearchValue::eq("8867-4"),
+        assert!(
+            plan.iter().any(|line| line.starts_with("SEARCH si")
+                && line.contains("idx_search_composite")
+                && line.contains("resource_key=?")),
+            "{plan:#?}"
         );
-
-        let matching_ids = backend
-            .resolve_reverse_chain(&tenant, "Patient", &reverse_chain)
-            .await
-            .unwrap();
-
-        // Should find p1 (referenced by observation with code 8867-4)
-        assert_eq!(matching_ids.len(), 1);
-        assert!(matching_ids.contains(&"p1".to_string()));
-    }
-
-    /// #1389, end to end on real rows: `system|` on a chained token terminal
-    /// matches every code in that system, forward and reverse. The SQL text
-    /// tests cannot show the predicate matches anything.
-    #[tokio::test]
-    async fn test_resolve_chain_system_only_token_matches_rows() {
-        let backend = create_test_backend();
-        let tenant = create_test_tenant();
-        let tenant_id = tenant.tenant_id().as_str();
-
-        for (ty, id, body) in [
-            ("Patient", "p1", json!({"id": "p1"})),
-            ("Patient", "p2", json!({"id": "p2"})),
-            (
-                "Observation",
-                "o1",
-                json!({"id": "o1", "subject": {"reference": "Patient/p1"}}),
-            ),
-            (
-                "Observation",
-                "o2",
-                json!({"id": "o2", "subject": {"reference": "Patient/p2"}}),
-            ),
-        ] {
-            let _ = id;
-            backend
-                .create(&tenant, ty, body, FhirVersion::default())
-                .await
-                .unwrap();
-        }
-        {
-            let conn = backend.get_connection().unwrap();
-            for (rt, rid, name, refv) in [
-                ("Observation", "o1", "subject", "Patient/p1"),
-                ("Observation", "o2", "subject", "Patient/p2"),
-            ] {
-                conn.execute(
-                    "INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name, value_reference)
-                     VALUES (?1, ?2, ?3, ?4, ?5)",
-                    params![tenant_id, rt, rid, name, refv],
-                )
-                .unwrap();
-            }
-            for (rt, rid, name, sys, code) in [
-                ("Patient", "p1", "identifier", "http://ex.org/mrn", "MRN1"),
-                ("Patient", "p2", "identifier", "http://other.example", "X1"),
-                ("Observation", "o1", "code", "http://loinc.org", "8867-4"),
-                (
-                    "Observation",
-                    "o2",
-                    "code",
-                    "http://snomed.info/sct",
-                    "271649006",
-                ),
-            ] {
-                conn.execute(
-                    "INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name, value_token_system, value_token_code)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    params![tenant_id, rt, rid, name, sys, code],
-                )
-                .unwrap();
-            }
-        }
-
-        let forward = backend
-            .resolve_chain(
-                &tenant,
-                "Observation",
-                "subject.identifier",
-                "http://ex.org/mrn|",
-            )
-            .await
-            .unwrap();
-        assert_eq!(forward, vec!["o1".to_string()]);
-
-        let reverse_chain = ReverseChainedParameter::terminal(
-            "Observation",
-            "subject",
-            "code",
-            crate::types::SearchValue::eq("http://loinc.org|"),
+        assert!(
+            !plan.iter().any(|line| line.starts_with("SCAN si")),
+            "{plan:#?}"
         );
-        let reverse = backend
-            .resolve_reverse_chain(&tenant, "Patient", &reverse_chain)
-            .await
-            .unwrap();
-        assert_eq!(reverse, vec!["p1".to_string()]);
     }
 
+    /// #1930: search, id-only search and count wait for SQLite on a blocking
+    /// thread. With the pool's only connection held, the first poll of each
+    /// is pending instead of parking the async worker until the pool times
+    /// out, so a request timeout or a dropped request can take effect.
     #[tokio::test]
-    async fn test_resolve_chain_multi_level() {
-        // Test 3-level chain: Observation?subject.organization.name=Hospital
-        let backend = create_test_backend();
+    async fn search_waits_for_sqlite_off_the_async_worker() {
+        let mut config = crate::backends::sqlite::backend::SqliteBackendConfig::default();
+        config.max_connections = 1;
+        config.min_connections = 1;
+        config.connection_timeout_ms = 2_000;
+        let backend = SqliteBackend::with_config(":memory:", config).unwrap();
+        backend.init_schema().unwrap();
         let tenant = create_test_tenant();
-        let tenant_id = tenant.tenant_id().as_str();
+        let query = SearchQuery::new("Patient");
 
-        // Create organization
-        backend
-            .create(
-                &tenant,
-                "Organization",
-                json!({"id": "org1", "name": "General Hospital"}),
-                FhirVersion::default(),
-            )
-            .await
-            .unwrap();
+        let held = backend.get_connection().unwrap();
+        let mut search = Box::pin(backend.search(&tenant, &query));
+        let mut ids = Box::pin(backend.search_ids(&tenant, &query));
+        let mut count = Box::pin(backend.search_count(&tenant, &query));
+        assert!(futures::poll!(&mut search).is_pending(), "search");
+        assert!(futures::poll!(&mut ids).is_pending(), "search_ids");
+        assert!(futures::poll!(&mut count).is_pending(), "search_count");
+        drop(held);
 
-        // Create patient linked to organization
-        backend
-            .create(
-                &tenant,
-                "Patient",
-                json!({"id": "p1", "managingOrganization": {"reference": "Organization/org1"}}),
-                FhirVersion::default(),
-            )
-            .await
-            .unwrap();
-
-        // Create observation linked to patient
-        backend
-            .create(
-                &tenant,
-                "Observation",
-                json!({"id": "o1", "subject": {"reference": "Patient/p1"}}),
-                FhirVersion::default(),
-            )
-            .await
-            .unwrap();
-
-        // Manually insert search index entries
-        {
-            let conn = backend.get_connection().unwrap();
-            // Organization name
-            conn.execute(
-                "INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name, value_string)
-                 VALUES (?1, 'Organization', 'org1', 'name', 'General Hospital')",
-                params![tenant_id],
-            ).unwrap();
-            // Patient -> Organization reference
-            conn.execute(
-                "INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name, value_reference)
-                 VALUES (?1, 'Patient', 'p1', 'organization', 'Organization/org1')",
-                params![tenant_id],
-            ).unwrap();
-            // Observation -> Patient reference
-            conn.execute(
-                "INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name, value_reference)
-                 VALUES (?1, 'Observation', 'o1', 'subject', 'Patient/p1')",
-                params![tenant_id],
-            ).unwrap();
-        }
-
-        // Find observations where patient's organization name contains "Hospital"
-        let matching_ids = backend
-            .resolve_chain(
-                &tenant,
-                "Observation",
-                "subject.organization.name",
-                "Hospital",
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(matching_ids.len(), 1);
-        assert!(matching_ids.contains(&"o1".to_string()));
-    }
-
-    #[tokio::test]
-    async fn test_resolve_chain_with_type_modifier() {
-        // Test chain with explicit type: Observation?subject:Patient.name=Smith
-        let backend = create_test_backend();
-        let tenant = create_test_tenant();
-        let tenant_id = tenant.tenant_id().as_str();
-
-        // Create patient
-        backend
-            .create(
-                &tenant,
-                "Patient",
-                json!({"id": "p1", "name": [{"family": "Smith"}]}),
-                FhirVersion::default(),
-            )
-            .await
-            .unwrap();
-
-        // Create observation
-        backend
-            .create(
-                &tenant,
-                "Observation",
-                json!({"id": "o1", "subject": {"reference": "Patient/p1"}}),
-                FhirVersion::default(),
-            )
-            .await
-            .unwrap();
-
-        // Manually insert search index entries
-        {
-            let conn = backend.get_connection().unwrap();
-            conn.execute(
-                "INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name, value_string)
-                 VALUES (?1, 'Patient', 'p1', 'name', 'Smith')",
-                params![tenant_id],
-            ).unwrap();
-            conn.execute(
-                "INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name, value_reference)
-                 VALUES (?1, 'Observation', 'o1', 'subject', 'Patient/p1')",
-                params![tenant_id],
-            ).unwrap();
-        }
-
-        // Use explicit type modifier
-        let matching_ids = backend
-            .resolve_chain(&tenant, "Observation", "subject:Patient.name", "Smith")
-            .await
-            .unwrap();
-
-        assert_eq!(matching_ids.len(), 1);
-        assert!(matching_ids.contains(&"o1".to_string()));
-    }
-
-    #[tokio::test]
-    async fn test_chain_invalid_param_error() {
-        // Test that invalid chain parameters return an error
-        let backend = create_test_backend();
-        let tenant = create_test_tenant();
-
-        // Try a chain with non-existent parameter
-        let result = backend
-            .resolve_chain(&tenant, "Observation", "invalid.param", "value")
-            .await;
-
-        // Should return an error due to unknown parameter
-        assert!(result.is_err());
+        assert!(search.await.unwrap().resources.items.is_empty());
+        assert!(ids.await.unwrap().items.is_empty());
+        assert_eq!(count.await.unwrap(), 0);
     }
 
     /// `search()` reads neither `SearchParameter::chain` nor
@@ -3346,7 +2994,7 @@ mod tests {
     /// Patient, and a forward chain was read as a reference to an id (#1389).
     #[tokio::test]
     async fn search_refuses_unresolved_chains() {
-        use crate::types::{ChainedParameter, SearchParamType};
+        use crate::types::{ChainedParameter, ReverseChainedParameter, SearchParamType};
 
         let backend = create_test_backend();
         let tenant = create_test_tenant();

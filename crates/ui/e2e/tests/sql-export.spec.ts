@@ -1,3 +1,4 @@
+import { fixedSinceTests } from "../pages/since-contract";
 // Active SQL Exports (#833): the list-first workspace for `$sql-export` jobs.
 // Runs against the sqlite server the suite boots — a real `$sql-export`
 // kick-off, not a stub — so a job genuinely transitions through the states
@@ -16,6 +17,13 @@ import {
   deleteResources,
   waitSearchable,
 } from "../pages/api";
+import {
+  LOAD_SUBJECTS,
+  cancelSqlExportJobs,
+  deleteLoadPatients,
+  loadViewDefinition,
+  seedLoadPatients,
+} from "../pages/sql-export-load";
 
 // The card's own htmx fragment polls every 5s; generous headroom for a job to
 // finish without ever sleeping blindly.
@@ -30,7 +38,7 @@ const POLL_TIMEOUT = 30_000;
 // happens to follow this one against the same shared server.
 let seededViewDefinitionIds: string[] = [];
 
-// The per-run name prefix of every padding `ViewDefinition` batch a test
+// The per-run name prefix of every load `ViewDefinition` batch a test
 // below seeds, swept by name in this file's own `afterEach` (below) on top of
 // the ids above: `createResources` reports each chunk's ids as it lands, but a
 // chunk whose request fails outright (a 408 on the ES composites) never
@@ -43,7 +51,16 @@ let seededViewDefinitionPrefixes: string[] = [];
 // rail selection on whatever run follows this one.
 let seededLibraryIds: string[] = [];
 
+// Same reasoning again, for the Patients the in-progress test seeds as the
+// data each load subject runs over: the ids per chunk as they land, and the
+// per-run family-name prefix swept on top of them.
+let seededPatientIds: string[] = [];
+let seededPatientPrefixes: string[] = [];
+
 test.afterEach(async ({ request }) => {
+  // Stop any job the test left running before its source data is deleted.
+  await cancelSqlExportJobs(request);
+
   const ids = seededViewDefinitionIds;
   seededViewDefinitionIds = [];
   await deleteResources(request, "ViewDefinition", ids);
@@ -57,6 +74,15 @@ test.afterEach(async ({ request }) => {
   const libraryIds = seededLibraryIds;
   seededLibraryIds = [];
   await deleteResources(request, "Library", libraryIds);
+
+  const patientIds = seededPatientIds;
+  seededPatientIds = [];
+  await deleteResources(request, "Patient", patientIds);
+  const patientPrefixes = seededPatientPrefixes;
+  seededPatientPrefixes = [];
+  for (const prefix of patientPrefixes) {
+    await deleteLoadPatients(request, prefix);
+  }
 
   // The jobs these tests start live in the per-user settings document under
   // `byTenant.<tenant>.sqlExport.jobs` (crates/ui/src/sql_export.rs); the
@@ -73,17 +99,14 @@ test.afterEach(async ({ request }) => {
   });
 });
 
-/**
- * A `$sql-export` job over a single tiny ViewDefinition finishes in well
- * under 100ms, faster than the redirect that lands on the list even renders
- * — so there is no reliable way to observe it `in-progress` there. Padding
- * the job with this many trivial subjects (a single self-search round trip
- * apiece) buys a window measured in hundreds of milliseconds, still far
- * short of the card's first 5s htmx poll, without ever waiting on a fixed
- * clock: every assertion below still polls actual DOM state — this
- * constant only makes that state observable at all.
- */
-const PADDING_SUBJECTS = 200;
+// A `$sql-export` job over a single tiny ViewDefinition finishes in well
+// under 100ms, faster than the redirect that lands on the list even renders
+// — so there is no reliable way to observe it `in-progress` there. One
+// request may carry at most 64 `subject` entries (#1705), so the job carries
+// `LOAD_SUBJECTS` of them and gets its run time from the work each one does
+// (pages/sql-export-load.ts: a wide ViewDefinition over `LOAD_PATIENTS`
+// Patients), several seconds in all. Every assertion below still polls
+// actual DOM state; the load only makes that state observable at all.
 
 test.describe.serial("Active SQL Exports", () => {
   test("an empty list shows the empty notice and the New SQL Export button", async ({
@@ -101,28 +124,25 @@ test.describe.serial("Active SQL Exports", () => {
     sqlExport,
   }) => {
     test.setTimeout(60_000);
-    // At least one real subject row, so the completion manifest carries an
-    // actual download link instead of 200 empty outputs.
-    const patientId = await createResource(request, "Patient", {
-      name: [{ family: "SqlExportPaddingE2E" }],
-    });
-    await waitSearchable(request, "Patient", patientId);
+    // Real subject rows for each load ViewDefinition to run over, so the
+    // completion manifest carries actual download links too.
+    const patientPrefix = `E2eSqlExportLoad${Date.now()}x`;
+    seededPatientPrefixes.push(patientPrefix);
+    const lastPatientId = await seedLoadPatients(request, patientPrefix, (chunkIds) =>
+      seededPatientIds.push(...chunkIds),
+    );
+    await waitSearchable(request, "Patient", lastPatientId);
 
     const prefix = `e2e_sql_export_slow_${Date.now()}`;
     // Registered before the batch starts and per chunk as it lands, so a
     // failure partway through still leaves `afterEach` able to clean up
-    // every padding row that did (or may yet) commit.
+    // every load ViewDefinition that did (or may yet) commit.
     seededViewDefinitionPrefixes.push(`${prefix}_`);
     const ids = await createResources(
       request,
-      Array.from({ length: PADDING_SUBJECTS }, (_, i) => ({
+      Array.from({ length: LOAD_SUBJECTS }, (_, i) => ({
         type: "ViewDefinition",
-        body: {
-          name: `${prefix}_${i}`,
-          status: "active",
-          resource: "Patient",
-          select: [{ column: [{ name: "id", path: "getResourceKey()" }] }],
-        },
+        body: loadViewDefinition(`${prefix}_${i}`),
       })),
       undefined,
       (chunkIds) => seededViewDefinitionIds.push(...chunkIds),
@@ -171,7 +191,7 @@ test.describe.serial("Active SQL Exports", () => {
     // whichever done count landed by then, and of the optional
     // "Writing <name>" clause preceding it.
     await expect(card.locator(".job-card__meta")).toHaveText(
-      new RegExp(`\\d+ of ${PADDING_SUBJECTS} subjects`),
+      new RegExp(`\\d+ of ${LOAD_SUBJECTS} subjects`),
     );
 
     // (d) Without ever reloading, the card's own `hx-trigger="every 5s"`
@@ -183,8 +203,8 @@ test.describe.serial("Active SQL Exports", () => {
     await expect(card).toContainText("file");
 
     // (e) View files leads to the job's own permalink (#835), listing every
-    // one of this padded job's outputs and its one download pill apiece —
-    // a trivial single-row `ViewDefinition` never needs a second shard.
+    // one of this load job's outputs and its one download pill apiece —
+    // one `ViewDefinition` over the seeded load Patients still fits one shard.
     await card.getByRole("link", { name: "View files" }).click();
     await expect(page).toHaveURL(/\/ui\/sql\/export\/[^/]+$/);
     await expect(page.locator(".data-table tbody tr")).toHaveCount(ids.length);
@@ -863,6 +883,38 @@ test.describe("SQL Export builder job-wide filters (#836)", () => {
     await expect(sqlExport.detailTrackingId).toHaveText("ward-census-2026-q3");
   });
 
+  test("group lookup loads the next page when scrolled to the bottom", async ({ page, request, sqlExport }) => {
+    // "Narrow it down" only shows once a subject is checked.
+    const vdId = await createResource(request, "ViewDefinition", {
+      name: `e2e_sql_export_group_page_${Date.now()}`,
+      status: "active",
+      resource: "Patient",
+      select: [{ column: [{ name: "id", path: "getResourceKey()" }] }],
+    });
+    seededViewDefinitionIds.push(vdId);
+    await waitSearchable(request, "ViewDefinition", vdId);
+    const option = (n: number) => `<button type="button" class="combobox__option" data-combobox-option
+          data-value="Group/g-${n}" data-label="Group ${n}">Group ${n}</button>`;
+    const range = (from: number, to: number) =>
+      Array.from({ length: to - from + 1 }, (_, i) => option(from + i)).join("");
+    await page.route("**/ui/lookup/group-options*", (route) => {
+      const params = new URLSearchParams(route.request().postData() ?? "");
+      const body = params.get("page") === "o.8"
+        ? `${range(9, 12)}<div class="combobox__footer" data-combobox-footer role="none">End of results</div>`
+        : `${range(1, 8)}<div class="combobox__more" data-combobox-more data-page="o.8" role="none" aria-hidden="true"></div><div class="combobox__footer" data-combobox-footer role="none">12 matches · scroll for more</div>`;
+      return route.fulfill({ status: 200, contentType: "text/html", body });
+    });
+    await sqlExport.gotoNew();
+    await sqlExport.subjectCheckbox(`ViewDefinition/${vdId}`).check();
+    await sqlExport.groupSearch.fill("gr");
+    const listbox = sqlExport.groupListbox;
+    await expect(listbox.getByRole("option")).toHaveCount(8);
+    await listbox.evaluate((el) => { el.scrollTop = el.scrollHeight; });
+    await expect(listbox.locator('[data-value="Group/g-9"]')).toHaveCount(1);
+    await expect(listbox.getByRole("option")).toHaveCount(12);
+    await expect(listbox.locator("[data-combobox-footer]")).toHaveText("End of results");
+  });
+
   test("the CSV header switch hides for non-csv formats, and an unchecked box is recorded in the detail", async ({
     page,
     request,
@@ -930,7 +982,7 @@ test.describe("SQL Export builder job-wide filters (#836)", () => {
     await sqlExport.gotoNew();
     await expect(sqlExport.sinceCustom).toBeDisabled();
 
-    await sqlExport.sincePreset.selectOption("custom");
+    await sqlExport.chooseSince("custom");
     await expect(sqlExport.sinceCustom).toBeEnabled();
 
     await sqlExport.subjectCheckbox(`ViewDefinition/${vdId}`).check();
@@ -943,7 +995,7 @@ test.describe("SQL Export builder job-wide filters (#836)", () => {
     await expect(sqlExport.sinceCustomError).toBeVisible();
     await expect(sqlExport.sinceCustom).toBeFocused();
 
-    await sqlExport.sincePreset.selectOption("week");
+    await sqlExport.chooseSince("week");
     await expect(sqlExport.sinceCustom).toBeDisabled();
     const beforeSubmit = Date.now();
     await sqlExport.startButton.click();
@@ -1242,14 +1294,14 @@ test.describe("pending SQL Export filters (#1575)", () => {
       });
     }
 
-    for (const entry of ["typed", "single-paste"] as const) {
+    for (const entry of ["typed", "single-paste", "separator-paste"] as const) {
       test(`${kind} ${entry} then clicked reaches the real job, detail and restricted NDJSON (#1575)`, async ({ page, request, sqlExport }) => {
         const id = kind === "Patient" ? patientIds[0] : groupId;
         const search = kind === "Patient" ? sqlExport.patientSearch : sqlExport.groupSearch;
-        if (entry === "single-paste") {
+        if (entry !== "typed") {
           await page.context().grantPermissions(["clipboard-read", "clipboard-write"]);
           await search.focus();
-          await page.evaluate((text) => navigator.clipboard.writeText(text), id);
+          await page.evaluate((text) => navigator.clipboard.writeText(text), entry === "separator-paste" ? ` ,\r\n ${id} \r\n, ` : id);
           await search.press("ControlOrMeta+v");
           await expect(kind === "Patient" ? sqlExport.selectedPatients : sqlExport.selectedGroups).toHaveCount(0);
           await expect(search).toHaveValue(id);
@@ -1275,8 +1327,91 @@ test.describe("pending SQL Export filters (#1575)", () => {
       });
     }
 
+    test(`${kind} single clipboard entries lookup normalized queries and retain named labels (#1831)`, async ({ page, sqlExport }) => {
+      await page.context().grantPermissions(["clipboard-read", "clipboard-write"]);
+      const search = kind === "Patient" ? sqlExport.patientSearch : sqlExport.groupSearch;
+      const selected = kind === "Patient" ? sqlExport.selectedPatients : sqlExport.selectedGroups;
+      const root = kind === "Patient" ? sqlExport.patientCombobox : sqlExport.groupCombobox;
+      const listbox = kind === "Patient" ? sqlExport.patientListbox : sqlExport.groupListbox;
+      const queryName = (await root.getAttribute("data-combobox-query-name"))!;
+      const path = `/ui/lookup/${kind.toLowerCase()}-options`;
+      await page.route(`**${path}*`, (route) => {
+        const query = new URLSearchParams(route.request().postData() ?? "").get(queryName)!;
+        const id = query.replace(new RegExp(`^${kind}/`), "");
+        return route.fulfill({ status: 200, contentType: "text/html", body:
+          `<button type="button" data-combobox-option data-value="${kind}/${id}" data-label="Named ${kind} ${id}">Named ${kind} ${id}</button>` });
+      });
+      for (const [index, wrapper] of ["\n", "\r", "\r\n", ",", " ,\n,\r\n, ", "\n , "].entries()) {
+        for (const typed of [false, true]) {
+          const id = `id-1831-${index}-${typed ? "typed" : "bare"}`;
+          const query = typed ? `${kind}/${id}` : id;
+          await search.focus();
+          await page.evaluate((text) => navigator.clipboard.writeText(text), ` ${wrapper} ${query} ${wrapper} `);
+          const lookup = page.waitForResponse((response) => new URL(response.url()).pathname === path &&
+            new URLSearchParams(response.request().postData() ?? "").get(queryName) === query);
+          await search.press("ControlOrMeta+v");
+          await expect(search).toHaveValue(query);
+          await expect(selected).toHaveCount(0);
+          await lookup;
+          await listbox.getByRole("option", { name: `Named ${kind} ${id}`, exact: true }).click();
+          await expect(selected).toHaveValue(`${kind}/${id}`);
+          await expect(root.locator(".combobox__chip-label")).toHaveText(`Named ${kind} ${id}`);
+          await root.getByRole("button", { name: `Remove Named ${kind} ${id}`, exact: true }).click();
+        }
+      }
+    });
+
+    test(`${kind} normalized paste preserves selection, caret, duplicate lists and validation (#1831)`, async ({ page, sqlExport }) => {
+      await page.context().grantPermissions(["clipboard-read", "clipboard-write"]);
+      const search = kind === "Patient" ? sqlExport.patientSearch : sqlExport.groupSearch;
+      const selected = kind === "Patient" ? sqlExport.selectedPatients : sqlExport.selectedGroups;
+      const root = kind === "Patient" ? sqlExport.patientCombobox : sqlExport.groupCombobox;
+      await search.fill("REPLACE-suffix");
+      await search.evaluate((input) => (input as HTMLInputElement).setSelectionRange(0, 7));
+      await page.evaluate(() => navigator.clipboard.writeText("\r\n one"));
+      await search.press("ControlOrMeta+v");
+      await expect(search).toHaveValue("one-suffix");
+      expect(await search.evaluate((input) => [(input as HTMLInputElement).selectionStart, (input as HTMLInputElement).selectionEnd])).toEqual([3, 3]);
+      await expect(selected).toHaveCount(0);
+      await search.fill(" prefix-REPLACE-suffix ");
+      await search.evaluate((input) => (input as HTMLInputElement).setSelectionRange(8, 15));
+      await page.evaluate(() => navigator.clipboard.writeText(" ,\r\n, "));
+      await search.press("ControlOrMeta+v");
+      await expect(search).toHaveValue(" prefix--suffix ");
+      expect(await search.evaluate((input) => (input as HTMLInputElement).selectionStart)).toBe(8);
+      await expect(selected).toHaveCount(0);
+      await search.fill("");
+      await page.evaluate(() => navigator.clipboard.writeText(" ,\r\n, "));
+      await search.press("ControlOrMeta+v");
+      await expect(search).toHaveValue("");
+      await expect(selected).toHaveCount(0);
+      await page.evaluate(() => navigator.clipboard.writeText("id-1831,id-1831"));
+      await search.press("ControlOrMeta+v");
+      await expect(selected).toHaveValue("id-1831");
+      await expect(search).toHaveValue("");
+      await root.getByRole("button", { name: "Remove id-1831", exact: true }).click();
+      await page.evaluate(() => navigator.clipboard.writeText("\n not a valid id! ,"));
+      await search.press("ControlOrMeta+v");
+      await expect(search).toHaveValue("not a valid id!");
+      await expect(search).not.toHaveAttribute("aria-invalid", /.+/);
+      await expect(selected).toHaveCount(0);
+      await search.press("Enter");
+      await expect(search).toHaveAttribute("aria-invalid", "true");
+      await search.fill("");
+      await page.evaluate(() => navigator.clipboard.writeText("\n id-enter-1831 ,"));
+      await search.press("ControlOrMeta+v");
+      await expect(search).not.toHaveAttribute("aria-invalid", /.+/);
+      await search.press("Enter");
+      await expect(selected).toHaveValue("id-enter-1831");
+      await page.evaluate(() => navigator.clipboard.writeText("valid-1831\ninvalid/id/path"));
+      await search.press("ControlOrMeta+v");
+      await expect(selected).toHaveCount(1);
+      await expect(search).toHaveAttribute("aria-invalid", "true");
+      await expect(search).toHaveValue("valid-1831, invalid/id/path");
+    });
+
     test(`${kind} invalid pending text is rejected before submission and preserves the form (#1575)`, async ({ page, request, sqlExport }) => {
-      await sqlExport.sincePreset.selectOption("custom");
+      await sqlExport.chooseSince("custom");
       await sqlExport.sinceCustom.fill("2020-01-01T00:00:00Z");
       await sqlExport.openAdvanced();
       await sqlExport.trackingIdInput.fill("pending-validation");
@@ -1520,4 +1655,29 @@ test.describe("SQL Export copy after polling (#1645)", () => {
     await card.locator("summary").click();
     await expect(button).toBeHidden();
   });
+});
+
+fixedSinceTests("sql-export");
+
+test("Since calendar-invalid custom instant retains the enhanced choice after server rejection", async ({ page, request, sqlExport }) => {
+  const vdId = await createResource(request, "ViewDefinition", {
+    name: `since_rejected_${Date.now()}`, status: "active", resource: "Patient",
+    select: [{ column: [{ name: "id", path: "getResourceKey()" }] }],
+  });
+  seededViewDefinitionIds.push(vdId);
+  await waitSearchable(request, "ViewDefinition", vdId);
+  await sqlExport.gotoNew();
+  await sqlExport.subjectCheckbox(`ViewDefinition/${vdId}`).check();
+  await sqlExport.chooseSince("custom");
+  await sqlExport.sinceCustom.fill("2026-02-31T00:00:00Z");
+  const response = page.waitForResponse(res => res.url().endsWith("/ui/sql/export") && res.request().method() === "POST");
+  await sqlExport.startButton.click();
+  expect((await response).status()).toBe(200);
+  await expect(sqlExport.sinceTrigger).toHaveAccessibleName("Since Custom");
+  await expect(sqlExport.sincePreset).toHaveValue("custom");
+  await expect(sqlExport.sinceCustom).toHaveValue("2026-02-31T00:00:00Z");
+  await expect(sqlExport.sinceCustomError).toBeVisible();
+  await expect(sqlExport.sinceCustom).toBeFocused();
+  const settings = await (await request.get("/_user/settings")).json();
+  expect(Object.keys(settings.sqlExport?.jobs ?? {})).toEqual([]);
 });

@@ -25,6 +25,7 @@
 //! instead of silently looking like a clean end of stream.
 
 use std::pin::Pin;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures::Stream;
@@ -106,6 +107,12 @@ pub enum SofError {
     #[error("backend error: {0}")]
     Backend(String),
 
+    /// A batch of resources references more distinct resources than the runner
+    /// may read for `resolve()`. The handler layer maps this variant to a
+    /// `422 Unprocessable Entity` OperationOutcome.
+    #[error("too many references to resolve: {0}")]
+    ResolutionLimit(String),
+
     /// The view run was cancelled (e.g. client disconnected, export job cancelled).
     #[error("view run cancelled")]
     Cancelled,
@@ -141,6 +148,11 @@ pub fn watch_row_producer(runner: &'static str, tx: RowSender, producer: JoinHan
 }
 
 /// Abstraction over in-process and in-DB SQL-on-FHIR execution strategies.
+///
+/// For row order, collection cells and preview limits by backend and view
+/// shape, see the [HFS stored-data ordering contract].
+///
+/// [HFS stored-data ordering contract]: https://heliossoftware.github.io/hfs/ch06-sql-on-fhir.html#hfs-stored-data-ordering
 ///
 /// # Object safety
 ///
@@ -182,6 +194,24 @@ pub trait SofRunner: Send + Sync {
 
     /// Returns a human-readable name for this runner (used in logs and diagnostics).
     fn runner_name(&self) -> &'static str;
+
+    /// A runner for one export job, or `None` when this runner has nothing to
+    /// share between the subjects of a job.
+    ///
+    /// An export job runs many views one after another, and a runner that
+    /// reads a type by scanning storage (S3) would scan it once per view. The
+    /// runner returned here may keep what it read for the life of the job, so
+    /// views over the same type read it once and the job sees one snapshot.
+    ///
+    /// A runner may also return a differently configured clone for the job
+    /// because an export, unlike a preview, reads a whole type: the PostgreSQL
+    /// runner reads each view in keyset pages over the resource id, so no
+    /// statement sorts or holds the entire type, and its rows come out in
+    /// bytewise id order (not `(last_updated, id)`) without a single snapshot
+    /// across pages.
+    fn for_export_job(&self) -> Option<Arc<dyn SofRunner>> {
+        None
+    }
 }
 
 #[cfg(test)]

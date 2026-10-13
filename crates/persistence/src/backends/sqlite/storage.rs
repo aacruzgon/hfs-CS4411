@@ -1,5 +1,8 @@
 //! ResourceStorage and VersionedStorage implementations for SQLite.
 
+use crate::core::transaction::BundleTransactionState;
+use crate::core::{BundleEntryTarget, parse_bundle_entry_target};
+
 use crate::backends::sql_literal::sql_string_literal;
 use async_trait::async_trait;
 use chrono::Utc;
@@ -33,7 +36,23 @@ use crate::types::SearchQuery;
 use crate::types::{CursorValue, Page, PageCursor, PageInfo, StoredResource};
 
 use super::SqliteBackend;
+use super::bulk_submit::retry_bookkeeping_on_busy_async;
 use super::search::writer::{SqlValue, SqliteSearchIndexWriter};
+
+/// How long the tenant registry admin paths (`count_by_tenant`,
+/// `list_tenants`, `register_tenant`, `deregister_tenant`,
+/// `purge_tenant_data`) keep retrying a busy/locked statement (#1827).
+///
+/// What this covers is the shared-cache in-memory database
+/// ([`SqliteBackend::in_memory`]). There locking is per table, and a statement
+/// that meets a table another connection is reading (or writing) fails at once
+/// with `SQLITE_LOCKED_SHAREDCACHE`: SQLite never calls the busy handler for
+/// that code, so `busy_timeout` does not help. With the tenant reads on
+/// blocking threads, an inventory refresh can overlap a tenant delete and
+/// fail it. The conflicting statement is short, so a brief retry outlasts it.
+/// On a file database a busy only surfaces after the whole `busy_timeout`,
+/// which by default is far past this budget, so no retry is added there.
+const TENANT_ADMIN_LOCK_RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 
 fn internal_error(message: String) -> StorageError {
     StorageError::Backend(BackendError::Internal {
@@ -113,7 +132,7 @@ pub(crate) fn fts_table_exists(conn: &rusqlite::Connection) -> StorageResult<boo
     conn.prepare_cached("SELECT 1 FROM sqlite_master WHERE type='table' AND name='resource_fts'")
         .and_then(|mut stmt| stmt.query_row([], |_| Ok(())).optional())
         .map(|found| found.is_some())
-        .map_err(|e| internal_error(format!("Failed to probe for resource_fts: {e}")))
+        .or_query_error("Failed to probe for resource_fts")
 }
 
 /// Cap on [`WriteMarker::recent_writes`](crate::core::WriteMarker): the count is
@@ -205,7 +224,7 @@ fn purge_fts_rows(
         return Ok(());
     }
     conn.execute(sql, params)
-        .map_err(|e| internal_error(format!("purge fts delete: {e}")))?;
+        .or_query_error("purge fts delete")?;
     Ok(())
 }
 
@@ -225,7 +244,11 @@ impl ResourceStorage for SqliteBackend {
 
     fn sof_runner(&self) -> Option<std::sync::Arc<dyn crate::core::sof_runner::SofRunner>> {
         use crate::sof::sqlite::SqliteInDbRunner;
-        Some(std::sync::Arc::new(SqliteInDbRunner::new(self.pool())))
+        let fhir_version = self.config().fhir_version;
+        tracing::info!(runner = "sqlite-indb", ?fhir_version, "Creating SofRunner");
+        Some(std::sync::Arc::new(
+            SqliteInDbRunner::new(self.pool()).with_fhir_version(fhir_version),
+        ))
     }
 
     async fn create(
@@ -991,26 +1014,69 @@ impl ResourceStorage for SqliteBackend {
     }
 
     async fn count_by_tenant(&self) -> StorageResult<Vec<(String, u64)>> {
-        // Cross-tenant admin aggregate (see trait docs): no tenant filter.
-        let conn = self.get_connection()?;
-        let mut stmt = conn
-            .prepare(
-                "SELECT tenant_id, COUNT(*) FROM resources \
-                 WHERE is_deleted = 0 GROUP BY tenant_id",
+        // Cross-tenant admin aggregate (see trait docs): no tenant filter. It
+        // scans every tenant's rows, so both the pool acquire and the query run
+        // on a blocking thread, as `count_all_types` does (#959, #1827). A
+        // caller that stops waiting does not stop the scan: see
+        // `run_blocking`'s "not cancellable" caveat. A shared-cache lock
+        // conflict is retried, see `TENANT_ADMIN_LOCK_RETRY_BUDGET`.
+        retry_bookkeeping_on_busy_async(
+            self,
+            "count_by_tenant",
+            TENANT_ADMIN_LOCK_RETRY_BUDGET,
+            || {
+                |conn: &rusqlite::Connection| {
+                    let mut stmt = conn
+                        .prepare(
+                            "SELECT tenant_id, COUNT(*) FROM resources \
+                     WHERE is_deleted = 0 GROUP BY tenant_id",
+                        )
+                        .or_query_error("Failed to prepare count_by_tenant")?;
+                    let rows = stmt
+                        .query_map([], |row| {
+                            let tid: String = row.get(0)?;
+                            let n: i64 = row.get(1)?;
+                            Ok((tid, n.max(0) as u64))
+                        })
+                        .or_query_error("Failed to query count_by_tenant")?;
+                    let mut out = Vec::new();
+                    for row in rows {
+                        out.push(row.or_query_error("count_by_tenant row")?);
+                    }
+                    Ok(out)
+                }
+            },
+        )
+        .await
+    }
+
+    async fn discover_tenants(
+        &self,
+        _req: &crate::core::DiscoveryRequest,
+    ) -> StorageResult<crate::core::TenantDiscovery> {
+        // The grouped count already spans every tenant in one query, so it is
+        // complete discovery of live resources; the request budget is moot.
+        Ok(crate::core::TenantDiscovery::from_grouped_counts(
+            self.count_by_tenant().await?,
+            crate::core::CountBasis::LiveResources,
+        ))
+    }
+
+    async fn tenant_has_resources(&self, tenant: &TenantContext) -> StorageResult<bool> {
+        // `EXISTS` stops at the first live row of `idx_resources_live_type
+        // (tenant_id, is_deleted, resource_type)` — one index probe, not the
+        // cross-tenant `GROUP BY` of `count_by_tenant` (#1912). Off the async
+        // worker like `count`, connection acquisition included.
+        let tenant_id = tenant.tenant_id().as_str().to_string();
+        self.run_blocking(move |conn| {
+            conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM resources WHERE tenant_id = ?1 AND is_deleted = 0)",
+                params![tenant_id],
+                |row| row.get::<_, bool>(0),
             )
-            .or_query_error("Failed to prepare count_by_tenant")?;
-        let rows = stmt
-            .query_map([], |row| {
-                let tid: String = row.get(0)?;
-                let n: i64 = row.get(1)?;
-                Ok((tid, n.max(0) as u64))
-            })
-            .or_query_error("Failed to query count_by_tenant")?;
-        let mut out = Vec::new();
-        for row in rows {
-            out.push(row.or_query_error("count_by_tenant row")?);
-        }
-        Ok(out)
+            .or_query_error("Failed to probe tenant resources")
+        })
+        .await
     }
 
     fn supports_type_counts(&self) -> bool {
@@ -1031,27 +1097,42 @@ impl ResourceStorage for SqliteBackend {
     }
 
     async fn list_tenants(&self) -> StorageResult<Vec<crate::core::TenantRecord>> {
-        let conn = self.get_connection()?;
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, display_name, created_at FROM tenants \
-                 ORDER BY created_at ASC, id ASC",
-            )
-            .map_err(|e| internal_error(format!("prepare list_tenants: {e}")))?;
-        let rows = stmt
-            .query_map([], |row| {
-                Ok(crate::core::TenantRecord {
-                    id: row.get(0)?,
-                    display_name: row.get(1)?,
-                    created_at: row.get(2)?,
-                })
-            })
-            .map_err(|e| internal_error(format!("query list_tenants: {e}")))?;
-        let mut out = Vec::new();
-        for row in rows {
-            out.push(row.map_err(|e| internal_error(format!("list_tenants row: {e}")))?);
-        }
-        Ok(out)
+        // The registry query itself is cheap, but acquiring a connection is
+        // not when the pool is exhausted: r2d2 parks the calling thread for up
+        // to the acquire timeout. Doing that on a blocking thread keeps the
+        // runtime free for everything else meanwhile (#1827). Errors are
+        // classified so a shared-cache lock conflict reaches the retry, see
+        // `TENANT_ADMIN_LOCK_RETRY_BUDGET`.
+        retry_bookkeeping_on_busy_async(
+            self,
+            "list_tenants",
+            TENANT_ADMIN_LOCK_RETRY_BUDGET,
+            || {
+                |conn: &rusqlite::Connection| {
+                    let mut stmt = conn
+                        .prepare(
+                            "SELECT id, display_name, created_at FROM tenants \
+                             ORDER BY created_at ASC, id ASC",
+                        )
+                        .or_query_error("prepare list_tenants")?;
+                    let rows = stmt
+                        .query_map([], |row| {
+                            Ok(crate::core::TenantRecord {
+                                id: row.get(0)?,
+                                display_name: row.get(1)?,
+                                created_at: row.get(2)?,
+                            })
+                        })
+                        .or_query_error("query list_tenants")?;
+                    let mut out = Vec::new();
+                    for row in rows {
+                        out.push(row.or_query_error("list_tenants row")?);
+                    }
+                    Ok(out)
+                }
+            },
+        )
+        .await
     }
 
     async fn get_tenant(&self, id: &str) -> StorageResult<Option<crate::core::TenantRecord>> {
@@ -1089,114 +1170,159 @@ impl ResourceStorage for SqliteBackend {
         // from minting an id the other backends could not keep distinct, and
         // keeps the precondition uniform across every implementation.
         self.ensure_canonical_tenant_id(id)?;
-        let conn = self.get_connection()?;
+        // One `INSERT ... RETURNING` statement rather than an INSERT and a
+        // read-back, so a retried attempt (see
+        // `TENANT_ADMIN_LOCK_RETRY_BUDGET`) is either the whole registration
+        // or none of it, never a second INSERT after a first one landed.
+        //
         // Plain INSERT so a duplicate id surfaces as a constraint error; the
         // admin handler pre-checks existence and returns 409, so reaching here
         // with a duplicate is a race and a 500 is acceptable.
-        conn.execute(
-            "INSERT INTO tenants (id, display_name, created_at) \
-             VALUES (?1, ?2, strftime('%Y-%m-%dT%H:%M:%SZ','now'))",
-            params![id, display_name],
+        let id = id.to_owned();
+        let display_name = display_name.map(str::to_owned);
+        retry_bookkeeping_on_busy_async(
+            self,
+            "register_tenant",
+            TENANT_ADMIN_LOCK_RETRY_BUDGET,
+            || {
+                let id = id.clone();
+                let display_name = display_name.clone();
+                move |conn: &rusqlite::Connection| {
+                    conn.query_row(
+                        "INSERT INTO tenants (id, display_name, created_at) \
+                         VALUES (?1, ?2, strftime('%Y-%m-%dT%H:%M:%SZ','now')) \
+                         RETURNING id, display_name, created_at",
+                        params![id, display_name],
+                        |row| {
+                            Ok(crate::core::TenantRecord {
+                                id: row.get(0)?,
+                                display_name: row.get(1)?,
+                                created_at: row.get(2)?,
+                            })
+                        },
+                    )
+                    .or_query_error("register_tenant")
+                }
+            },
         )
-        .map_err(|e| internal_error(format!("register_tenant: {e}")))?;
-        let mut stmt = conn
-            .prepare("SELECT id, display_name, created_at FROM tenants WHERE id = ?1")
-            .map_err(|e| internal_error(format!("prepare register read-back: {e}")))?;
-        stmt.query_row(params![id], |row| {
-            Ok(crate::core::TenantRecord {
-                id: row.get(0)?,
-                display_name: row.get(1)?,
-                created_at: row.get(2)?,
-            })
-        })
-        .map_err(|e| internal_error(format!("register read-back: {e}")))
+        .await
     }
 
     async fn deregister_tenant(&self, id: &str) -> StorageResult<bool> {
         crate::tenant::ensure_mutable_tenant(id)?;
-        let conn = self.get_connection()?;
-        let changed = conn
-            .execute("DELETE FROM tenants WHERE id = ?1", params![id])
-            .map_err(|e| internal_error(format!("deregister_tenant: {e}")))?;
+        // Retried on a shared-cache lock conflict, see
+        // `TENANT_ADMIN_LOCK_RETRY_BUDGET`: an inventory refresh reading the
+        // registry on another connection used to fail this DELETE outright.
+        let id = id.to_owned();
+        let changed = retry_bookkeeping_on_busy_async(
+            self,
+            "deregister_tenant",
+            TENANT_ADMIN_LOCK_RETRY_BUDGET,
+            || {
+                let id = id.clone();
+                move |conn: &rusqlite::Connection| {
+                    conn.execute("DELETE FROM tenants WHERE id = ?1", params![id])
+                        .or_query_error("deregister_tenant")
+                }
+            },
+        )
+        .await?;
         Ok(changed > 0)
     }
 
     async fn purge_tenant_data(&self, id: &str) -> StorageResult<u64> {
         crate::tenant::ensure_mutable_tenant(id)?;
-        let mut conn = self.get_connection()?;
-        // IMMEDIATE, not the DEFERRED default: this transaction reads (the count
-        // below) before it writes. Under WAL a deferred transaction takes a read
-        // snapshot on that first read and then fails the read-to-write upgrade
-        // with SQLITE_BUSY_SNAPSHOT if another connection committed in between —
-        // and the busy handler is *not* invoked for that code, so the configured
-        // busy_timeout does not cover it. Taking the write lock up front does.
-        let tx = conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-            .or_query_error("purge begin")?;
-        // Count current-version rows first so we can report what was removed.
-        let removed: i64 = tx
-            .query_row(
-                "SELECT COUNT(*) FROM resources WHERE tenant_id = ?1",
-                params![id],
-                |row| row.get(0),
-            )
-            .or_query_error("purge count")?;
-        // search_index has ON DELETE CASCADE from resources, but delete it
-        // explicitly too in case foreign keys are not enforced on this handle.
-        // (That explicit delete is also what fires the `search_index_fts`
-        // triggers, though a cascade fires them too.)
-        for sql in [
-            "DELETE FROM search_index WHERE tenant_id = ?1",
-            "DELETE FROM resource_history WHERE tenant_id = ?1",
-            "DELETE FROM resources WHERE tenant_id = ?1",
-        ] {
-            tx.execute(sql, params![id])
-                .or_query_error("purge delete")?;
-        }
-        // `resource_fts` is an FTS5 *virtual* table: it can carry no foreign key,
-        // so the cascade above never reaches it and it must be deleted explicitly
-        // (issue #386). Left behind, the purged resource's narrative and its
-        // entire serialized body stay in the database, and are resurrected as a
-        // match oracle the moment a resource reuses the same logical id.
-        //
-        // Deliberately NOT gated on `is_search_offloaded()`: that flag is a
-        // write-path optimisation ("don't maintain an index nobody reads"),
-        // whereas this is an erasure guarantee. A deployment that indexed
-        // locally and later moved search to Elasticsearch still has rows here,
-        // and a purge is precisely when they must go.
-        purge_fts_rows(
-            &tx,
-            "DELETE FROM resource_fts WHERE tenant_id = ?1",
-            params![id],
-        )?;
-        // The rowid mapping (#967) is a plain table, so it neither cascades
-        // nor is reached by the FTS delete above.
-        tx.execute(
-            "DELETE FROM resource_fts_map WHERE tenant_id = ?1",
-            params![id],
+        // Each attempt is one transaction, rolled back when it fails, so a
+        // retry on a shared-cache lock conflict (see
+        // `TENANT_ADMIN_LOCK_RETRY_BUDGET`) replays the whole purge.
+        let id = id.to_owned();
+        retry_bookkeeping_on_busy_async(
+            self,
+            "purge_tenant_data",
+            TENANT_ADMIN_LOCK_RETRY_BUDGET,
+            || {
+                let id = id.clone();
+                move |conn: &rusqlite::Connection| {
+                    let id = id.as_str();
+                    // IMMEDIATE, not the DEFERRED default: this transaction reads (the count
+                    // below) before it writes. Under WAL a deferred transaction takes a read
+                    // snapshot on that first read and then fails the read-to-write upgrade
+                    // with SQLITE_BUSY_SNAPSHOT if another connection committed in between —
+                    // and the busy handler is *not* invoked for that code, so the configured
+                    // busy_timeout does not cover it. Taking the write lock up front does.
+                    let tx = rusqlite::Transaction::new_unchecked(
+                        conn,
+                        rusqlite::TransactionBehavior::Immediate,
+                    )
+                    .or_query_error("purge begin")?;
+                    // Count current-version rows first so we can report what was removed.
+                    let removed: i64 = tx
+                        .query_row(
+                            "SELECT COUNT(*) FROM resources WHERE tenant_id = ?1",
+                            params![id],
+                            |row| row.get(0),
+                        )
+                        .or_query_error("purge count")?;
+                    // search_index has ON DELETE CASCADE from resources, but delete it
+                    // explicitly too in case foreign keys are not enforced on this handle.
+                    // (That explicit delete is also what fires the `search_index_fts`
+                    // triggers, though a cascade fires them too.)
+                    for sql in [
+                        "DELETE FROM search_index WHERE tenant_id = ?1",
+                        "DELETE FROM resource_history WHERE tenant_id = ?1",
+                        "DELETE FROM resources WHERE tenant_id = ?1",
+                    ] {
+                        tx.execute(sql, params![id])
+                            .or_query_error("purge delete")?;
+                    }
+                    // `resource_fts` is an FTS5 *virtual* table: it can carry no foreign key,
+                    // so the cascade above never reaches it and it must be deleted explicitly
+                    // (issue #386). Left behind, the purged resource's narrative and its
+                    // entire serialized body stay in the database, and are resurrected as a
+                    // match oracle the moment a resource reuses the same logical id.
+                    //
+                    // Deliberately NOT gated on `is_search_offloaded()`: that flag is a
+                    // write-path optimisation ("don't maintain an index nobody reads"),
+                    // whereas this is an erasure guarantee. A deployment that indexed
+                    // locally and later moved search to Elasticsearch still has rows here,
+                    // and a purge is precisely when they must go.
+                    purge_fts_rows(
+                        &tx,
+                        "DELETE FROM resource_fts WHERE tenant_id = ?1",
+                        params![id],
+                    )?;
+                    // The rowid mapping (#967) is a plain table, so it neither cascades
+                    // nor is reached by the FTS delete above.
+                    tx.execute(
+                        "DELETE FROM resource_fts_map WHERE tenant_id = ?1",
+                        params![id],
+                    )
+                    .or_query_error("purge FTS mapping")?;
+                    // Per-user settings are keyed by user, not tenant, so they are not swept
+                    // by the deletes above — but a client stores PHI-derived query strings in
+                    // them, which belong to this tenant (issue #313). Same transaction: this
+                    // connection already holds the write lock, and a second one would
+                    // deadlock against it.
+                    // Provider-side Bulk Submit submissions are tenant-keyed rows (#772).
+                    tx.execute(
+                        "DELETE FROM bulk_provider_submissions WHERE tenant_id = ?1",
+                        params![id],
+                    )
+                    .or_query_error("purge provider submissions")?;
+                    let settings = SqliteBackend::purge_tenant_settings_in_txn(&tx, id)?;
+                    tx.commit().or_query_error("purge commit")?;
+                    if settings > 0 {
+                        tracing::info!(
+                            tenant = %id,
+                            documents = settings,
+                            "purged tenant-scoped content from user settings documents"
+                        );
+                    }
+                    Ok(removed.max(0) as u64)
+                }
+            },
         )
-        .or_query_error("purge FTS mapping")?;
-        // Per-user settings are keyed by user, not tenant, so they are not swept
-        // by the deletes above — but a client stores PHI-derived query strings in
-        // them, which belong to this tenant (issue #313). Same transaction: this
-        // connection already holds the write lock, and a second one would
-        // deadlock against it.
-        // Provider-side Bulk Submit submissions are tenant-keyed rows (#772).
-        tx.execute(
-            "DELETE FROM bulk_provider_submissions WHERE tenant_id = ?1",
-            params![id],
-        )
-        .or_query_error("purge provider submissions")?;
-        let settings = SqliteBackend::purge_tenant_settings_in_txn(&tx, id)?;
-        tx.commit().or_query_error("purge commit")?;
-        if settings > 0 {
-            tracing::info!(
-                tenant = %id,
-                documents = settings,
-                "purged tenant-scoped content from user settings documents"
-            );
-        }
-        Ok(removed.max(0) as u64)
+        .await
     }
 }
 
@@ -3430,7 +3556,8 @@ impl BundleProvider for SqliteBackend {
         validator: Option<&dyn PatchCandidateValidator>,
     ) -> Result<BundleResult, TransactionError> {
         use crate::core::transaction::{Transaction, TransactionOptions, TransactionProvider};
-        use std::collections::HashMap;
+
+        let mut entries = entries;
 
         // Start a transaction
         let mut tx = self
@@ -3443,10 +3570,6 @@ impl BundleProvider for SqliteBackend {
         let mut results = Vec::with_capacity(entries.len());
         let mut error_info: Option<(usize, String)> = None;
         let mut patch_error: Option<TransactionError> = None;
-
-        // Build a map of fullUrl -> assigned reference for reference resolution
-        // This maps urn:uuid:xxx to ResourceType/assigned-id after creates
-        let mut reference_map: HashMap<String, String> = HashMap::new();
 
         // URL-borne conditional entries (`PUT/DELETE [type]?[criteria]`)
         // resolve against the transaction's starting view before any entry is
@@ -3467,15 +3590,6 @@ impl BundleProvider for SqliteBackend {
                 return Err(e);
             }
         };
-        for target in targets.values() {
-            if let (Some(full_url), Some(identity)) = (
-                entries[target.entry_index].full_url.as_ref(),
-                target.identity(),
-            ) {
-                reference_map.insert(full_url.clone(), identity);
-            }
-        }
-
         // Whether any entry in this transaction writes a SearchParameter that
         // affects this tenant's cached overlay (#787: transaction-bundle writes
         // never invalidated the registry, so a SearchParameter POSTed inside a
@@ -3485,15 +3599,47 @@ impl BundleProvider for SqliteBackend {
         // update/delete are unconditional).
         let mut search_param_overlay_changed = false;
 
-        // Make entries mutable for reference resolution
-        let mut entries = entries;
+        let references = match crate::core::transaction::pin_forward_references(
+            &mut entries,
+            &targets,
+            &mut SqliteBundleMatches {
+                backend: self,
+                tenant,
+                tx: &mut tx,
+            },
+        )
+        .await
+        {
+            Ok(references) => references,
+            Err((index, error)) => {
+                let _ = Box::new(tx).rollback().await;
+                return Err(TransactionError::BundleError {
+                    index,
+                    message: error.to_string(),
+                });
+            }
+        };
+        let mut bundle_state = BundleTransactionState::new(references);
 
         // Process each entry within the transaction
         for (idx, entry) in entries.iter_mut().enumerate() {
-            // Resolve references in this entry's resource before processing
-            if let Some(ref mut resource) = entry.resource {
-                resolve_bundle_references(resource, &reference_map);
-            }
+            let used_references = entry
+                .resource
+                .as_mut()
+                .map(|resource| bundle_state.resolve(resource))
+                .unwrap_or_default();
+            let delete_target = (entry.method == BundleMethod::Delete)
+                .then(|| {
+                    targets
+                        .get(&idx)
+                        .and_then(|target| target.identity())
+                        .or_else(|| {
+                            self.parse_url(&entry.url)
+                                .ok()
+                                .map(|(kind, id)| format!("{kind}/{id}"))
+                        })
+                })
+                .flatten();
 
             let result = self
                 .process_bundle_entry_tx(
@@ -3560,21 +3706,11 @@ impl BundleProvider for SqliteBackend {
                             };
                     }
 
-                    // A create (POST, or a conditional PUT that created) with a
-                    // fullUrl records the assigned identity for later references.
-                    if matches!(entry.method, BundleMethod::Post | BundleMethod::Put) {
-                        if let Some(ref full_url) = entry.full_url {
-                            if let Some(ref location) = entry_result.location {
-                                // location is in format "ResourceType/id/_history/version"
-                                // Extract "ResourceType/id"
-                                let reference = location
-                                    .split("/_history")
-                                    .next()
-                                    .unwrap_or(location)
-                                    .to_string();
-                                reference_map.insert(full_url.clone(), reference);
-                            }
-                        }
+                    if let Err(message) =
+                        bundle_state.record(entry, &entry_result, delete_target, used_references)
+                    {
+                        error_info = Some((idx, message));
+                        break;
                     }
 
                     results.push(entry_result);
@@ -3747,7 +3883,7 @@ impl SqliteBackend {
                             tx.delete(&target.resource_type, existing.id()).await?;
                             crate::core::conditional_delete_entry(existing)
                         }
-                        None => BundleEntryResult::deleted(),
+                        None => BundleEntryResult::delete_not_found(),
                     });
                 }
 
@@ -3831,68 +3967,41 @@ impl SqliteBackend {
 
     /// Parse a FHIR URL into resource type and ID.
     fn parse_url(&self, url: &str) -> StorageResult<(String, String)> {
-        // Handle formats like:
-        // - Patient/123
-        // - /Patient/123
-        // - http://example.com/fhir/Patient/123
-        let path = url
-            .strip_prefix("http://")
-            .or_else(|| url.strip_prefix("https://"))
-            .map(|s| {
-                // Find the path part after the host
-                s.find('/').map(|i| &s[i..]).unwrap_or(s)
-            })
-            .unwrap_or(url);
-
-        let path = path.trim_start_matches('/');
-        let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-
-        // Take the last two parts (resource type and ID)
-        // This handles URLs like /fhir/Patient/123 where we want Patient/123
-        if parts.len() >= 2 {
-            let len = parts.len();
-            Ok((parts[len - 2].to_string(), parts[len - 1].to_string()))
-        } else {
-            Err(StorageError::Validation(
+        match parse_bundle_entry_target(url)? {
+            BundleEntryTarget::Instance { resource_type, id } => Ok((resource_type, id)),
+            BundleEntryTarget::Conditional { .. } => Err(StorageError::Validation(
                 crate::error::ValidationError::InvalidReference {
                     reference: url.to_string(),
-                    message: "URL must be in format ResourceType/id".to_string(),
+                    message: "Expected an instance URL".to_string(),
                 },
-            ))
+            )),
         }
     }
 }
 
-/// Recursively resolves urn:uuid references in a JSON value using the reference map.
-///
-/// This function walks through the JSON structure and replaces any `reference` fields
-/// that contain urn:uuid: values with the corresponding resource references from the map.
-fn resolve_bundle_references(
-    value: &mut serde_json::Value,
-    reference_map: &std::collections::HashMap<String, String>,
-) {
-    use serde_json::Value;
-    match value {
-        Value::Object(map) => {
-            // Check if this is a Reference with a urn:uuid reference
-            if let Some(Value::String(ref_str)) = map.get("reference") {
-                if ref_str.starts_with("urn:uuid:") {
-                    if let Some(resolved) = reference_map.get(ref_str) {
-                        map.insert("reference".to_string(), Value::String(resolved.clone()));
-                    }
-                }
-            }
-            // Recurse into all values
-            for v in map.values_mut() {
-                resolve_bundle_references(v, reference_map);
-            }
+/// The open transaction's conditional search, lent to reference pinning.
+struct SqliteBundleMatches<'a> {
+    backend: &'a SqliteBackend,
+    tenant: &'a TenantContext,
+    tx: &'a mut crate::backends::sqlite::transaction::SqliteTransaction,
+}
+
+#[async_trait]
+impl crate::core::transaction::BundleMatchSource for SqliteBundleMatches<'_> {
+    async fn find_matches(
+        &mut self,
+        resource_type: &str,
+        criteria: &str,
+    ) -> StorageResult<Option<Vec<StoredResource>>> {
+        // With search offloaded the local index is empty, so a match here
+        // would be meaningless; the POST arm refuses the entry (#511).
+        if self.backend.is_search_offloaded() {
+            return Ok(None);
         }
-        Value::Array(arr) => {
-            for item in arr {
-                resolve_bundle_references(item, reference_map);
-            }
-        }
-        _ => {}
+        self.backend
+            .find_matching_resources_in_tx(self.tenant, self.tx, resource_type, criteria)
+            .await
+            .map(Some)
     }
 }
 
@@ -3962,71 +4071,47 @@ impl ReindexSource for SqliteBackend {
         max_bytes: u64,
     ) -> StorageResult<ResourcePage> {
         let conn = self.get_connection()?;
-        let tenant_id = tenant.tenant_id().as_str().to_string();
+        fetch_reindex_page_on(&conn, tenant, resource_type, cursor, limit, max_bytes)
+    }
 
-        // Parse cursor if provided (format: "last_updated|id")
-        // Split on the last `|`: an id cannot contain one, but the stored
-        // `last_updated` text of a corrupted row can.
-        let (cursor_ts, cursor_id) = match cursor.and_then(|c| c.rsplit_once('|')) {
-            Some((ts, id)) => (Some(ts.to_string()), Some(id.to_string())),
-            None => (None, None),
-        };
+    /// Only with search offloaded (#1250): the page read and the write in
+    /// flight then touch disjoint stores — the write goes to Elasticsearch
+    /// and this backend's own writer is a no-op — so a prefetched page can
+    /// neither observe nor wait on that write. Standalone SQLite keeps the
+    /// serial loop: its writer holds an IMMEDIATE transaction on the same
+    /// file, and the driver yields between pages so that lock is not taken
+    /// back to back.
+    fn may_prefetch_page(&self, _cursor: &str) -> bool {
+        self.is_search_offloaded()
+    }
 
-        // Build query based on whether we have a cursor
-        let (sql, params): (String, Vec<Box<dyn ToSql>>) =
-            if let (Some(ts), Some(id)) = (&cursor_ts, &cursor_id) {
-                (
-                    "SELECT id, version_id, data, last_updated, fhir_version FROM resources \
-                 WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0 \
-                 AND (last_updated > ?3 OR (last_updated = ?3 AND id > ?4)) \
-                 ORDER BY last_updated ASC, id ASC LIMIT ?5"
-                        .to_string(),
-                    vec![
-                        Box::new(tenant_id.clone()) as Box<dyn ToSql>,
-                        Box::new(resource_type.to_string()),
-                        Box::new(ts.clone()),
-                        Box::new(id.clone()),
-                        Box::new(limit as i64),
-                    ],
-                )
-            } else {
-                (
-                    "SELECT id, version_id, data, last_updated, fhir_version FROM resources \
-                 WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0 \
-                 ORDER BY last_updated ASC, id ASC LIMIT ?3"
-                        .to_string(),
-                    vec![
-                        Box::new(tenant_id.clone()) as Box<dyn ToSql>,
-                        Box::new(resource_type.to_string()),
-                        Box::new(limit as i64),
-                    ],
-                )
-            };
-
-        let mut stmt = conn
-            .prepare(&sql)
-            .map_err(|e| internal_error(format!("Failed to prepare statement: {}", e)))?;
-
-        let param_refs: Vec<&dyn ToSql> = params.iter().map(|p| p.as_ref()).collect();
-
-        let rows = stmt
-            .query_map(param_refs.as_slice(), RawReindexRow::read)
-            .map_err(|e| internal_error(format!("Failed to query resources: {}", e)))?;
-
-        // The cursor uses the stored text so the keyset comparison in the
-        // SQL above sees exactly what it compares against (#1125).
-        collect_reindex_page(
-            rows,
-            tenant,
-            resource_type,
-            limit,
-            max_bytes,
-            "id and lastUpdated",
-            |row| match (&row.last_updated, &row.id) {
-                (Some(last_updated), Some(id)) => Some(format!("{last_updated}|{id}")),
-                _ => None,
-            },
-        )
+    /// The page the serial fetch would return, read on a blocking thread:
+    /// the driver polls an ahead fetch concurrently with the write in
+    /// flight, so a synchronous read on the runtime worker would stall that
+    /// write instead of overlapping it.
+    async fn fetch_resources_page_ahead(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        cursor: &str,
+        limit: u32,
+        max_bytes: u64,
+    ) -> StorageResult<Option<ResourcePage>> {
+        let tenant = tenant.clone();
+        let resource_type = resource_type.to_string();
+        let cursor = cursor.to_string();
+        self.run_blocking(move |conn| {
+            fetch_reindex_page_on(
+                conn,
+                &tenant,
+                &resource_type,
+                Some(&cursor),
+                limit,
+                max_bytes,
+            )
+        })
+        .await
+        .map(Some)
     }
 
     async fn fetch_resources_by_ids(
@@ -4132,21 +4217,43 @@ impl SqliteBackend {
         range: &ReindexIdRange,
     ) -> StorageResult<ResourcePage> {
         let conn = self.get_connection()?;
-        let tenant_id = tenant.tenant_id().as_str();
-        let limit_param = i64::from(limit);
-        let mut params: Vec<&dyn ToSql> = vec![&tenant_id, &resource_type];
-        let bounds = reindex_id_range_sql(range, after_id.as_ref(), &mut params);
-        params.push(&limit_param);
-        let mut stmt = conn
-            .prepare(&reindex_id_range_page_sql(&bounds, params.len()))
-            .map_err(|e| internal_error(format!("Failed to prepare statement: {}", e)))?;
-        let rows = stmt
-            .query_map(params.as_slice(), RawReindexRow::read)
-            .map_err(|e| internal_error(format!("Failed to query resources: {}", e)))?;
-        collect_reindex_page(rows, tenant, resource_type, limit, max_bytes, "id", |row| {
-            row.id.clone()
-        })
+        fetch_reindex_id_range_page_on(
+            &conn,
+            tenant,
+            resource_type,
+            after_id,
+            limit,
+            max_bytes,
+            range,
+        )
     }
+}
+
+/// One id-range page on `conn` (#1767), shared by the serial fetch and the
+/// ahead fetch of an id-range view (#1250).
+fn fetch_reindex_id_range_page_on(
+    conn: &rusqlite::Connection,
+    tenant: &TenantContext,
+    resource_type: &str,
+    after_id: Option<&str>,
+    limit: u32,
+    max_bytes: u64,
+    range: &ReindexIdRange,
+) -> StorageResult<ResourcePage> {
+    let tenant_id = tenant.tenant_id().as_str();
+    let limit_param = i64::from(limit);
+    let mut params: Vec<&dyn ToSql> = vec![&tenant_id, &resource_type];
+    let bounds = reindex_id_range_sql(range, after_id.as_ref(), &mut params);
+    params.push(&limit_param);
+    let mut stmt = conn
+        .prepare(&reindex_id_range_page_sql(&bounds, params.len()))
+        .map_err(|e| internal_error(format!("Failed to prepare statement: {}", e)))?;
+    let rows = stmt
+        .query_map(params.as_slice(), RawReindexRow::read)
+        .map_err(|e| internal_error(format!("Failed to query resources: {}", e)))?;
+    collect_reindex_page(rows, tenant, resource_type, limit, max_bytes, "id", |row| {
+        row.id.clone()
+    })
 }
 
 /// Appends the `id` bounds of an id-range page or count to a statement whose
@@ -4187,6 +4294,86 @@ fn reindex_id_range_page_sql(bounds: &str, limit_param: usize) -> String {
         "SELECT id, version_id, data, last_updated, fhir_version FROM resources \
          WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0{bounds} \
          ORDER BY id ASC LIMIT ?{limit_param}"
+    )
+}
+
+/// One page of the unranged walk on `conn`, in `(last_updated, id)` order
+/// from `cursor` (`"last_updated|id"`), bounded by `limit` resources and,
+/// when `max_bytes` is set, by bytes of stored JSON (#1125). The serial
+/// fetch and the ahead fetch share it and differ only in the thread they
+/// read on (#1250).
+fn fetch_reindex_page_on(
+    conn: &rusqlite::Connection,
+    tenant: &TenantContext,
+    resource_type: &str,
+    cursor: Option<&str>,
+    limit: u32,
+    max_bytes: u64,
+) -> StorageResult<ResourcePage> {
+    let tenant_id = tenant.tenant_id().as_str().to_string();
+
+    // Parse cursor if provided (format: "last_updated|id")
+    // Split on the last `|`: an id cannot contain one, but the stored
+    // `last_updated` text of a corrupted row can.
+    let (cursor_ts, cursor_id) = match cursor.and_then(|c| c.rsplit_once('|')) {
+        Some((ts, id)) => (Some(ts.to_string()), Some(id.to_string())),
+        None => (None, None),
+    };
+
+    // Build query based on whether we have a cursor
+    let (sql, params): (String, Vec<Box<dyn ToSql>>) =
+        if let (Some(ts), Some(id)) = (&cursor_ts, &cursor_id) {
+            (
+                "SELECT id, version_id, data, last_updated, fhir_version FROM resources \
+             WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0 \
+             AND (last_updated > ?3 OR (last_updated = ?3 AND id > ?4)) \
+             ORDER BY last_updated ASC, id ASC LIMIT ?5"
+                    .to_string(),
+                vec![
+                    Box::new(tenant_id.clone()) as Box<dyn ToSql>,
+                    Box::new(resource_type.to_string()),
+                    Box::new(ts.clone()),
+                    Box::new(id.clone()),
+                    Box::new(limit as i64),
+                ],
+            )
+        } else {
+            (
+                "SELECT id, version_id, data, last_updated, fhir_version FROM resources \
+             WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0 \
+             ORDER BY last_updated ASC, id ASC LIMIT ?3"
+                    .to_string(),
+                vec![
+                    Box::new(tenant_id.clone()) as Box<dyn ToSql>,
+                    Box::new(resource_type.to_string()),
+                    Box::new(limit as i64),
+                ],
+            )
+        };
+
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| internal_error(format!("Failed to prepare statement: {}", e)))?;
+
+    let param_refs: Vec<&dyn ToSql> = params.iter().map(|p| p.as_ref()).collect();
+
+    let rows = stmt
+        .query_map(param_refs.as_slice(), RawReindexRow::read)
+        .map_err(|e| internal_error(format!("Failed to query resources: {}", e)))?;
+
+    // The cursor uses the stored text so the keyset comparison in the
+    // SQL above sees exactly what it compares against (#1125).
+    collect_reindex_page(
+        rows,
+        tenant,
+        resource_type,
+        limit,
+        max_bytes,
+        "id and lastUpdated",
+        |row| match (&row.last_updated, &row.id) {
+            (Some(last_updated), Some(id)) => Some(format!("{last_updated}|{id}")),
+            _ => None,
+        },
     )
 }
 
@@ -4316,6 +4503,43 @@ impl ReindexSource for RangedSqliteReindexSource {
             max_bytes,
             &self.range,
         )
+    }
+
+    /// As the unranged source (#1250): only with search offloaded, where the
+    /// id-ordered page read and the Elasticsearch write in flight touch
+    /// disjoint stores.
+    fn may_prefetch_page(&self, _cursor: &str) -> bool {
+        self.backend.is_search_offloaded()
+    }
+
+    /// The id-range page on a blocking thread, as the unranged ahead fetch
+    /// reads its page.
+    async fn fetch_resources_page_ahead(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        cursor: &str,
+        limit: u32,
+        max_bytes: u64,
+    ) -> StorageResult<Option<ResourcePage>> {
+        let tenant = tenant.clone();
+        let resource_type = resource_type.to_string();
+        let cursor = cursor.to_string();
+        let range = self.range.clone();
+        self.backend
+            .run_blocking(move |conn| {
+                fetch_reindex_id_range_page_on(
+                    conn,
+                    &tenant,
+                    &resource_type,
+                    Some(&cursor),
+                    limit,
+                    max_bytes,
+                    &range,
+                )
+            })
+            .await
+            .map(Some)
     }
 
     async fn fetch_resources_by_ids(
@@ -5042,6 +5266,95 @@ mod tests {
             fts_rows,
             "offloaded reindex writes must neither add nor clear FTS rows"
         );
+    }
+
+    /// #1250: on `sqlite-es` the next page is fetched while the current one
+    /// is sent to Elasticsearch. Standalone SQLite keeps the serial loop.
+    #[tokio::test]
+    async fn may_prefetch_page_only_when_search_is_offloaded() {
+        let cursor = "2024-01-01T00:00:00Z|p1";
+        let mut backend = create_test_backend();
+        assert!(!backend.may_prefetch_page(cursor));
+        backend.set_search_offloaded(true);
+        assert!(backend.may_prefetch_page(cursor));
+
+        let ranged = std::sync::Arc::new(backend)
+            .with_id_range(ReindexIdRange {
+                start: None,
+                end: None,
+            })
+            .expect("SQLite supports id ranges");
+        assert!(ranged.may_prefetch_page("p1"));
+    }
+
+    /// The ahead fetch is the serial fetch on a blocking thread (#1250): the
+    /// same resources, in the same order, with the same cursor, for both the
+    /// unranged walk and an id-range view.
+    #[tokio::test]
+    async fn fetch_ahead_returns_the_page_the_serial_fetch_would() {
+        fn ids(page: &ResourcePage) -> Vec<String> {
+            page.resources.iter().map(|r| r.id().to_string()).collect()
+        }
+
+        let mut backend = create_test_backend();
+        backend.set_search_offloaded(true);
+        let tenant = create_test_tenant();
+        for i in 1..=5 {
+            backend
+                .create(
+                    &tenant,
+                    "Patient",
+                    json!({"resourceType": "Patient", "id": format!("p{i}")}),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+
+        let first = backend
+            .fetch_resources_page_capped(&tenant, "Patient", None, 2, 0)
+            .await
+            .unwrap();
+        let cursor = first.next_cursor.clone().expect("three more resources");
+        let serial = backend
+            .fetch_resources_page_capped(&tenant, "Patient", Some(&cursor), 2, 0)
+            .await
+            .unwrap();
+        let ahead = backend
+            .fetch_resources_page_ahead(&tenant, "Patient", &cursor, 2, 0)
+            .await
+            .unwrap()
+            .expect("SQLite never declines an ahead fetch");
+        assert_eq!(ids(&ahead), ids(&serial));
+        assert_eq!(ids(&ahead), ["p3", "p4"]);
+        assert_eq!(ahead.next_cursor, serial.next_cursor);
+
+        let ranged = std::sync::Arc::new(backend)
+            .with_id_range(ReindexIdRange {
+                start: Some("p2".to_string()),
+                end: None,
+            })
+            .expect("SQLite supports id ranges");
+        let first = ranged
+            .fetch_resources_page_capped(&tenant, "Patient", None, 2, 0)
+            .await
+            .unwrap();
+        let cursor = first
+            .next_cursor
+            .clone()
+            .expect("two more resources in range");
+        let serial = ranged
+            .fetch_resources_page_capped(&tenant, "Patient", Some(&cursor), 2, 0)
+            .await
+            .unwrap();
+        let ahead = ranged
+            .fetch_resources_page_ahead(&tenant, "Patient", &cursor, 2, 0)
+            .await
+            .unwrap()
+            .expect("SQLite never declines an ahead fetch");
+        assert_eq!(ids(&ahead), ids(&serial));
+        assert_eq!(ids(&ahead), ["p4", "p5"]);
+        assert_eq!(ahead.next_cursor, serial.next_cursor);
     }
 
     /// #1125: a row whose content or timestamp does not parse used to vanish
@@ -5960,8 +6273,12 @@ mod tests {
             TenantContext::new(TenantId::new("tenant-a"), TenantPermissions::full_access());
         let tenant_b =
             TenantContext::new(TenantId::new("tenant-b"), TenantPermissions::full_access());
+        let gone = TenantContext::new(
+            TenantId::new("tenant-gone"),
+            TenantPermissions::full_access(),
+        );
 
-        // tenant-a: 3 resources, tenant-b: 2 resources.
+        // tenant-a: 3 live resources plus one soft-deleted; tenant-b: 2 live.
         backend
             .create(&tenant_a, "Patient", json!({}), FhirVersion::default())
             .await
@@ -5974,6 +6291,14 @@ mod tests {
             .create(&tenant_a, "Observation", json!({}), FhirVersion::default())
             .await
             .unwrap();
+        let deleted = backend
+            .create(&tenant_a, "Observation", json!({}), FhirVersion::default())
+            .await
+            .unwrap();
+        backend
+            .delete(&tenant_a, "Observation", deleted.id())
+            .await
+            .unwrap();
         backend
             .create(&tenant_b, "Patient", json!({}), FhirVersion::default())
             .await
@@ -5982,12 +6307,125 @@ mod tests {
             .create(&tenant_b, "Observation", json!({}), FhirVersion::default())
             .await
             .unwrap();
+        // A tenant whose only resource is a tombstone has no live data.
+        let tombstone = backend
+            .create(&gone, "Patient", json!({}), FhirVersion::default())
+            .await
+            .unwrap();
+        backend
+            .delete(&gone, "Patient", tombstone.id())
+            .await
+            .unwrap();
 
-        // Cross-tenant admin aggregate: takes NO TenantContext.
-        let counts = backend.count_by_tenant().await.unwrap();
-        let map: std::collections::HashMap<String, u64> = counts.into_iter().collect();
+        // tenant-a is registered and has data; "empty" is registered with no
+        // data; tenant-b has data but was never registered.
+        backend.register_tenant("tenant-a", None).await.unwrap();
+        backend.register_tenant("empty", None).await.unwrap();
+
+        // Cross-tenant admin aggregate: takes NO TenantContext. It counts live
+        // resources only (the tombstones are excluded), finds tenant-b even
+        // though the registry does not know it, and has no entry for a tenant
+        // without live data — registered ("empty") or not ("tenant-gone").
+        let map: std::collections::HashMap<String, u64> = backend
+            .count_by_tenant()
+            .await
+            .unwrap()
+            .into_iter()
+            .collect();
         assert_eq!(map.get("tenant-a"), Some(&3));
         assert_eq!(map.get("tenant-b"), Some(&2));
+        assert_eq!(map.get("empty"), None);
+        assert_eq!(map.get("tenant-gone"), None);
+        assert_eq!(map.len(), 2);
+
+        // The registry lists registered tenants only, data or not. (Sorted
+        // here: `created_at` has one-second resolution, so the two rows may
+        // tie and fall back to id order.)
+        let mut ids: Vec<String> = backend
+            .list_tenants()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|t| t.id)
+            .collect();
+        ids.sort();
+        assert_eq!(ids, vec!["empty".to_string(), "tenant-a".to_string()]);
+
+        // Deregistering without a purge removes the registry row but not the
+        // data, so tenant-a turns into a data-only tenant and stays counted.
+        assert!(backend.deregister_tenant("tenant-a").await.unwrap());
+        let after: std::collections::HashMap<String, u64> = backend
+            .count_by_tenant()
+            .await
+            .unwrap()
+            .into_iter()
+            .collect();
+        assert_eq!(after, map);
+        let ids: Vec<String> = backend
+            .list_tenants()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|t| t.id)
+            .collect();
+        assert_eq!(ids, vec!["empty".to_string()]);
+    }
+
+    /// #1672: SQLite discovery is its grouped live count, complete in one
+    /// query. Deleted resources do not count, so a tenant left with only
+    /// deleted resources is absent: a measured zero.
+    #[tokio::test]
+    async fn test_discover_tenants_reports_live_counts() {
+        use crate::core::{CountBasis, DiscoveryCoverage, DiscoveryRequest, TenantDataEvidence};
+        let backend = create_test_backend();
+        let tenant_a =
+            TenantContext::new(TenantId::new("tenant-a"), TenantPermissions::full_access());
+        let tenant_gone = TenantContext::new(
+            TenantId::new("tenant-gone"),
+            TenantPermissions::full_access(),
+        );
+
+        for resource_type in ["Patient", "Patient", "Observation"] {
+            backend
+                .create(&tenant_a, resource_type, json!({}), FhirVersion::default())
+                .await
+                .unwrap();
+        }
+        let deleted = backend
+            .create(&tenant_a, "Patient", json!({}), FhirVersion::default())
+            .await
+            .unwrap();
+        backend
+            .delete(&tenant_a, "Patient", deleted.id())
+            .await
+            .unwrap();
+        let only = backend
+            .create(&tenant_gone, "Patient", json!({}), FhirVersion::default())
+            .await
+            .unwrap();
+        backend
+            .delete(&tenant_gone, "Patient", only.id())
+            .await
+            .unwrap();
+
+        let discovery = backend
+            .discover_tenants(&DiscoveryRequest::default())
+            .await
+            .unwrap();
+        assert_eq!(discovery.coverage, DiscoveryCoverage::Complete);
+        let found: std::collections::HashMap<String, TenantDataEvidence> = discovery
+            .tenants
+            .into_iter()
+            .map(|t| (t.id, t.evidence))
+            .collect();
+        assert_eq!(
+            found.get("tenant-a"),
+            Some(&TenantDataEvidence::Counted {
+                resources: 3,
+                basis: CountBasis::LiveResources,
+            })
+        );
+        assert!(!found.contains_key("tenant-gone"));
     }
 
     #[test]
@@ -6040,14 +6478,32 @@ mod tests {
                 .await
                 .unwrap();
         }
+        let tombstone = backend
+            .create(&acme, "Observation", json!({}), FhirVersion::default())
+            .await
+            .unwrap();
+        backend
+            .delete(&acme, "Observation", tombstone.id())
+            .await
+            .unwrap();
         backend
             .create(&other, "Patient", json!({}), FhirVersion::default())
             .await
             .unwrap();
 
-        // Purge removes acme's data only, reporting the row count.
+        let live: std::collections::HashMap<String, u64> = backend
+            .count_by_tenant()
+            .await
+            .unwrap()
+            .into_iter()
+            .collect();
+        assert_eq!(live.get("acme"), Some(&3));
+
+        // Purge removes acme's data only. The number it reports counts every
+        // current row, the tombstone included, so it is NOT the live count and
+        // must not be used as a delta against `count_by_tenant` (#1827).
         let removed = backend.purge_tenant_data("acme").await.unwrap();
-        assert_eq!(removed, 3);
+        assert_eq!(removed, 4);
 
         let counts: std::collections::HashMap<String, u64> = backend
             .count_by_tenant()
@@ -6057,6 +6513,303 @@ mod tests {
             .collect();
         assert_eq!(counts.get("acme"), None);
         assert_eq!(counts.get("other"), Some(&1));
+    }
+
+    /// A file-backed backend whose pool has exactly one connection, so a
+    /// thread that checks that connection out leaves every other caller
+    /// waiting in `pool.get()` (#1827). File-backed rather than `:memory:`
+    /// because the shared-cache in-memory URI is inert on some builds (#787).
+    /// The acquire timeout is the red phase's only cost: on code that acquires
+    /// on the runtime thread, the gate tests below block for this long and
+    /// then fail.
+    fn one_connection_backend(dir: &tempfile::TempDir) -> SqliteBackend {
+        let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.join("data"))
+            .unwrap_or_else(|| PathBuf::from("data"));
+        let backend = SqliteBackend::with_config(
+            dir.path().join("one-connection.db"),
+            SqliteBackendConfig {
+                max_connections: 1,
+                min_connections: 1,
+                connection_timeout_ms: 3_000,
+                data_dir: Some(data_dir),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        backend.init_schema().unwrap();
+        backend
+    }
+
+    /// Checks out the pool's only connection on a separate std thread and
+    /// keeps it until the returned sender fires (or is dropped, so a failing
+    /// test cannot leave the thread parked).
+    fn hold_only_connection(
+        backend: &SqliteBackend,
+    ) -> (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>) {
+        let pool = backend.pool();
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let conn = pool.get().expect("holder acquires the only connection");
+            held_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+            drop(conn);
+        });
+        held_rx
+            .recv()
+            .expect("holder signals that it holds the connection");
+        assert_eq!(backend.pool().state().idle_connections, 0);
+        (release_tx, holder)
+    }
+
+    /// #1827: with the pool's only connection held elsewhere, `count_by_tenant`
+    /// must wait for it on a blocking thread, leaving the (single) runtime
+    /// thread free to poll other futures. The heartbeat is what releases the
+    /// connection, so the count can only succeed if the heartbeat ran while it
+    /// was still pending. Before the fix the acquire parked the runtime thread
+    /// itself: the heartbeat never ran, and the count failed with
+    /// `ConnectionFailed` once the acquire timed out.
+    #[tokio::test(flavor = "current_thread")]
+    async fn count_by_tenant_waits_for_a_pooled_connection_off_the_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = one_connection_backend(&dir);
+        let acme = TenantContext::new(TenantId::new("acme"), TenantPermissions::full_access());
+        let beta = TenantContext::new(TenantId::new("beta"), TenantPermissions::full_access());
+        for _ in 0..2 {
+            backend
+                .create(&acme, "Patient", json!({}), FhirVersion::default())
+                .await
+                .unwrap();
+        }
+        backend
+            .create(&beta, "Observation", json!({}), FhirVersion::default())
+            .await
+            .unwrap();
+
+        let (release, holder) = hold_only_connection(&backend);
+        let events = std::cell::RefCell::new(Vec::new());
+        let (counts, ()) = tokio::join!(
+            async {
+                let r = backend.count_by_tenant().await;
+                events.borrow_mut().push("count");
+                r
+            },
+            async {
+                events.borrow_mut().push("heartbeat");
+                release.send(()).unwrap();
+            },
+        );
+        holder.join().unwrap();
+
+        assert_eq!(events.into_inner(), vec!["heartbeat", "count"]);
+        let counts: std::collections::HashMap<String, u64> = counts.unwrap().into_iter().collect();
+        assert_eq!(counts.get("acme"), Some(&2));
+        assert_eq!(counts.get("beta"), Some(&1));
+        assert_eq!(counts.len(), 2);
+    }
+
+    /// #1827: the same gate for the tenant registry read.
+    #[tokio::test(flavor = "current_thread")]
+    async fn list_tenants_waits_for_a_pooled_connection_off_the_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = one_connection_backend(&dir);
+        backend
+            .register_tenant("acme", Some("Acme Health"))
+            .await
+            .unwrap();
+        backend.register_tenant("beta", None).await.unwrap();
+
+        let (release, holder) = hold_only_connection(&backend);
+        let events = std::cell::RefCell::new(Vec::new());
+        let (tenants, ()) = tokio::join!(
+            async {
+                let r = backend.list_tenants().await;
+                events.borrow_mut().push("list");
+                r
+            },
+            async {
+                events.borrow_mut().push("heartbeat");
+                release.send(()).unwrap();
+            },
+        );
+        holder.join().unwrap();
+
+        assert_eq!(events.into_inner(), vec!["heartbeat", "list"]);
+        let mut tenants = tenants.unwrap();
+        tenants.sort_by(|a, b| a.id.cmp(&b.id));
+        assert_eq!(tenants.len(), 2);
+        assert_eq!(tenants[0].id, "acme");
+        assert_eq!(tenants[0].display_name.as_deref(), Some("Acme Health"));
+        assert_eq!(tenants[1].id, "beta");
+        assert_eq!(tenants[1].display_name, None);
+    }
+
+    /// #1827: what a caller that stops waiting does NOT get. Once
+    /// `run_blocking`'s closure has started, dropping the future (a timeout,
+    /// an aborted request) leaves the closure running and its pooled
+    /// connection checked out until the closure itself returns. Exercised on
+    /// the helper directly because `count_by_tenant` and `list_tenants` both go
+    /// through it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn abandoned_run_blocking_keeps_its_connection_until_the_closure_ends() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = one_connection_backend(&dir);
+        let pool = backend.pool();
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let work = backend.run_blocking(move |conn| {
+            started_tx.send(()).unwrap();
+            // Stand-in for a long aggregate: the closure is mid-flight and
+            // owns `conn` until the test lets it finish.
+            let _ = release_rx.recv();
+            let one: i64 = conn
+                .query_row("SELECT 1", [], |r| r.get(0))
+                .or_query_error("select 1")?;
+            done_tx.send(()).unwrap();
+            Ok(one)
+        });
+
+        // Stop waiting as soon as the closure is known to be running; the
+        // `select!` drops `work` on the way out.
+        tokio::select! {
+            biased;
+            _ = started_rx => {}
+            _ = work => panic!("the closure cannot finish before it is released"),
+        }
+
+        // Nobody is waiting any more, yet the connection is still checked out.
+        assert_eq!(pool.state().connections, 1);
+        assert_eq!(pool.state().idle_connections, 0);
+        assert!(pool.try_get().is_none());
+
+        // Letting the closure finish is what returns the connection.
+        release_tx.send(()).unwrap();
+        let reacquired = tokio::task::spawn_blocking(move || {
+            done_rx
+                .recv()
+                .expect("the abandoned closure ran to completion");
+            pool.get_timeout(std::time::Duration::from_secs(10))
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        })
+        .await
+        .unwrap();
+        assert_eq!(reacquired, Ok(()));
+    }
+
+    /// #1827: a caller that gives up while `run_blocking` is still waiting for
+    /// a connection does not withdraw the work either. The blocking task keeps
+    /// waiting, and once a connection frees up it acquires it and runs the
+    /// closure for nobody — the reason an abandoned refresh is not free.
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_blocking_abandoned_while_acquiring_still_runs_its_closure() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = one_connection_backend(&dir);
+        let (release, holder) = hold_only_connection(&backend);
+
+        let (ran_tx, ran_rx) = std::sync::mpsc::channel::<()>();
+        let mut work = Box::pin(backend.run_blocking(move |_conn| {
+            ran_tx.send(()).unwrap();
+            Ok(())
+        }));
+        // One poll spawns the blocking task, which parks in `pool.get()`.
+        assert!(futures::poll!(work.as_mut()).is_pending());
+        drop(work);
+
+        release.send(()).unwrap();
+        holder.join().unwrap();
+        let ran = tokio::task::spawn_blocking(move || {
+            ran_rx.recv_timeout(std::time::Duration::from_secs(10))
+        })
+        .await
+        .unwrap();
+        assert!(ran.is_ok(), "the abandoned closure still ran: {ran:?}");
+    }
+
+    /// Opens a read transaction on `table` from another pooled connection of
+    /// a shared-cache in-memory backend and keeps it, with its table read
+    /// lock, until the returned sender fires (or is dropped).
+    fn hold_shared_cache_read_lock(
+        backend: &SqliteBackend,
+        table: &'static str,
+    ) -> (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>) {
+        let pool = backend.pool();
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let conn = pool.get().expect("holder acquires a connection");
+            conn.execute_batch("BEGIN").unwrap();
+            let _: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap();
+            held_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+            conn.execute_batch("COMMIT").unwrap();
+        });
+        held_rx
+            .recv()
+            .expect("holder signals that it holds the lock");
+        (release_tx, holder)
+    }
+
+    /// #1827: on the shared-cache in-memory database a reader on another
+    /// connection makes a write fail at once with `SQLITE_LOCKED`, which
+    /// `busy_timeout` does not retry. With the tenant reads on blocking
+    /// threads an inventory refresh can overlap a tenant delete that way, so
+    /// the registry writes retry it. The precondition check below shows the
+    /// conflict is real on this build; the deregister and the purge must then
+    /// wait it out instead of failing.
+    #[tokio::test(flavor = "current_thread")]
+    async fn tenant_writes_wait_out_a_shared_cache_reader() {
+        let backend = create_test_backend();
+        let acme = TenantContext::new(TenantId::new("acme"), TenantPermissions::full_access());
+        backend.register_tenant("acme", None).await.unwrap();
+        backend.register_tenant("beta", None).await.unwrap();
+        backend
+            .create(&acme, "Patient", json!({}), FhirVersion::default())
+            .await
+            .unwrap();
+
+        // Registry write against a registry reader.
+        let (release, holder) = hold_shared_cache_read_lock(&backend, "tenants");
+        let raw = backend
+            .get_connection()
+            .unwrap()
+            .execute("DELETE FROM tenants WHERE id = 'nobody'", []);
+        assert_eq!(
+            raw.as_ref().err().and_then(|e| e.sqlite_error_code()),
+            Some(rusqlite::ErrorCode::DatabaseLocked),
+            "precondition: a shared-cache reader locks writers out: {raw:?}"
+        );
+        let (deregistered, ()) = tokio::join!(backend.deregister_tenant("beta"), async {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            release.send(()).unwrap();
+        });
+        holder.join().unwrap();
+        assert!(deregistered.unwrap(), "beta was registered");
+        let ids: Vec<String> = backend
+            .list_tenants()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|t| t.id)
+            .collect();
+        assert_eq!(ids, vec!["acme".to_string()]);
+
+        // Purge against a reader of the resources table (a count).
+        let (release, holder) = hold_shared_cache_read_lock(&backend, "resources");
+        let (removed, ()) = tokio::join!(backend.purge_tenant_data("acme"), async {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            release.send(()).unwrap();
+        });
+        holder.join().unwrap();
+        assert_eq!(removed.unwrap(), 1);
+        assert!(backend.count_by_tenant().await.unwrap().is_empty());
     }
 
     #[tokio::test]
