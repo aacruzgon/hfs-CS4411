@@ -135,6 +135,17 @@ export CARGO_BUILD_JOBS=4
 ### Windows and worktree notes
 See `CLAUDE.md` -> "Windows and worktree notes" (the only place they live; do not copy them here).
 
+## Decision records (ADR)
+
+Every design decision made in a session with an AI assistant (Codex, Claude Code or any other) is recorded by the human driving the session, in that person's own ADR log under `docs/Cassandra/`, in the directory `ADR-<github username>/`, in the file `ADR-<github username>.md`. Current logs: `ADR-aacruzgon/`, `ADR-anastasiabryz/`, `ADR-diya-patel83/`, `ADR-sam-michaels/`, `ADR-sara-lahourpour/`.
+
+- Identify the user's log with `gh api user --jq .login`. If that fails, ask which log is theirs. Do not guess from `git config user.name`.
+- Append an entry using the template at the top of that file and fill every field, including **AI involvement** (what the assistant proposed, what the human changed, what was verified and how). Add a row to the index table at the top of the file.
+- Append only to the current user's own file. Never edit another collaborator's ADR log; a disagreement is a new entry in the disagreeing person's log that references the other.
+- A decision that changes `docs/Cassandra/cassandra-discussion.md` or `docs/Cassandra/development-roadmap.md` updates those files in the same commit as the ADR entry.
+- Routine work (typo fixes, formatting, a test for existing behaviour) needs no entry. A choice between workable designs, or a change to a table, key, column type, trait surface, consistency level, write path, dependency or benchmark method, or any deviation from the design document, does.
+- Draft the entry at the end of the session and show it to the user before committing; the entry is theirs, not the assistant's.
+
 ## Important Notes
 
 - Default FHIR version is R4 when no features specified
