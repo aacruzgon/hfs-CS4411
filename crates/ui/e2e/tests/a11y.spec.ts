@@ -1,3 +1,4 @@
+import { createResource, deleteResources, waitSearchable } from "../pages/api";
 import { SearchBuilder } from "../pages/search-builder";
 import { holdSearches } from "../pages/search-lifecycle";
 import { test, expect, confirmDialog, dismissConfirm } from "../pages/fixtures";
@@ -397,4 +398,50 @@ for (const theme of THEMES) {
       await request.patch("/_user/settings", { data: { bulkExport: previous } });
     }
   });
+}
+
+for (const theme of THEMES) {
+  test(`issue1880 unsaved navigation confirmation is keyboard accessible — ${theme}`, async ({ page, chrome }) => {
+    test.setTimeout(2 * SCAN_BUDGET_MS);
+    await chrome.seedTheme(theme);
+    await page.goto("/ui/sql/view-definitions?vd=new&lang=en");
+    const editor = new VdEditor(page);
+    await editor.setDoc(JSON.stringify({ resourceType: "ViewDefinition", name: "navigation_a11y", status: "active", resource: "Patient", select: [{ column: [{ name: "id", path: "getResourceKey()" }] }] }));
+    const trigger = page.locator("#vd-editor-cancel");
+    await trigger.focus();
+    await page.keyboard.press("Enter");
+    await expect(confirmDialog(page)).toBeVisible();
+    await expect(confirmDialog(page).locator("[data-confirm-cancel]")).toBeFocused();
+    await page.keyboard.press("Tab");
+    await expect(confirmDialog(page).locator("[data-confirm-ok]")).toBeFocused();
+    await page.keyboard.press("Shift+Tab");
+    await expect(confirmDialog(page).locator("[data-confirm-cancel]")).toBeFocused();
+    await expectNoViolations(page, `unsaved navigation dialog — ${theme}`);
+    await page.keyboard.press("Escape");
+    await expect(confirmDialog(page)).toHaveCount(0);
+    await expect(trigger).toBeFocused();
+    await expect(page.locator("#vd-editor-form .tag--unsaved")).toBeVisible();
+  });
+
+  for (const kind of ["bulk-export", "sql-export"]) {
+    test(`Since open fixed-choice popup is accessible on ${kind} — ${theme}`, async ({ page, request, chrome }) => {
+      let id: string | undefined;
+      try {
+        if (kind === "sql-export") {
+          id = await createResource(request, "ViewDefinition", {
+            name: `since_axe_${Date.now()}`, status: "active", resource: "Patient",
+            select: [{ column: [{ name: "id", path: "getResourceKey()" }] }],
+          });
+          await waitSearchable(request, "ViewDefinition", id);
+        }
+        await chrome.seedTheme(theme);
+        await page.goto(`/ui/${kind === "bulk-export" ? "bulk-export" : "sql/export"}/new`, { waitUntil: "networkidle" });
+        const picker = page.locator(`#${kind}-since`);
+        await picker.getByRole("combobox").click();
+        await expect(picker.getByRole("listbox")).toBeVisible();
+        await expect(picker.locator('[role="option"][aria-selected="true"]')).toHaveCount(1);
+        await expectNoViolations(page, `${kind} Since popup open in ${theme}`);
+      } finally { if (id) await deleteResources(request, "ViewDefinition", [id]); }
+    });
+  }
 }

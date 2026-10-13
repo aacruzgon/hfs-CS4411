@@ -70,6 +70,7 @@ pub mod converters;
 pub mod date_value;
 pub mod errors;
 pub mod extractor;
+pub mod in_resolver;
 pub mod list_resolver;
 pub mod loader;
 pub mod metadata_modifier;
@@ -77,6 +78,10 @@ pub mod numeric_value;
 pub mod range;
 pub mod registry;
 pub mod reindex;
+/// Shared by the writers that extract on a rayon pool; without either of
+/// them it is dead code, which the single-backend clippy matrix refuses.
+#[cfg(any(feature = "elasticsearch", feature = "mongodb"))]
+pub(crate) mod reindex_prepare;
 mod reindex_stats;
 pub mod seeder;
 pub mod tenant_registries;
@@ -107,6 +112,7 @@ pub use date_value::{
 };
 pub use errors::{ExtractionError, LoaderError, RegistryError, ReindexError};
 pub use extractor::{ContainedExtraction, ExtractedValue, SearchParameterExtractor};
+pub use in_resolver::{query_has_in, resolve_in};
 pub use list_resolver::{query_has_list, resolve_list};
 pub use loader::SearchParameterLoader;
 pub use metadata_modifier::reject_unsupported_metadata_modifier;

@@ -4,8 +4,9 @@
 //! - Basic single-type search
 //! - Multi-type search
 //! - _include and _revinclude support
-//! - Chained search (`ChainedSearchProvider`); `search()` evaluates the bounded
-//!   native Patient `_has` shape and refuses other unresolved chains (#1389)
+//! - `search()` evaluates the bounded native Patient `_has` shape
+//!   (`search::native_has`) and refuses other chains not resolved first by
+//!   the shared resolver (`crate::search::resolve_chains`, #1389)
 //! - Full-text search using tsvector/tsquery
 
 use crate::backends::sql_literal::sql_string_literal;
@@ -16,32 +17,22 @@ use chrono::Utc;
 use helios_fhir::FhirVersion;
 
 use crate::core::{
-    ChainedSearchProvider, IncludeProvider, MultiTypeSearchProvider, ResourceStorage,
-    RevincludeProvider, SearchProvider, SearchResult, TextSearchProvider,
+    IncludeProvider, MultiTypeSearchProvider, ResourceStorage, RevincludeProvider, SearchProvider,
+    SearchResult, TextSearchProvider,
 };
-use crate::error::{BackendError, QueryErrorExt, SearchError, StorageError, StorageResult};
+use crate::error::{QueryErrorExt, SearchError, StorageError, StorageResult};
 use crate::tenant::TenantContext;
 use crate::types::{
     CursorDirection, CursorValue, IncludeDirective, Page, PageCursor, PageInfo, Pagination,
-    ReverseChainedParameter, SearchQuery, StoredResource,
+    SearchQuery, StoredResource,
 };
 
 use super::PostgresBackend;
 use super::cached::{query_dyn_cached, query_one_dyn_cached};
-use super::search::chain_builder::{
-    ChainQueryBuilder, native_patient_code_predicate, native_patient_code_token,
-};
+use super::search::native_has::{native_patient_code_predicate, native_patient_code_token};
 use super::search::query_builder::{
     KeysetKey, PostgresQueryBuilder, SortValueKind, SqlFragment, SqlParam,
 };
-
-fn internal_error(message: String) -> StorageError {
-    StorageError::Backend(BackendError::Internal {
-        backend_name: "postgres".to_string(),
-        message,
-        source: None,
-    })
-}
 
 /// Whether a cursor sits on a resource with no value for the sort key.
 fn cursor_value_is_null(cursor: &PageCursor) -> bool {
@@ -186,6 +177,128 @@ fn reject_unresolved_chains(query: &SearchQuery) -> StorageResult<()> {
 /// it describes (#1363).
 fn reject_contained_missing(query: &SearchQuery) -> StorageResult<()> {
     PostgresQueryBuilder::reject_unsupported_contained(query).map_err(StorageError::Search)
+}
+
+/// The SQL used by the conservative legacy check. Each representation has a
+/// matching partial index on Legacy databases; contained rows are always unfolded.
+fn legacy_composite_probe_sql(
+    contained: bool,
+    family: crate::types::SearchParamType,
+    count: usize,
+) -> String {
+    use crate::types::SearchParamType;
+    let scope = if contained {
+        "is_contained = TRUE AND contained_type = $2"
+    } else {
+        "is_contained = FALSE AND resource_type = $2"
+    };
+    let folded_guard = if contained || count > 2 {
+        ""
+    } else {
+        match family {
+            SearchParamType::Token => {
+                " AND value_token_code_2 IS NULL AND value_token_system_2 IS NULL"
+            }
+            SearchParamType::Number => " AND value_number_2 IS NULL",
+            _ => "",
+        }
+    };
+    format!(
+        "SELECT 1 FROM search_index WHERE tenant_id = $1 AND {scope} AND param_name = $3 AND composite_group IS NOT NULL AND composite_slot IS NULL{folded_guard} LIMIT 1"
+    )
+}
+
+async fn reject_legacy_composites(
+    client: &deadpool_postgres::Client,
+    tenant: &TenantContext,
+    query: &SearchQuery,
+    layout: super::schema::IndexLayout,
+) -> StorageResult<()> {
+    use super::schema::IndexLayout;
+    use crate::types::{ContainedMode, SearchModifier, SearchParamType};
+    let mut probes = Vec::new();
+    for parameter in query
+        .parameters
+        .iter()
+        .filter(|p| p.param_type == SearchParamType::Composite)
+    {
+        // Ordinary :missing is a presence predicate, so neither component
+        // positions nor a representable folded shape affect its answer.
+        if query.contained == ContainedMode::Off
+            && matches!(parameter.modifier, Some(SearchModifier::Missing))
+        {
+            continue;
+        }
+        let families: HashSet<SearchParamType> =
+            parameter.components.iter().map(|c| c.param_type).collect();
+        for family in families {
+            let count = parameter
+                .components
+                .iter()
+                .filter(|c| c.param_type == family)
+                .count();
+            if count < 2 {
+                continue;
+            }
+            let supported = matches!(
+                family,
+                SearchParamType::Token
+                    | SearchParamType::Number
+                    | SearchParamType::Quantity
+                    | SearchParamType::String
+                    | SearchParamType::Date
+            );
+            let representable =
+                matches!(family, SearchParamType::Token | SearchParamType::Number) && count <= 2;
+            if !supported
+                || count > u8::MAX as usize
+                || (layout == IndexLayout::Denormalized
+                    && query.contained != ContainedMode::On
+                    && !representable)
+            {
+                return Err(StorageError::Search(SearchError::InvalidComposite {
+                    message: format!(
+                        "search parameter '{}' has unsupported repeated {family:?} components for the requested PostgreSQL representation",
+                        parameter.name
+                    ),
+                }));
+            }
+            probes.push((parameter, family, count));
+        }
+    }
+    // Refuse every unsupported declaration before a legacy row in another
+    // parameter can suggest a reindex that cannot repair the requested shape.
+    for (parameter, family, count) in probes {
+        for contained in [false, true] {
+            if (!contained
+                && (query.contained == ContainedMode::On || layout != IndexLayout::Legacy))
+                || (contained && query.contained == ContainedMode::Off)
+            {
+                continue;
+            }
+            let sql = legacy_composite_probe_sql(contained, family, count);
+            let old = client
+                .query_opt(
+                    &sql,
+                    &[
+                        &tenant.tenant_id().as_str(),
+                        &query.resource_type,
+                        &parameter.name,
+                    ],
+                )
+                .await
+                .or_query_error("Failed to probe legacy composite index rows")?;
+            if old.is_some() {
+                return Err(StorageError::Search(SearchError::InvalidComposite {
+                    message: format!(
+                        "search parameter '{}' requires $reindex: older PostgreSQL composite index rows lack component slots; update all writers and reindex the full tenant",
+                        parameter.name
+                    ),
+                }));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Decides whether a page can be resolved from `search_index` alone, returning
@@ -365,6 +478,8 @@ impl PostgresBackend {
             query,
             self.supports_native_reverse_chains(tenant, query),
         )?;
+
+        reject_legacy_composites(client, tenant, query, self.index_layout()).await?;
 
         let tenant_id = tenant.tenant_id().as_str();
         let resource_type = &query.resource_type;
@@ -720,6 +835,8 @@ impl SearchProvider for PostgresBackend {
             query,
             self.supports_native_reverse_chains(tenant, query),
         )?;
+        let client = self.get_client().await?;
+        reject_legacy_composites(&client, tenant, query, self.index_layout()).await?;
         let tenant_id = tenant.tenant_id().as_str();
         let resource_type = &query.resource_type;
         let param_offset = if cursor.is_some() { 4 } else { 2 };
@@ -770,7 +887,6 @@ impl SearchProvider for PostgresBackend {
             .iter()
             .map(|param| param.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
             .collect();
-        let client = self.get_client().await?;
         let rows = query_dyn_cached(&client, &sql, &param_refs)
             .await
             .or_query_error("Failed to execute id-only search")?;
@@ -826,6 +942,7 @@ impl SearchProvider for PostgresBackend {
         }
 
         let client = self.get_client().await?;
+        reject_legacy_composites(&client, tenant, query, self.index_layout()).await?;
         let tenant_id = tenant.tenant_id().as_str();
         let resource_type = &query.resource_type;
 
@@ -1129,131 +1246,6 @@ impl RevincludeProvider for PostgresBackend {
 }
 
 #[async_trait]
-impl ChainedSearchProvider for PostgresBackend {
-    async fn resolve_chain(
-        &self,
-        tenant: &TenantContext,
-        base_type: &str,
-        chain: &str,
-        value: &str,
-    ) -> StorageResult<Vec<String>> {
-        if chain.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let client = self.get_client().await?;
-        let tenant_id = tenant.tenant_id().as_str();
-
-        // Build a multi-step chain query via the registry-driven builder.
-        // The builder produces a `r.id IN (... nested SELECTs ...)` fragment
-        // that handles arbitrary chain depth (was previously stubbed for >2
-        // segments).
-        let builder = ChainQueryBuilder::new(tenant_id, base_type, self.tenant_registry(tenant_id))
-            .with_param_offset(1);
-        let parsed = builder
-            .parse_chain(chain)
-            .map_err(|e| internal_error(format!("Failed to parse chain: {}", e)))?;
-        // Strip the comparator prefix only when the terminal parameter's type
-        // admits one — date, number and quantity, explicit `eq` included
-        // (#1290, #1307) — so a string or token value is never misread: not
-        // `family=Levine` as le + "vine" (#258), nor `family=nelson` as
-        // ne + "lson" (#1307).
-        let parsed_value = crate::types::SearchValue::parse_for_type(value, parsed.terminal_type);
-        let fragment = builder.build_forward_chain_sql(&parsed, &parsed_value)?;
-
-        let sql = format!(
-            "SELECT r.id FROM resources r WHERE r.tenant_id = $1 \
-             AND r.resource_type = {base} AND r.is_deleted = FALSE AND {clause}",
-            base = sql_string_literal(base_type),
-            clause = fragment.sql,
-        );
-
-        let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> =
-            vec![Box::new(tenant_id.to_string())];
-        for p in &fragment.params {
-            match p {
-                SqlParam::Text(s) => params.push(Box::new(s.clone())),
-                SqlParam::TextArray(ids) => params.push(Box::new(ids.clone())),
-                SqlParam::Float(f) => params.push(Box::new(*f)),
-                SqlParam::Integer(i) => params.push(Box::new(*i)),
-                SqlParam::Bool(b) => params.push(Box::new(*b)),
-                SqlParam::Timestamp(dt) => params.push(Box::new(*dt)),
-                SqlParam::Null => params.push(Box::new(Option::<String>::None)),
-            }
-        }
-        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
-            .iter()
-            .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
-            .collect();
-
-        // Not cached. Every client-supplied value is bound, the token system
-        // included (the `Token` arms of `build_terminal_condition` and its
-        // reverse twin in search/chain_builder.rs); what the text still inlines
-        // is resource types and parameter names checked against the registry,
-        // and the chain's shape. That key is bounded, but a distinct statement
-        // per chain shape buys little here: REST resolves chains through the
-        // shared resolver, so this path is reached only through the
-        // `ChainedSearchProvider` API (#1341).
-        let rows = client
-            .query(&sql, &param_refs)
-            .await
-            .or_query_error("Failed to execute chain query")?;
-
-        Ok(rows.iter().map(|r| r.get(0)).collect())
-    }
-
-    async fn resolve_reverse_chain(
-        &self,
-        tenant: &TenantContext,
-        base_type: &str,
-        reverse_chain: &ReverseChainedParameter,
-    ) -> StorageResult<Vec<String>> {
-        let client = self.get_client().await?;
-        let tenant_id = tenant.tenant_id().as_str();
-
-        // Use the registry-driven builder so we handle nested `_has` chains
-        // and any param type (was previously single-level only with hardcoded
-        // token-or-string-or-empty fallback).
-        let builder = ChainQueryBuilder::new(tenant_id, base_type, self.tenant_registry(tenant_id))
-            .with_param_offset(1);
-        let fragment = builder.build_reverse_chain_sql(reverse_chain)?;
-
-        let sql = format!(
-            "SELECT r.id FROM resources r WHERE r.tenant_id = $1 \
-             AND r.resource_type = {base} AND r.is_deleted = FALSE AND {clause}",
-            base = sql_string_literal(base_type),
-            clause = fragment.sql,
-        );
-
-        let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> =
-            vec![Box::new(tenant_id.to_string())];
-        for p in &fragment.params {
-            match p {
-                SqlParam::Text(s) => params.push(Box::new(s.clone())),
-                SqlParam::TextArray(ids) => params.push(Box::new(ids.clone())),
-                SqlParam::Float(f) => params.push(Box::new(*f)),
-                SqlParam::Integer(i) => params.push(Box::new(*i)),
-                SqlParam::Bool(b) => params.push(Box::new(*b)),
-                SqlParam::Timestamp(dt) => params.push(Box::new(*dt)),
-                SqlParam::Null => params.push(Box::new(Option::<String>::None)),
-            }
-        }
-        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
-            .iter()
-            .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
-            .collect();
-
-        // Not cached, for the reason given in `resolve_chain`.
-        let rows = client
-            .query(&sql, &param_refs)
-            .await
-            .or_query_error("Failed to execute reverse chain query")?;
-
-        Ok(rows.iter().map(|r| r.get(0)).collect())
-    }
-}
-
-#[async_trait]
 impl TextSearchProvider for PostgresBackend {
     async fn search_text(
         &self,
@@ -1514,6 +1506,11 @@ impl PostgresBackend {
         query: &SearchQuery,
     ) -> StorageResult<ContainedPlan> {
         use crate::types::{ContainedMode, ContainedReturn, SearchParamType, SearchParameter};
+
+        {
+            let client = self.get_client().await?;
+            reject_legacy_composites(&client, tenant, query, self.index_layout()).await?;
+        }
 
         let mut keys = self.contained_matches(tenant, query).await?;
         if query.contained_return == ContainedReturn::Container {
@@ -2011,5 +2008,363 @@ mod composite_arity_tests {
         assert!(message.contains("expects 2"), "{message}");
 
         assert!(reject_unsupported_metadata_modifier(&q("8302-2$gt150"), false).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod composite_slot_runtime_tests {
+    use super::*;
+    use crate::backends::postgres::PostgresConfig;
+    use crate::search::{ReindexOperation, ReindexRequest, ReindexStatus};
+    use crate::tenant::{TenantId, TenantPermissions};
+    use crate::types::{
+        CompositeSearchComponent, ContainedMode, SearchParamType, SearchParameter, SearchValue,
+    };
+    use serde_json::json;
+    use testcontainers::{ImageExt, runners::AsyncRunner};
+    use testcontainers_modules::postgres::Postgres;
+
+    fn pair(name: &str, family: SearchParamType, count: usize) -> SearchQuery {
+        let value = if family == SearchParamType::Date {
+            "2020-01-01"
+        } else {
+            "1"
+        };
+        SearchQuery::new("Observation").with_parameter(SearchParameter {
+            name: name.into(),
+            param_type: SearchParamType::Composite,
+            components: (0..count)
+                .map(|position| CompositeSearchComponent {
+                    param_type: family,
+                    param_name: format!("axis-{position}"),
+                })
+                .collect(),
+            values: vec![SearchValue::eq(vec![value; count].join("$"))],
+            ..Default::default()
+        })
+    }
+
+    async fn explain(
+        client: &deadpool_postgres::Client,
+        scope: &TenantContext,
+        contained: bool,
+        family: SearchParamType,
+        count: usize,
+        name: &str,
+    ) {
+        let sql = legacy_composite_probe_sql(contained, family, count);
+        let rows = client
+            .query(
+                &format!("EXPLAIN (ANALYZE, BUFFERS) {sql}"),
+                &[&scope.tenant_id().as_str(), &"Observation", &name],
+            )
+            .await
+            .unwrap();
+        let plan = rows
+            .iter()
+            .map(|row| row.get::<_, String>(0))
+            .collect::<Vec<_>>()
+            .join("\n");
+        eprintln!(
+            "[postgres-composite-probe] contained={contained} {family:?}/{count} {name}:\n{plan}"
+        );
+        let expected = if contained {
+            "idx_search_contained_composite_legacy"
+        } else {
+            match family {
+                SearchParamType::Token if count <= 2 => "idx_search_composite_legacy_token",
+                SearchParamType::Number if count <= 2 => "idx_search_composite_legacy_number",
+                _ => "idx_search_composite_legacy",
+            }
+        };
+        assert!(
+            plan.contains(&format!("using {expected} on search_index")),
+            "real probe must use its partial index: {plan}"
+        );
+        assert!(!plan.contains("Seq Scan"), "{plan}");
+    }
+
+    #[tokio::test]
+    async fn postgres_composite_guard_transaction_client_and_real_probe_plans() {
+        let container = Postgres::default()
+            .with_tag("16-alpine")
+            .start()
+            .await
+            .unwrap();
+        let config = PostgresConfig {
+            host: container.get_host().await.unwrap().to_string(),
+            port: container.get_host_port_ipv4(5432).await.unwrap(),
+            dbname: "postgres".into(),
+            user: "postgres".into(),
+            password: Some("postgres".into()),
+            max_connections: 5,
+            data_dir: Some(std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data")),
+            ..Default::default()
+        };
+        let admin = PostgresBackend::new(config.clone()).await.unwrap();
+        let dbname = format!("hfs1407_r1_client_{}", uuid::Uuid::new_v4().simple());
+        admin
+            .get_client()
+            .await
+            .unwrap()
+            .batch_execute(&format!("CREATE DATABASE {dbname}"))
+            .await
+            .unwrap();
+        let config = PostgresConfig { dbname, ..config };
+        let denorm = PostgresBackend::new(config.clone()).await.unwrap();
+        denorm.init_schema().await.unwrap();
+        let scope = TenantContext::new(
+            TenantId::new("guard-client"),
+            TenantPermissions::full_access(),
+        );
+        let observation = |id: &str| json!({"resourceType":"Observation","id":id,"status":"final","code":{"coding":[{"code":"A"}]},"valueCodeableConcept":{"coding":[{"code":"B"}]}});
+        denorm
+            .create(
+                &scope,
+                "Observation",
+                observation("folded"),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        denorm
+            .get_client()
+            .await
+            .unwrap()
+            .execute("UPDATE search_index_layout SET layout='legacy'", &[])
+            .await
+            .unwrap();
+        drop(denorm);
+        let backend = PostgresBackend::new(config).await.unwrap();
+        backend.init_schema().await.unwrap();
+        backend
+            .create(
+                &scope,
+                "Observation",
+                observation("slotted"),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        backend.create(&scope,"Patient",json!({"resourceType":"Patient","id":"container","contained":[observation("child")]}),FhirVersion::default()).await.unwrap();
+        let mut query = pair("code-value-concept", SearchParamType::Token, 2);
+        query.parameters[0].values = vec![SearchValue::eq("A$B")];
+        assert_eq!(
+            backend
+                .search(&scope, &query)
+                .await
+                .unwrap()
+                .resources
+                .items
+                .len(),
+            2,
+            "folded and unfolded coexist under Legacy"
+        );
+        query.parameters[0].values = vec![SearchValue::eq("B$A")];
+        assert!(
+            backend
+                .search(&scope, &query)
+                .await
+                .unwrap()
+                .resources
+                .items
+                .is_empty()
+        );
+        let client = backend.get_client().await.unwrap();
+        client.batch_execute("BEGIN").await.unwrap();
+        client.execute("UPDATE search_index SET composite_slot=NULL, value_number_2=99 WHERE tenant_id=$1 AND resource_id='slotted' AND param_name='code-value-concept'",&[&scope.tenant_id().as_str()]).await.unwrap();
+        query.parameters[0].values = vec![SearchValue::eq("no-match$no-match")];
+        query.count = Some(0);
+        let error = backend
+            .search_with_client(&client, &scope, &query, None)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("code-value-concept")
+                && error.to_string().contains("$reindex"),
+            "uncommitted NULL slots with foreign Number_2 must reject: {error}"
+        );
+        for (missing, expected) in [(false, 2), (true, 0)] {
+            for count in [0, 100] {
+                let mut presence = query.clone();
+                presence.parameters[0].modifier = Some(crate::types::SearchModifier::Missing);
+                presence.parameters[0].values = vec![SearchValue::eq(missing.to_string())];
+                presence.count = Some(count);
+                let result = backend
+                    .search_with_client(&client, &scope, &presence, None)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    result.resources.items.len(),
+                    if count == 0 { 0 } else { expected }
+                );
+            }
+        }
+        client.batch_execute("ROLLBACK").await.unwrap();
+        backend
+            .search_with_client(&client, &scope, &query, None)
+            .await
+            .unwrap();
+
+        // Both foreign families populated still prove nothing for String,
+        // Date, Quantity, or a family whose declaration exceeds two slots.
+        client.execute("INSERT INTO search_index (tenant_id,resource_type,resource_id,param_name,composite_group,value_token_code_2,value_number_2) VALUES ($1,'Observation','slotted','foreign-family',0,'B',9)",&[&scope.tenant_id().as_str()]).await.unwrap();
+        for (family, count) in [
+            (SearchParamType::String, 2),
+            (SearchParamType::Date, 2),
+            (SearchParamType::Quantity, 2),
+            (SearchParamType::Token, 3),
+            (SearchParamType::Number, 3),
+        ] {
+            let error = backend
+                .search_with_client(
+                    &client,
+                    &scope,
+                    &pair("foreign-family", family, count),
+                    None,
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("$reindex"),
+                "{family:?}/{count}: {error}"
+            );
+        }
+        client.execute("INSERT INTO search_index (tenant_id,resource_type,resource_id,param_name,composite_group,value_token_code_2) VALUES ($1,'Observation','slotted','probe-number',0,'B')",&[&scope.tenant_id().as_str()]).await.unwrap();
+        let error = backend
+            .search_with_client(
+                &client,
+                &scope,
+                &pair("probe-number", SearchParamType::Number, 2),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("$reindex"),
+            "Token_2 must not make a folded Number row: {error}"
+        );
+        client.execute("UPDATE search_index SET composite_slot=NULL WHERE tenant_id=$1 AND param_name='code-value-concept' AND (resource_id='slotted' OR is_contained=TRUE)",&[&scope.tenant_id().as_str()]).await.unwrap();
+
+        // Ordinary and contained unrelated rows keep the table large after the
+        // target tenant is rebuilt; natural cost planning must still seek the
+        // sparse partial indexes, even when they contain no matching old rows.
+        client.batch_execute("INSERT INTO search_index (tenant_id,resource_type,resource_id,param_name,composite_group,composite_slot,value_token_code) SELECT 'plan-other','Observation','other','code-value-concept',n,1,'X' FROM generate_series(1,15000) n;
+            INSERT INTO search_index (tenant_id,resource_type,resource_id,param_name,composite_group,composite_slot,value_token_code,is_contained,contained_type,contained_local_id) SELECT 'plan-other','Patient','other','code-value-concept',n,1,'X',TRUE,'Observation','child' FROM generate_series(1,15000) n;
+            ANALYZE search_index").await.unwrap();
+        explain(
+            &client,
+            &scope,
+            false,
+            SearchParamType::Token,
+            2,
+            "code-value-concept",
+        )
+        .await;
+        explain(
+            &client,
+            &scope,
+            false,
+            SearchParamType::Number,
+            2,
+            "probe-number",
+        )
+        .await;
+        explain(
+            &client,
+            &scope,
+            false,
+            SearchParamType::Quantity,
+            2,
+            "foreign-family",
+        )
+        .await;
+        explain(
+            &client,
+            &scope,
+            true,
+            SearchParamType::Token,
+            2,
+            "code-value-concept",
+        )
+        .await;
+        drop(client);
+        let op = ReindexOperation::new(
+            std::sync::Arc::new(backend.clone()),
+            backend.tenant_registries().clone(),
+        );
+        let request = ReindexRequest::all();
+        assert!(!request.clear_existing);
+        let id = op.start(scope.clone(), request, None).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            loop {
+                let progress = op.get_progress(&id).await.unwrap();
+                if progress.status == ReindexStatus::Completed {
+                    assert!(progress.errors.is_empty(), "{:?}", progress.errors);
+                    break;
+                }
+                assert!(
+                    !matches!(
+                        progress.status,
+                        ReindexStatus::Failed | ReindexStatus::Cancelled
+                    ),
+                    "{progress:?}"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let client = backend.get_client().await.unwrap();
+        client.batch_execute("ANALYZE search_index").await.unwrap();
+        explain(
+            &client,
+            &scope,
+            false,
+            SearchParamType::Token,
+            2,
+            "code-value-concept",
+        )
+        .await;
+        explain(
+            &client,
+            &scope,
+            false,
+            SearchParamType::Number,
+            2,
+            "probe-number",
+        )
+        .await;
+        explain(
+            &client,
+            &scope,
+            false,
+            SearchParamType::Quantity,
+            2,
+            "foreign-family",
+        )
+        .await;
+        explain(
+            &client,
+            &scope,
+            true,
+            SearchParamType::Token,
+            2,
+            "code-value-concept",
+        )
+        .await;
+        let mut both = pair("code-value-concept", SearchParamType::Token, 2);
+        both.contained = ContainedMode::Both;
+        both.parameters[0].values = vec![SearchValue::eq("A$B")];
+        assert_eq!(
+            backend
+                .search(&scope, &both)
+                .await
+                .unwrap()
+                .resources
+                .items
+                .len(),
+            3
+        );
     }
 }

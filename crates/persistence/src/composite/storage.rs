@@ -45,20 +45,16 @@ use tracing::{debug, instrument, warn};
 use crate::core::history::HistoryParams;
 use crate::core::{
     BundleEntry, BundleEntryEffect, BundleProvider, BundleResult, CapabilityProvider,
-    ChainedSearchProvider, ConditionalCreateResult, ConditionalDeleteResult, ConditionalStorage,
-    ConditionalUpdateResult, ExportDataProvider, ExportRequest, GroupExportProvider,
-    IncludeProvider, InstanceHistoryProvider, NdjsonBatch, PatchCandidateValidator,
-    PatientExportProvider, PurgableStorage, ResourceStorage, RevincludeProvider, SearchProvider,
-    SearchResult, SofRunner, StorageCapabilities, SystemHistoryProvider, TerminologySearchProvider,
-    TextSearchProvider, TypeHistoryProvider, VersionedStorage,
+    ConditionalCreateResult, ConditionalDeleteResult, ConditionalStorage, ConditionalUpdateResult,
+    ExportDataProvider, ExportRequest, GroupExportProvider, IncludeProvider,
+    InstanceHistoryProvider, NdjsonBatch, PatchCandidateValidator, PatientExportProvider,
+    PurgableStorage, ResourceStorage, RevincludeProvider, SearchProvider, SearchResult, SofRunner,
+    StorageCapabilities, SystemHistoryProvider, TerminologySearchProvider, TextSearchProvider,
+    TypeHistoryProvider, VersionedStorage,
 };
 use crate::error::{BackendError, ResourceError, StorageError, StorageResult, TransactionError};
-use crate::search::ChainResolveOptions;
 use crate::tenant::TenantContext;
-use crate::types::{
-    IncludeDirective, Page, Pagination, ReverseChainedParameter, SearchParamType, SearchParameter,
-    SearchQuery, SearchValue, StoredResource,
-};
+use crate::types::{IncludeDirective, Page, Pagination, SearchQuery, StoredResource};
 
 use super::config::{CompositeConfig, SyncMode};
 use super::merger::ResultMerger;
@@ -67,6 +63,10 @@ use super::sync::{SyncEvent, SyncManager, SyncStatus};
 use super::sync_failures::{
     SecondarySyncFailureLedger, SecondarySyncObserver, SyncFailureRecorder,
 };
+
+/// Entries a batch may run at once when the composite syncs search
+/// synchronously, whatever the primary alone tolerates.
+const SYNC_SEARCH_WRITE_CONCURRENCY: usize = 8;
 
 /// A dynamically typed storage backend.
 pub type DynStorage = Arc<dyn ResourceStorage + Send + Sync>;
@@ -996,8 +996,18 @@ impl ResourceStorage for CompositeStorage {
     }
 
     fn bulk_write_concurrency(&self) -> usize {
-        // Writes route to the primary, so its tolerance is the bound.
-        self.primary.bulk_write_concurrency()
+        // Writes route to the primary, so its tolerance is the floor.
+        let primary = self.primary.bulk_write_concurrency();
+        // With a synchronous search secondary every write also awaits the
+        // secondary (Elasticsearch `refresh=wait_for` waits out a refresh
+        // tick), so a serial batch pays one tick per entry. Overlapping those
+        // waits is safe even when the primary is a single writer: its own
+        // calls hold no await points and cannot interleave.
+        if self.syncs_search_synchronously() {
+            primary.max(SYNC_SEARCH_WRITE_CONCURRENCY)
+        } else {
+            primary
+        }
     }
 
     fn sof_runner(&self) -> Option<Arc<dyn SofRunner>> {
@@ -1361,6 +1371,12 @@ impl ResourceStorage for CompositeStorage {
         self.counting_storage().supports_type_counts()
     }
 
+    fn type_count_basis(&self) -> Option<crate::core::CountBasis> {
+        // Same backend as the figures: an S3 primary counted through its
+        // Elasticsearch secondary reports index-relative figures (#1850).
+        self.counting_storage().type_count_basis()
+    }
+
     async fn latest_write_marker(
         &self,
         tenant: &TenantContext,
@@ -1375,6 +1391,21 @@ impl ResourceStorage for CompositeStorage {
 
     async fn count_by_tenant(&self) -> StorageResult<Vec<(String, u64)>> {
         self.primary.count_by_tenant().await
+    }
+
+    async fn discover_tenants(
+        &self,
+        req: &crate::core::DiscoveryRequest,
+    ) -> StorageResult<crate::core::TenantDiscovery> {
+        // Like `count_by_tenant`: the authoritative primary decides which
+        // tenants hold data. A search secondary has no cross-tenant view.
+        self.primary.discover_tenants(req).await
+    }
+
+    async fn tenant_has_resources(&self, tenant: &TenantContext) -> StorageResult<bool> {
+        // The primary, like `count_by_tenant`: it holds the authoritative
+        // data a purge removes, while a search secondary may lag it.
+        self.primary.tenant_has_resources(tenant).await
     }
 
     // ---- Tenant registry ----------------------------------------------------
@@ -2320,98 +2351,6 @@ impl RevincludeProvider for CompositeStorage {
 }
 
 #[async_trait]
-impl ChainedSearchProvider for CompositeStorage {
-    async fn resolve_chain(
-        &self,
-        tenant: &TenantContext,
-        base_type: &str,
-        chain: &str,
-        value: &str,
-    ) -> StorageResult<Vec<String>> {
-        // Delegates to the shared application-side resolver — the one REST
-        // uses — running its iterative plain searches through composite's own
-        // search routing. It types the terminal parameter from the registry
-        // and parses the value like a direct search: comparator prefix,
-        // comma-separated OR list, every target type of an untyped hop (#1304).
-        let Some(param) = parse_chain_path(chain, value) else {
-            // A single segment is not a chain.
-            return Ok(Vec::new());
-        };
-        // The trait API carries no terminology server, so a terminology-backed
-        // modifier on the terminal is rejected rather than searched literally
-        // (the resolver's default, as for `resolve_chains`; #1317).
-        crate::search::chain_resolver::resolve_forward_chain(
-            self,
-            tenant,
-            base_type,
-            &param,
-            ChainResolveOptions::default(),
-        )
-        .await
-    }
-
-    async fn resolve_reverse_chain(
-        &self,
-        tenant: &TenantContext,
-        base_type: &str,
-        reverse_chain: &ReverseChainedParameter,
-    ) -> StorageResult<Vec<String>> {
-        // Same delegation as `resolve_chain`. The terminal used to be searched
-        // as a hardcoded `Token` holding the raw value — prefix and commas
-        // included — and a nested `_has` was ignored outright (#1304).
-        crate::search::chain_resolver::resolve_reverse_chain(
-            self,
-            tenant,
-            base_type,
-            reverse_chain,
-            ChainResolveOptions::default(),
-        )
-        .await
-    }
-}
-
-/// Parses a trait-API chain path (`subject:Patient.organization.name`) and its
-/// raw value into the chained [`SearchParameter`] the shared resolver takes:
-/// one hop per reference segment, each with its optional `:Type` qualifier,
-/// and the value split into its raw OR alternatives. The resolver types and
-/// parses those once it knows the terminal parameter.
-///
-/// Returns `None` when `chain` has no reference hop.
-fn parse_chain_path(chain: &str, value: &str) -> Option<SearchParameter> {
-    let segments: Vec<(&str, Option<&str>)> = chain
-        .split('.')
-        .map(|segment| match segment.split_once(':') {
-            Some((name, target_type)) => (name, Some(target_type)),
-            None => (segment, None),
-        })
-        .collect();
-    if segments.len() < 2 {
-        return None;
-    }
-
-    let hops = segments
-        .windows(2)
-        .map(|pair| crate::types::ChainedParameter {
-            reference_param: pair[0].0.to_string(),
-            target_type: pair[0].1.map(str::to_string),
-            target_param: pair[1].0.to_string(),
-        })
-        .collect();
-
-    Some(SearchParameter {
-        name: segments[0].0.to_string(),
-        param_type: SearchParamType::Reference,
-        modifier: None,
-        values: crate::search::split_unescaped_commas(value)
-            .into_iter()
-            .map(SearchValue::eq)
-            .collect(),
-        chain: hops,
-        components: vec![],
-    })
-}
-
-#[async_trait]
 impl TerminologySearchProvider for CompositeStorage {
     async fn expand_value_set(&self, _value_set_url: &str) -> StorageResult<Vec<(String, String)>> {
         // Delegate to terminology backend if available
@@ -2797,8 +2736,8 @@ mod tests {
     use crate::error::{BackendError, StorageError, StorageResult};
     use crate::tenant::{TenantContext, TenantId, TenantPermissions};
     use crate::types::{
-        Page, PageInfo, SearchParamType, SearchParameter, SearchQuery, SearchValue, StoredResource,
-        StoredResourceBuilder,
+        Page, PageInfo, ReverseChainedParameter, SearchParamType, SearchParameter, SearchQuery,
+        SearchValue, StoredResource, StoredResourceBuilder,
     };
     use async_trait::async_trait;
     use helios_fhir::FhirVersion;
@@ -3008,12 +2947,20 @@ mod tests {
         }
     }
 
-    /// Mock storage with an in-memory tenant registry and a configurable purge.
+    /// Mock storage with an in-memory tenant registry, a configurable purge
+    /// and a scripted tenant discovery.
     #[derive(Default)]
     struct MockRegistryStorage {
         tenants: std::sync::Mutex<Vec<crate::core::TenantRecord>>,
         purge_count: u64,
         fail_purge: bool,
+        /// Answer of `discover_tenants`; `None` keeps the trait default.
+        discovery: Option<crate::core::TenantDiscovery>,
+        fail_discovery: bool,
+        /// Every request `discover_tenants` received, in order.
+        discovery_requests: std::sync::Mutex<Vec<crate::core::DiscoveryRequest>>,
+        /// Tenants `tenant_has_resources` reports as holding data.
+        tenants_with_data: Vec<&'static str>,
     }
 
     #[async_trait]
@@ -3139,6 +3086,12 @@ mod tests {
             Ok(tenants.len() < before)
         }
 
+        async fn tenant_has_resources(&self, tenant: &TenantContext) -> StorageResult<bool> {
+            Ok(self
+                .tenants_with_data
+                .contains(&tenant.tenant_id().as_str()))
+        }
+
         async fn purge_tenant_data(&self, _id: &str) -> StorageResult<u64> {
             if self.fail_purge {
                 return Err(StorageError::Backend(BackendError::ConnectionFailed {
@@ -3147,6 +3100,23 @@ mod tests {
                 }));
             }
             Ok(self.purge_count)
+        }
+
+        async fn discover_tenants(
+            &self,
+            req: &crate::core::DiscoveryRequest,
+        ) -> StorageResult<crate::core::TenantDiscovery> {
+            self.discovery_requests.lock().unwrap().push(req.clone());
+            if self.fail_discovery {
+                return Err(StorageError::Backend(BackendError::ConnectionFailed {
+                    backend_name: self.backend_name().to_string(),
+                    message: "discovery failed".to_string(),
+                }));
+            }
+            Ok(self
+                .discovery
+                .clone()
+                .unwrap_or_else(|| crate::core::TenantDiscovery::unsupported("tenant-discovery")))
         }
     }
 
@@ -4592,6 +4562,21 @@ mod tests {
     }
 
     #[test]
+    fn test_bulk_write_concurrency_raised_for_synchronous_search() {
+        let spy = SpySecondary::new(Default::default());
+        let sync = make_composite_with_spy(spy.clone());
+        assert_eq!(sync.primary().bulk_write_concurrency(), 1);
+        assert_eq!(sync.bulk_write_concurrency(), SYNC_SEARCH_WRITE_CONCURRENCY);
+
+        // Asynchronous sync does not wait on the secondary: the primary rules.
+        let asynchronous = make_composite_with_spy_async(spy);
+        assert_eq!(
+            asynchronous.bulk_write_concurrency(),
+            asynchronous.primary().bulk_write_concurrency()
+        );
+    }
+
+    #[test]
     fn test_bulk_write_concurrency_delegates_to_primary() {
         let composite = make_composite_no_secondary();
         assert_eq!(
@@ -4675,6 +4660,14 @@ mod tests {
         );
     }
 
+    /// #1850: the default basis follows `supports_type_counts`, so a backend
+    /// without counts has no basis to claim.
+    #[test]
+    fn test_type_count_basis_defaults_to_none_without_counts() {
+        assert_eq!(MockStorage.type_count_basis(), None);
+        assert_eq!(make_composite_no_secondary().type_count_basis(), None);
+    }
+
     #[cfg(feature = "sqlite")]
     #[test]
     fn test_supports_type_counts_is_true_over_a_sqlite_primary() {
@@ -4689,6 +4682,11 @@ mod tests {
         backends.insert("es".to_string(), Arc::new(MockStorage) as DynStorage);
         let composite = CompositeStorage::new(config, backends).unwrap();
         assert!(composite.supports_type_counts());
+        assert_eq!(
+            composite.type_count_basis(),
+            Some(crate::core::CountBasis::LiveResources),
+            "an authoritative SQL primary counts live resources (#1850)"
+        );
     }
 
     /// #1078: `latest_write_marker` defaults to `None` (a backend that cannot
@@ -5008,6 +5006,28 @@ mod tests {
         assert!(primary.tenants.lock().unwrap().is_empty());
     }
 
+    /// #1912: the tenant existence probe asks the primary — the store a purge
+    /// empties and `count_by_tenant` reads — never a search secondary.
+    #[tokio::test]
+    async fn test_tenant_has_resources_delegates_to_primary() {
+        use crate::core::ResourceStorage;
+        let primary = Arc::new(MockRegistryStorage {
+            tenants_with_data: vec!["acme"],
+            ..Default::default()
+        });
+        let secondary = Arc::new(MockRegistryStorage {
+            tenants_with_data: vec!["beta"],
+            ..Default::default()
+        });
+        let composite = make_composite_registry(primary, Some(secondary as DynStorage));
+        let ctx =
+            |id: &str| TenantContext::new(TenantId::new(id), TenantPermissions::full_access());
+
+        assert!(composite.tenant_has_resources(&ctx("acme")).await.unwrap());
+        assert!(!composite.tenant_has_resources(&ctx("beta")).await.unwrap());
+        assert!(!composite.tenant_has_resources(&ctx("ghost")).await.unwrap());
+    }
+
     #[tokio::test]
     async fn test_purge_tenant_data_skips_unsupported_secondary() {
         use crate::core::ResourceStorage;
@@ -5040,69 +5060,99 @@ mod tests {
         ));
     }
 
-    fn make_composite_with_search_provider() -> CompositeStorage {
-        let composite = make_composite_no_secondary();
-        let mut providers = HashMap::new();
-        providers.insert(
-            "primary".to_string(),
-            Arc::new(MockStorage) as DynSearchProvider,
+    // ── Tenant discovery delegation (#1672) ───────────────────────
+
+    fn counted(id: &str, resources: u64) -> crate::core::DiscoveredTenant {
+        crate::core::DiscoveredTenant {
+            id: id.to_string(),
+            evidence: crate::core::TenantDataEvidence::Counted {
+                resources,
+                basis: crate::core::CountBasis::LiveResources,
+            },
+        }
+    }
+
+    /// A backend that does not implement discovery reports `Unsupported`, and
+    /// the composite passes that through: never a complete, empty store.
+    #[tokio::test]
+    async fn test_discover_tenants_default_is_unsupported() {
+        use crate::core::{DiscoveryCoverage, DiscoveryRequest, ResourceStorage};
+        let request = DiscoveryRequest::default();
+
+        let bare = MockStorage.discover_tenants(&request).await.unwrap();
+        assert!(bare.tenants.is_empty());
+        assert_eq!(
+            bare.coverage,
+            DiscoveryCoverage::Unsupported {
+                capability: "tenant-discovery"
+            }
         );
-        composite.with_search_providers(providers)
+
+        let composite = make_composite_no_secondary();
+        assert_eq!(composite.discover_tenants(&request).await.unwrap(), bare);
     }
 
-    /// `resolve_chain` should run iterative SearchQueries against composite's
-    /// own search routing rather than the previous stub that returned an
-    /// empty Vec for any chain longer than 2 segments. This test uses
-    /// MockStorage (which returns no results) so the assertion is just that
-    /// the implementation runs to completion and yields empty (not that it
-    /// finds anything) — full end-to-end coverage comes from inferno against
-    /// real backends.
+    /// The composite answers from the authoritative primary, with the
+    /// caller's request unchanged, and never asks the search secondary.
     #[tokio::test]
-    async fn test_resolve_chain_three_segments_does_not_error() {
-        use crate::core::ChainedSearchProvider;
-        let composite = make_composite_with_search_provider();
-        let tenant = make_tenant();
-        let result = composite
-            .resolve_chain(
-                &tenant,
-                "Observation",
-                "subject.organization.name",
-                "Hospital",
-            )
-            .await;
-        assert!(result.is_ok(), "resolve_chain failed: {:?}", result.err());
-        assert!(result.unwrap().is_empty());
+    async fn test_discover_tenants_delegates_to_primary() {
+        use crate::core::{
+            DiscoveryCoverage, DiscoveryCursor, DiscoveryRequest, ResourceStorage, TenantDiscovery,
+        };
+        let from_primary = TenantDiscovery {
+            tenants: vec![counted("acme", 3)],
+            coverage: DiscoveryCoverage::Complete,
+        };
+        let primary = Arc::new(MockRegistryStorage {
+            discovery: Some(from_primary.clone()),
+            ..Default::default()
+        });
+        let secondary = Arc::new(MockRegistryStorage {
+            discovery: Some(TenantDiscovery {
+                tenants: vec![counted("from-the-index", 99)],
+                coverage: DiscoveryCoverage::Partial { resume: None },
+            }),
+            ..Default::default()
+        });
+        let composite =
+            make_composite_registry(primary.clone(), Some(secondary.clone() as DynStorage));
+
+        let request = DiscoveryRequest {
+            max_requests: std::num::NonZeroU32::new(4),
+            resume: Some(DiscoveryCursor::new("acme/")),
+        };
+        assert_eq!(
+            composite.discover_tenants(&request).await.unwrap(),
+            from_primary
+        );
+        assert_eq!(*primary.discovery_requests.lock().unwrap(), vec![request]);
+        assert!(secondary.discovery_requests.lock().unwrap().is_empty());
     }
 
+    /// A primary discovery failure surfaces as an error, not as an empty or
+    /// unsupported success.
     #[tokio::test]
-    async fn test_resolve_chain_short_chain_does_not_error() {
-        use crate::core::ChainedSearchProvider;
-        let composite = make_composite_with_search_provider();
-        let tenant = make_tenant();
-        let result = composite
-            .resolve_chain(&tenant, "Observation", "patient.name", "Smith")
-            .await;
-        assert!(result.is_ok());
-        assert!(result.unwrap().is_empty());
-    }
+    async fn test_discover_tenants_propagates_primary_failure() {
+        use crate::core::{DiscoveryRequest, ResourceStorage};
+        let primary = Arc::new(MockRegistryStorage {
+            fail_discovery: true,
+            ..Default::default()
+        });
+        let composite = make_composite_registry(primary, None);
 
-    #[tokio::test]
-    async fn test_resolve_chain_invalid_chain_returns_empty() {
-        use crate::core::ChainedSearchProvider;
-        let composite = make_composite_with_search_provider();
-        let tenant = make_tenant();
-        // Single segment isn't a chain — must return empty, not error.
         let result = composite
-            .resolve_chain(&tenant, "Observation", "patient", "x")
+            .discover_tenants(&DiscoveryRequest::default())
             .await;
-        assert!(result.is_ok());
-        assert!(result.unwrap().is_empty());
+        assert!(matches!(
+            result,
+            Err(StorageError::Backend(BackendError::ConnectionFailed { .. }))
+        ));
     }
 
     // ------------------------------------------------------------------
-    // #1304: typed terminal values through the `ChainedSearchProvider` trait
-    // API. These run against a real SQLite primary built WITH the spec data
-    // dir: without it only the 5 embedded params load, date/quantity params
+    // #1304: typed terminal values through the shared chain resolver, then
+    // composite search, as REST runs them. These use a real SQLite primary
+    // built WITH the spec data dir: without it only the 5 embedded params load, date/quantity params
     // index nothing, and every assertion below would be vacuous.
     // ------------------------------------------------------------------
 
@@ -5225,8 +5275,29 @@ mod tests {
         assert_eq!(ids, expected, "control {resource_type}?{param}={raw}");
     }
 
-    /// `base_type?_has:source_type:reference_param:search_param=raw` through
-    /// the trait API, sorted and de-duplicated.
+    /// The ids `query` matches once the shared resolver has rewritten its
+    /// chains, as REST does: resolve, then search through the composite.
+    #[cfg(feature = "sqlite")]
+    async fn resolved_ids(
+        composite: &CompositeStorage,
+        tenant: &TenantContext,
+        query: &SearchQuery,
+    ) -> StorageResult<Vec<String>> {
+        let resolved = crate::search::resolve_chains(composite, tenant, query).await?;
+        let mut ids: Vec<String> = composite
+            .search(tenant, &resolved)
+            .await?
+            .resources
+            .items
+            .iter()
+            .map(|r| r.id().to_string())
+            .collect();
+        ids.sort();
+        ids.dedup();
+        Ok(ids)
+    }
+
+    /// `base_type?_has:source_type:reference_param:search_param=raw`.
     #[cfg(feature = "sqlite")]
     async fn has_ids(
         composite: &CompositeStorage,
@@ -5235,21 +5306,17 @@ mod tests {
         (source_type, reference_param, search_param): (&str, &str, &str),
         raw: &str,
     ) -> StorageResult<Vec<String>> {
-        use crate::core::ChainedSearchProvider;
-        let rc = ReverseChainedParameter::terminal(
+        let mut query = SearchQuery::new(base_type);
+        query.reverse_chains.push(ReverseChainedParameter::terminal(
             source_type,
             reference_param,
             search_param,
             SearchValue::eq(raw),
-        );
-        let mut ids = composite
-            .resolve_reverse_chain(tenant, base_type, &rc)
-            .await?;
-        ids.sort();
-        ids.dedup();
-        Ok(ids)
+        ));
+        resolved_ids(composite, tenant, &query).await
     }
 
+    /// `Observation?{chain}={raw}`.
     #[cfg(feature = "sqlite")]
     async fn chain_ids(
         composite: &CompositeStorage,
@@ -5257,13 +5324,51 @@ mod tests {
         chain: &str,
         raw: &str,
     ) -> StorageResult<Vec<String>> {
-        use crate::core::ChainedSearchProvider;
-        let mut ids = composite
-            .resolve_chain(tenant, "Observation", chain, raw)
-            .await?;
-        ids.sort();
-        ids.dedup();
-        Ok(ids)
+        let param = parse_chain_path(chain, raw).expect("a chain has a reference hop");
+        let query = SearchQuery::new("Observation").with_parameter(param);
+        resolved_ids(composite, tenant, &query).await
+    }
+
+    /// Parses a chain path (`subject:Patient.organization.name`) and its raw
+    /// value into the chained [`SearchParameter`] the shared resolver takes:
+    /// one hop per reference segment, each with its optional `:Type` qualifier,
+    /// and the value split into its raw OR alternatives. The resolver types and
+    /// parses those once it knows the terminal parameter.
+    ///
+    /// Returns `None` when `chain` has no reference hop.
+    #[cfg(feature = "sqlite")]
+    fn parse_chain_path(chain: &str, value: &str) -> Option<SearchParameter> {
+        let segments: Vec<(&str, Option<&str>)> = chain
+            .split('.')
+            .map(|segment| match segment.split_once(':') {
+                Some((name, target_type)) => (name, Some(target_type)),
+                None => (segment, None),
+            })
+            .collect();
+        if segments.len() < 2 {
+            return None;
+        }
+
+        let hops = segments
+            .windows(2)
+            .map(|pair| crate::types::ChainedParameter {
+                reference_param: pair[0].0.to_string(),
+                target_type: pair[0].1.map(str::to_string),
+                target_param: pair[1].0.to_string(),
+            })
+            .collect();
+
+        Some(SearchParameter {
+            name: segments[0].0.to_string(),
+            param_type: SearchParamType::Reference,
+            modifier: None,
+            values: crate::search::split_unescaped_commas(value)
+                .into_iter()
+                .map(SearchValue::eq)
+                .collect(),
+            chain: hops,
+            components: vec![],
+        })
     }
 
     /// (a) `_has:Observation:subject:date=ge…/lt…`
@@ -5390,7 +5495,6 @@ mod tests {
     #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn test_reverse_chain_nested_has() {
-        use crate::core::ChainedSearchProvider;
         let (c, t) = make_seeded_chain_composite().await;
         assert_direct_search(&c, &t, "Provenance", "recorded", "ge2021-01-01", &["prov1"]).await;
         // Patient?_has:Observation:subject:_has:Provenance:target:recorded=ge2021-01-01
@@ -5404,31 +5508,10 @@ mod tests {
                 SearchValue::eq("ge2021-01-01"),
             ),
         );
-        let ids = c.resolve_reverse_chain(&t, "Patient", &rc).await;
-        assert_eq!(ids.unwrap(), vec!["p1"]);
-    }
-
-    /// An unregistered terminal param behaves exactly as it does in the shared
-    /// resolver (typed by the value-shape fallback, never a hardcoded Token).
-    #[cfg(feature = "sqlite")]
-    #[tokio::test]
-    async fn test_reverse_chain_unknown_terminal_param_matches_shared_resolver() {
-        let (c, t) = make_seeded_chain_composite().await;
-        let has = ("Observation", "subject", "no-such-param");
-        let ids = has_ids(&c, &t, "Patient", has, "x").await;
-
         let mut query = SearchQuery::new("Patient");
-        query.reverse_chains.push(ReverseChainedParameter::terminal(
-            has.0,
-            has.1,
-            has.2,
-            SearchValue::eq("x"),
-        ));
-        let shared = crate::search::resolve_chains(&c, &t, &query).await;
-        assert_eq!(ids.is_ok(), shared.is_ok());
-        if let Ok(ids) = ids {
-            assert!(ids.is_empty());
-        }
+        query.reverse_chains.push(rc);
+        let ids = resolved_ids(&c, &t, &query).await;
+        assert_eq!(ids.unwrap(), vec!["p1"]);
     }
 
     /// Forward chain: prefixed date terminal, comma OR list, `:Type` qualifier.
@@ -5786,9 +5869,42 @@ mod count_routing_tests {
 
     /// A backend that either keeps counts (answering with its `label`) or,
     /// like an S3 primary, keeps none.
+    ///
+    /// It also answers the cross-tenant reads (registry, `count_by_tenant`,
+    /// discovery) with its own label, so a test can tell which backend a
+    /// composite asked (#1849), and records every Home and tenant call.
+    #[derive(Default)]
     struct Counting {
         label: &'static str,
         counts: bool,
+        /// Fails every Home and tenant call, the way an unreachable search
+        /// index does.
+        broken: bool,
+        /// The Home and tenant calls received, in order.
+        calls: std::sync::Mutex<Vec<&'static str>>,
+    }
+
+    impl Counting {
+        fn record(&self, call: &'static str) -> StorageResult<()> {
+            self.calls.lock().unwrap().push(call);
+            if self.broken {
+                return Err(StorageError::Backend(BackendError::ConnectionFailed {
+                    backend_name: self.label.to_string(),
+                    message: format!("{call}: unreachable"),
+                }));
+            }
+            Ok(())
+        }
+
+        fn calls(&self) -> Vec<&'static str> {
+            self.calls.lock().unwrap().clone()
+        }
+
+        /// This backend's distinct answer, `label.len()` resources of tenant
+        /// `label`.
+        fn resources(&self) -> u64 {
+            self.label.len() as u64
+        }
     }
 
     fn unsupported(what: &str) -> StorageError {
@@ -5864,10 +5980,20 @@ mod count_routing_tests {
             self.counts
         }
 
+        fn type_count_basis(&self) -> Option<crate::core::CountBasis> {
+            // The "es" double stands in for a search index (#1850).
+            self.counts.then_some(if self.label == "es" {
+                crate::core::CountBasis::IndexedLiveDocuments
+            } else {
+                crate::core::CountBasis::LiveResources
+            })
+        }
+
         async fn count_all_types(
             &self,
             _tenant: &TenantContext,
         ) -> StorageResult<Vec<(String, u64)>> {
+            self.record("count_all_types")?;
             Ok(vec![(self.label.to_string(), 1)])
         }
 
@@ -5876,10 +6002,79 @@ mod count_routing_tests {
             _tenant: &TenantContext,
             recent_since: Option<DateTime<Utc>>,
         ) -> StorageResult<Option<WriteMarker>> {
+            self.record("latest_write_marker")?;
             Ok(Some(WriteMarker {
                 latest: None,
                 recent_writes: recent_since.map(|_| self.label.len() as u64),
             }))
+        }
+
+        async fn count_by_tenant(&self) -> StorageResult<Vec<(String, u64)>> {
+            self.record("count_by_tenant")?;
+            Ok(vec![(self.label.to_string(), self.resources())])
+        }
+
+        async fn discover_tenants(
+            &self,
+            _req: &crate::core::DiscoveryRequest,
+        ) -> StorageResult<crate::core::TenantDiscovery> {
+            use crate::core::{
+                CountBasis, DiscoveredTenant, DiscoveryCoverage, PresenceBasis, TenantDataEvidence,
+                TenantDiscovery,
+            };
+            self.record("discover_tenants")?;
+            // What each kind of store could claim: an index-wide aggregate
+            // (which no real search secondary offers), an exact live count, or
+            // the presence-only finding of an S3 primary.
+            let evidence = if self.label == "es" {
+                TenantDataEvidence::Counted {
+                    resources: self.resources(),
+                    basis: CountBasis::IndexedLiveDocuments,
+                }
+            } else if self.counts {
+                TenantDataEvidence::Counted {
+                    resources: self.resources(),
+                    basis: CountBasis::LiveResources,
+                }
+            } else {
+                TenantDataEvidence::Present {
+                    basis: PresenceBasis::ResourceObjects,
+                }
+            };
+            Ok(TenantDiscovery {
+                tenants: vec![DiscoveredTenant {
+                    id: self.label.to_string(),
+                    evidence,
+                }],
+                coverage: DiscoveryCoverage::Complete,
+            })
+        }
+
+        fn supports_tenant_registry(&self) -> bool {
+            true
+        }
+
+        async fn list_tenants(&self) -> StorageResult<Vec<crate::core::TenantRecord>> {
+            self.record("list_tenants")?;
+            Ok(vec![crate::core::TenantRecord {
+                id: self.label.to_string(),
+                display_name: None,
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+            }])
+        }
+
+        async fn get_tenant(&self, id: &str) -> StorageResult<Option<crate::core::TenantRecord>> {
+            self.record("get_tenant")?;
+            Ok((id == self.label).then(|| crate::core::TenantRecord {
+                id: self.label.to_string(),
+                display_name: None,
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+            }))
+        }
+
+        async fn purge_tenant_data(&self, _id: &str) -> StorageResult<u64> {
+            self.record("purge_tenant_data")?;
+            Ok(self.resources())
         }
 
         async fn count_by_day(
@@ -5930,26 +6125,30 @@ mod count_routing_tests {
     }
 
     fn composite(primary_counts: bool, secondary_counts: bool) -> CompositeStorage {
+        composite_over(
+            Arc::new(Counting {
+                label: "primary",
+                counts: primary_counts,
+                ..Default::default()
+            }),
+            Arc::new(Counting {
+                label: "es",
+                counts: secondary_counts,
+                ..Default::default()
+            }),
+        )
+    }
+
+    /// The composite over caller-held doubles, so a test can read their calls.
+    fn composite_over(primary: Arc<Counting>, es: Arc<Counting>) -> CompositeStorage {
         let config = CompositeConfig::builder()
             .primary("primary", BackendKind::S3)
             .search_backend("es", BackendKind::Elasticsearch)
             .build()
             .unwrap();
         let mut backends: HashMap<String, DynStorage> = HashMap::new();
-        backends.insert(
-            "primary".to_string(),
-            Arc::new(Counting {
-                label: "primary",
-                counts: primary_counts,
-            }),
-        );
-        backends.insert(
-            "es".to_string(),
-            Arc::new(Counting {
-                label: "es",
-                counts: secondary_counts,
-            }),
-        );
+        backends.insert("primary".to_string(), primary);
+        backends.insert("es".to_string(), es);
         CompositeStorage::new(config, backends).unwrap()
     }
 
@@ -5962,6 +6161,10 @@ mod count_routing_tests {
         let composite = composite(true, true);
         assert!(composite.supports_type_counts());
         assert_eq!(
+            composite.type_count_basis(),
+            Some(crate::core::CountBasis::LiveResources)
+        );
+        assert_eq!(
             composite.count_all_types(&tenant()).await.unwrap(),
             vec![("primary".to_string(), 1)]
         );
@@ -5971,6 +6174,12 @@ mod count_routing_tests {
     async fn a_primary_without_counts_hands_them_to_the_counting_secondary() {
         let composite = composite(false, true);
         assert!(composite.supports_type_counts());
+        // The figures are the index's, and so is their provenance (#1850):
+        // an S3 primary with Elasticsearch never claims authoritative totals.
+        assert_eq!(
+            composite.type_count_basis(),
+            Some(crate::core::CountBasis::IndexedLiveDocuments)
+        );
         assert_eq!(
             composite.count_all_types(&tenant()).await.unwrap(),
             vec![("es".to_string(), 1)]
@@ -6021,6 +6230,7 @@ mod count_routing_tests {
         let backend = Counting {
             label: "primary",
             counts: false,
+            ..Default::default()
         };
         let t = tenant();
         let version = FhirVersion::default();
@@ -6047,10 +6257,218 @@ mod count_routing_tests {
     async fn no_counting_backend_means_no_counts() {
         let composite = composite(false, false);
         assert!(!composite.supports_type_counts());
+        assert_eq!(composite.type_count_basis(), None);
         assert_eq!(
             composite.count_all_types(&tenant()).await.unwrap(),
             vec![("primary".to_string(), 1)],
             "the primary is still asked, as before; the dashboard gates on supports_type_counts"
         );
+    }
+
+    // ── Tenant reads beside the Home routing (#1849) ───────────────
+    //
+    // The Home totals may move to a counting search secondary; the registry,
+    // `count_by_tenant` and discovery never do. Each double answers with its
+    // own label, so an answer names the backend that gave it.
+
+    const TENANT_READS: [&str; 4] = [
+        "count_by_tenant",
+        "discover_tenants",
+        "list_tenants",
+        "get_tenant",
+    ];
+
+    async fn read_everything(composite: &CompositeStorage) {
+        let request = crate::core::DiscoveryRequest::default();
+        // Home first, then the tenant reads, so one order serves every case.
+        let _ = composite.count_all_types(&tenant()).await;
+        let _ = composite
+            .latest_write_marker(&tenant(), Some(Utc::now()))
+            .await;
+        let _ = composite.count_by_tenant().await;
+        let _ = composite.discover_tenants(&request).await;
+        let _ = composite.list_tenants().await;
+        let _ = composite.get_tenant("primary").await;
+    }
+
+    /// Both composite shapes: SQL/Mongo with Elasticsearch (the primary
+    /// counts) and S3 with Elasticsearch (it does not, so Home reads the
+    /// index). Either way every tenant read reaches the primary only, and
+    /// the index is asked for Home figures alone.
+    #[tokio::test]
+    async fn tenant_reads_stay_on_the_primary_wherever_home_counts_come_from() {
+        use crate::core::{
+            CountBasis, DiscoveryCoverage, DiscoveryRequest, PresenceBasis, TenantDataEvidence,
+        };
+        for primary_counts in [true, false] {
+            let primary = Arc::new(Counting {
+                label: "primary",
+                counts: primary_counts,
+                ..Default::default()
+            });
+            let es = Arc::new(Counting {
+                label: "es",
+                counts: true,
+                ..Default::default()
+            });
+            let composite = composite_over(primary.clone(), es.clone());
+
+            assert_eq!(
+                composite.count_by_tenant().await.unwrap(),
+                vec![("primary".to_string(), primary.resources())]
+            );
+            let discovery = composite
+                .discover_tenants(&DiscoveryRequest::default())
+                .await
+                .unwrap();
+            assert_eq!(discovery.coverage, DiscoveryCoverage::Complete);
+            assert_eq!(discovery.tenants.len(), 1);
+            assert_eq!(discovery.tenants[0].id, "primary");
+            // An S3 primary proves presence only; it never borrows the
+            // index's number for it.
+            let expected = if primary_counts {
+                TenantDataEvidence::Counted {
+                    resources: primary.resources(),
+                    basis: CountBasis::LiveResources,
+                }
+            } else {
+                TenantDataEvidence::Present {
+                    basis: PresenceBasis::ResourceObjects,
+                }
+            };
+            assert_eq!(discovery.tenants[0].evidence, expected);
+            let ids: Vec<String> = composite
+                .list_tenants()
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|t| t.id)
+                .collect();
+            assert_eq!(ids, vec!["primary".to_string()]);
+            assert!(composite.get_tenant("primary").await.unwrap().is_some());
+            assert!(composite.get_tenant("es").await.unwrap().is_none());
+
+            let home_from = if primary_counts { "primary" } else { "es" };
+            assert_eq!(
+                composite.count_all_types(&tenant()).await.unwrap(),
+                vec![(home_from.to_string(), 1)]
+            );
+            assert_eq!(
+                composite.type_count_basis(),
+                Some(if primary_counts {
+                    CountBasis::LiveResources
+                } else {
+                    CountBasis::IndexedLiveDocuments
+                })
+            );
+
+            let es_calls = es.calls();
+            for read in TENANT_READS {
+                assert!(
+                    !es_calls.contains(&read),
+                    "{read} reached the index (primary counts: {primary_counts}): {es_calls:?}"
+                );
+                assert!(
+                    primary.calls().contains(&read),
+                    "{read} skipped the primary"
+                );
+            }
+            if primary_counts {
+                assert!(es_calls.is_empty(), "{es_calls:?}");
+            } else {
+                assert_eq!(es_calls, vec!["count_all_types"]);
+                assert!(!primary.calls().contains(&"count_all_types"));
+            }
+        }
+    }
+
+    /// The index is down: Home figures fail with it, while the registry,
+    /// `count_by_tenant` and discovery still answer from the primary. A
+    /// purge reaches both and reports the index's failure, after the primary
+    /// purged (so the operator knows to retry).
+    #[tokio::test]
+    async fn an_unreachable_index_fails_home_counts_but_not_tenant_reads() {
+        use crate::core::DiscoveryRequest;
+        let primary = Arc::new(Counting {
+            label: "primary",
+            ..Default::default()
+        });
+        let es = Arc::new(Counting {
+            label: "es",
+            counts: true,
+            broken: true,
+            ..Default::default()
+        });
+        let composite = composite_over(primary.clone(), es.clone());
+
+        assert!(composite.count_all_types(&tenant()).await.is_err());
+        assert!(
+            composite
+                .latest_write_marker(&tenant(), None)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            composite.count_by_tenant().await.unwrap(),
+            vec![("primary".to_string(), primary.resources())]
+        );
+        let discovery = composite
+            .discover_tenants(&DiscoveryRequest::default())
+            .await
+            .unwrap();
+        assert_eq!(discovery.tenants[0].id, "primary");
+        assert_eq!(composite.list_tenants().await.unwrap().len(), 1);
+
+        assert!(composite.purge_tenant_data("acme").await.is_err());
+        assert!(primary.calls().contains(&"purge_tenant_data"));
+        assert_eq!(
+            es.calls(),
+            vec![
+                "count_all_types",
+                "latest_write_marker",
+                "purge_tenant_data"
+            ]
+        );
+    }
+
+    /// A purge reaches the primary and the index, and reports the primary's
+    /// figure: the index's own count is informational.
+    #[tokio::test]
+    async fn a_purge_reaches_both_and_reports_the_primary_figure() {
+        let primary = Arc::new(Counting {
+            label: "primary",
+            ..Default::default()
+        });
+        let es = Arc::new(Counting {
+            label: "es",
+            counts: true,
+            ..Default::default()
+        });
+        let composite = composite_over(primary.clone(), es.clone());
+
+        assert_eq!(
+            composite.purge_tenant_data("acme").await.unwrap(),
+            primary.resources()
+        );
+        assert_eq!(primary.calls(), vec!["purge_tenant_data"]);
+        assert_eq!(es.calls(), vec!["purge_tenant_data"]);
+    }
+
+    /// Rendering the tenant reads asks the index for nothing beyond what Home
+    /// already asks: no reindex, refresh or count of its own.
+    #[tokio::test]
+    async fn the_index_sees_only_home_reads() {
+        let primary = Arc::new(Counting {
+            label: "primary",
+            ..Default::default()
+        });
+        let es = Arc::new(Counting {
+            label: "es",
+            counts: true,
+            ..Default::default()
+        });
+        read_everything(&composite_over(primary.clone(), es.clone())).await;
+        assert_eq!(es.calls(), vec!["count_all_types", "latest_write_marker"]);
+        assert_eq!(primary.calls(), TENANT_READS.to_vec());
     }
 }

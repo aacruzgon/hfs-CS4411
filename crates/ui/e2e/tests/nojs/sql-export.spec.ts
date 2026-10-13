@@ -8,6 +8,13 @@ import {
   deleteResources,
   waitSearchable,
 } from "../../pages/api";
+import {
+  LOAD_SUBJECTS,
+  cancelSqlExportJobs,
+  deleteLoadPatients,
+  loadViewDefinition,
+  seedLoadPatients,
+} from "../../pages/sql-export-load";
 
 // This file runs in the `nojs` project (javaScriptEnabled: false): htmx,
 // sql-export.js, and every `data-*` handler are inert here — the Active SQL
@@ -24,13 +31,14 @@ import {
 // A `$sql-export` job over a single tiny ViewDefinition finishes in well
 // under 100ms — before the redirect that lands on the list even renders —
 // so there is no reliable way to observe it in-progress, let alone catch it
-// with Cancel. Padding the job with this many trivial subjects (a single
-// self-search round trip apiece) buys a window measured in seconds, long
-// enough for a real interaction, without ever waiting on a fixed clock:
-// every wait below still polls actual DOM/network state.
-const PADDING_SUBJECTS = 200;
+// with Cancel. One request may carry at most 64 `subject` entries (#1705), so
+// each job carries `LOAD_SUBJECTS` of them and gets its run time from the
+// work each one does (pages/sql-export-load.ts: a wide ViewDefinition over
+// many Patients), a window measured in seconds, long enough for a real
+// interaction, without ever waiting on a fixed clock: every wait below still
+// polls actual DOM/network state.
 
-// Every padding `ViewDefinition` the test below seeds gets its id pushed
+// Every load `ViewDefinition` the test below seeds gets its id pushed
 // here, then deleted in this file's own `afterEach`. Left behind, a
 // `ViewDefinition` is a real, tenant-visible resource that
 // `/ui/sql/view-definitions` lists with no filter of its own — it becomes
@@ -39,7 +47,7 @@ const PADDING_SUBJECTS = 200;
 // the full mechanism).
 let seededViewDefinitionIds: string[] = [];
 
-// The per-run name prefix of every padding batch, swept by name in this
+// The per-run name prefix of every load batch, swept by name in this
 // file's own `afterEach` on top of the ids above: a `createResources` chunk
 // whose request fails outright (a 408 on the ES composites) never reports its
 // ids while the server may still commit it (#1070).
@@ -48,6 +56,11 @@ let seededViewDefinitionPrefixes: string[] = [];
 // Same reasoning as `seededViewDefinitionIds` above, for the `Library`
 // sql-query subject the failed-job detail test below seeds.
 let seededLibraryIds: string[] = [];
+
+// The Patients the load subjects run over: the ids per chunk as they land,
+// and the per-run family-name prefix swept on top of them.
+let seededPatientIds: string[] = [];
+let seededPatientPrefixes: string[] = [];
 
 test.beforeEach(async ({ request }) => {
   // Other specs can leave jobs in the shared user's settings. Count assertions
@@ -60,6 +73,9 @@ test.beforeEach(async ({ request }) => {
 });
 
 test.afterEach(async ({ request }) => {
+  // Stop any job the test left running before its source data is deleted.
+  await cancelSqlExportJobs(request);
+
   const ids = seededViewDefinitionIds;
   seededViewDefinitionIds = [];
   await deleteResources(request, "ViewDefinition", ids);
@@ -73,6 +89,15 @@ test.afterEach(async ({ request }) => {
   const libraryIds = seededLibraryIds;
   seededLibraryIds = [];
   await deleteResources(request, "Library", libraryIds);
+
+  const patientIds = seededPatientIds;
+  seededPatientIds = [];
+  await deleteResources(request, "Patient", patientIds);
+  const patientPrefixes = seededPatientPrefixes;
+  seededPatientPrefixes = [];
+  for (const prefix of patientPrefixes) {
+    await deleteLoadPatients(request, prefix);
+  }
 
   // The jobs this test starts live in the per-user settings document under
   // `byTenant.<tenant>.sqlExport.jobs` (crates/ui/src/sql_export.rs); the
@@ -90,25 +115,29 @@ test.afterEach(async ({ request }) => {
 });
 
 test("SQL Export lifecycle works without JavaScript", async ({ page, request, sqlExport }) => {
-  // Two padded jobs, each needing its own genuinely observable in-progress
-  // window (see PADDING_SUBJECTS above).
+  // Two load jobs, each needing its own genuinely observable in-progress
+  // window (see LOAD_SUBJECTS above).
   test.setTimeout(120_000);
 
-  async function startPaddedExport(name: string): Promise<void> {
+  // Real rows for every load ViewDefinition to run over, seeded once for
+  // both jobs.
+  const patientPrefix = `NojsSqlExportLoad${Date.now()}x`;
+  seededPatientPrefixes.push(patientPrefix);
+  const lastPatientId = await seedLoadPatients(request, patientPrefix, (chunkIds) =>
+    seededPatientIds.push(...chunkIds),
+  );
+  await waitSearchable(request, "Patient", lastPatientId);
+
+  async function startLoadExport(name: string): Promise<void> {
     // `name` already carries a per-run `Date.now()` stamp. Registered before
     // the batch starts and per chunk as it lands, so a failure partway
-    // through still leaves `afterEach` able to clean up every padding row.
+    // through still leaves `afterEach` able to clean up every load row.
     seededViewDefinitionPrefixes.push(`${name}_`);
     const ids = await createResources(
       request,
-      Array.from({ length: PADDING_SUBJECTS }, (_, i) => ({
+      Array.from({ length: LOAD_SUBJECTS }, (_, i) => ({
         type: "ViewDefinition",
-        body: {
-          name: `${name}_${i}`,
-          status: "active",
-          resource: "Patient",
-          select: [{ column: [{ name: "id", path: "getResourceKey()" }] }],
-        },
+        body: loadViewDefinition(`${name}_${i}`),
       })),
       undefined,
       (chunkIds) => seededViewDefinitionIds.push(...chunkIds),
@@ -129,7 +158,7 @@ test("SQL Export lifecycle works without JavaScript", async ({ page, request, sq
   }
 
   const cancelledName = `nojs_sql_export_cancel_${Date.now()}`;
-  await startPaddedExport(cancelledName);
+  await startLoadExport(cancelledName);
   let cancelledCard = sqlExport.card(cancelledName);
   await expect(cancelledCard).toBeVisible();
   await expect(cancelledCard.locator(".tag")).toHaveText("In progress");
@@ -151,7 +180,7 @@ test("SQL Export lifecycle works without JavaScript", async ({ page, request, sq
   await expect(page.locator("#sql-export-summary")).not.toHaveAttribute("hx-swap-oob", /.+/);
 
   const completedName = `nojs_sql_export_complete_${Date.now()}`;
-  await startPaddedExport(completedName);
+  await startLoadExport(completedName);
   let completedCard = sqlExport.card(completedName);
   await expect(completedCard).toBeVisible();
   await expect(completedCard.locator(".tag")).toHaveText("In progress");
@@ -181,7 +210,7 @@ test("SQL Export lifecycle works without JavaScript", async ({ page, request, sq
 // never runs in this project: the builder has to stay exactly as the server
 // renders it — every subject row visible, the table's tools and the header
 // select-all both `hidden` — and a subject checked by hand (a real click,
-// not the `evaluateAll` instrumentation the padded scenario above needs)
+// not the `evaluateAll` instrumentation the load scenario above needs)
 // still starts the job through a plain form post.
 test("the subjects table's tools stay hidden, and a subject checked by hand still starts the job", async ({
   page,
@@ -513,3 +542,26 @@ for (const state of ["Complete", "Failed", "Cancelled"] as const) {
     } finally { await runtime.stop(); }
   });
 }
+
+test("Since native fallback preserves a rejected Custom instant without JavaScript", async ({ page, request, sqlExport }) => {
+  const vdId = await createResource(request, "ViewDefinition", {
+    name: `nojs_since_${Date.now()}`, status: "active", resource: "Patient",
+    select: [{ column: [{ name: "id", path: "getResourceKey()" }] }],
+  });
+  seededViewDefinitionIds.push(vdId);
+  await waitSearchable(request, "ViewDefinition", vdId);
+  await sqlExport.gotoNew();
+  await expect(sqlExport.sincePreset).toBeVisible();
+  await expect(sqlExport.sincePreset).toBeEnabled();
+  await expect(sqlExport.sinceCustom).toBeEnabled();
+  await sqlExport.sincePreset.selectOption("custom");
+  await sqlExport.subjectCheckbox(`ViewDefinition/${vdId}`).check();
+  await sqlExport.sinceCustom.fill("2026-02-31T00:00:00Z");
+  await sqlExport.startButton.click();
+  await expect(sqlExport.sincePreset).toBeVisible();
+  await expect(sqlExport.sincePreset).toHaveValue("custom");
+  await expect(sqlExport.sinceCustom).toHaveValue("2026-02-31T00:00:00Z");
+  await expect(sqlExport.sinceCustomError).toBeVisible();
+  const settings = await (await request.get("/_user/settings")).json();
+  expect(Object.keys(settings.sqlExport?.jobs ?? {})).toEqual([]);
+});

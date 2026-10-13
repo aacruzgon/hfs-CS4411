@@ -6,7 +6,7 @@
 //! - [`ResourceStorage`] - Core CRUD operations
 //! - [`VersionedStorage`] - Version-aware operations
 //! - [`InstanceHistoryProvider`], [`TypeHistoryProvider`], [`SystemHistoryProvider`] - History access
-//! - [`SearchProvider`], [`MultiTypeSearchProvider`], [`ChainedSearchProvider`] - Search capability
+//! - [`SearchProvider`], [`MultiTypeSearchProvider`] - Search capability
 //! - [`Transaction`] - ACID transaction support
 //! - [`CapabilityProvider`] - Runtime capability discovery
 //!
@@ -27,7 +27,6 @@
 //!             ├── MultiTypeSearchProvider
 //!             ├── IncludeProvider
 //!             ├── RevincludeProvider
-//!             ├── ChainedSearchProvider
 //!             ├── TerminologySearchProvider
 //!             └── TextSearchProvider
 //!
@@ -111,6 +110,7 @@ pub mod preconditions;
 pub mod search;
 pub mod sof_runner;
 pub mod storage;
+pub mod tenant_discovery;
 pub mod transaction;
 pub mod user_settings;
 pub mod versioned;
@@ -174,9 +174,9 @@ pub use preconditions::{
     precondition_failed_entry,
 };
 pub use search::{
-    ChainedSearchProvider, FullSearchProvider, INCLUDE_TRUNCATION_OUTCOME_ID, IncludeProvider,
-    MAX_ITERATE_INCLUDED, MultiTypeSearchProvider, RevincludeProvider, SearchProvider,
-    SearchResult, TerminologySearchProvider, TextSearchProvider, include_truncation_outcome,
+    FullSearchProvider, INCLUDE_TRUNCATION_OUTCOME_ID, IncludeProvider, MAX_ITERATE_INCLUDED,
+    MultiTypeSearchProvider, RevincludeProvider, SearchProvider, SearchResult,
+    TerminologySearchProvider, TextSearchProvider, include_truncation_outcome,
     is_include_truncation_marker, resolve_includes_iterate_continuation,
     resolve_includes_iterative,
 };
@@ -187,10 +187,15 @@ pub use storage::{
     ConditionalUpdateResult, DailyResourceCount, PatchFormat, PurgableStorage, ResourceCountDelta,
     ResourceStorage, TenantRecord, WriteMarker, bucket_floor,
 };
+pub use tenant_discovery::{
+    CountBasis, DiscoveredTenant, DiscoveryCoverage, DiscoveryCursor, DiscoveryRequest,
+    PresenceBasis, TenantDataEvidence, TenantDiscovery,
+};
 pub use transaction::{
-    BundleEntry, BundleEntryEffect, BundleEntryResult, BundleMethod, BundleProvider, BundleResult,
-    BundleType, ConditionalTransaction, IsolationLevel, LockingStrategy, PatchCandidateValidator,
-    Transaction, TransactionOptions, TransactionProvider,
+    BundleEntry, BundleEntryEffect, BundleEntryResult, BundleEntryTarget, BundleMethod,
+    BundleProvider, BundleResult, BundleType, ConditionalTransaction, IsolationLevel,
+    LockingStrategy, PatchCandidateValidator, Transaction, TransactionOptions, TransactionProvider,
+    parse_bundle_entry_target,
 };
 pub use user_settings::{
     BY_TENANT_KEY, GLOBAL_SETTINGS_KEYS, SettingsStore, StoredUserSettings, apply_merge_patch,

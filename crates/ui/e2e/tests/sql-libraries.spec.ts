@@ -2,7 +2,7 @@
 // its SQL decodes into the editor pane, and the results region runs it over
 // its depends-on ViewDefinition through $sql-run on arrival — no Run button
 // (#839, generalizing #752's View Definitions playground here).
-import { expect, test } from "../pages/fixtures";
+import { acceptConfirm, dismissConfirm, expect, test } from "../pages/fixtures";
 import { createResource, createSqlQueryLibrary, deleteResources, readResource, updateResource, waitSearchable } from "../pages/api";
 import type { APIRequestContext, Page } from "@playwright/test";
 import { Editor } from "../pages/editor";
@@ -88,13 +88,13 @@ for (const [kind, route] of [["sql-view", "/ui/sql/views"], ["sql-query", "/ui/s
           return entries.find((entry: { resource?: Record<string, unknown> }) => entry.resource?.id === second.id)?.resource?.content;
         }, { timeout: 15_000 }).toEqual(changedContent);
         await page.goto(`${route}?lib=${second.id}`);
-        await expect(page.locator("#run-results-meta")).toHaveText(/^0 rows · \d+ ms$/);
+        await expect(page.locator("#run-results-meta")).toHaveText(/^0 rows · [\d,]+ ms$/);
 
         await page.goto(`/ui/sql/queries?lib=${dependentId}`);
         const row = page.locator("#lib-tables .lib-tables__row").filter({ has: page.locator(".lib-tables__alias", { hasText: /^v$/ }) });
         await expect(row.locator("a")).toHaveText(name);
         await expect(row.locator("a")).toHaveAttribute("href", `${route}?lib=${originalId}&return_to=${encodeURIComponent(`/ui/sql/queries?lib=${dependentId}`)}`);
-        await expect(page.locator("#run-results-meta")).toHaveText(/^1 rows · \d+ ms$/);
+        await expect(page.locator("#run-results-meta")).toHaveText(/^1 rows · [\d,]+ ms$/);
         await expect(page.locator("#run-results .data-table tbody td")).toHaveText([patientId]);
         expect(await readResource(request, "Library", dependentId)).toEqual(dependent);
       }
@@ -414,7 +414,7 @@ for (const { code, path, failed } of LIVE_RUN_KINDS) {
       timeout: 3000,
     });
     await expect(page).toHaveURL(new RegExp(`lib=${libId}$`));
-    await expect(page.locator("#run-results-meta")).toHaveText(/^\d+ rows · \d+ ms$/);
+    await expect(page.locator("#run-results-meta")).toHaveText(/^\d+ rows · [\d,]+ ms$/);
 
     // Invalid SQL reports the failure, keeps the last good table on screen,
     // and relabels its meta.
@@ -431,7 +431,7 @@ for (const { code, path, failed } of LIVE_RUN_KINDS) {
     await page.keyboard.press("ControlOrMeta+a");
     await page.keyboard.insertText("SELECT id AS newcol FROM v");
     await expect(page.locator(".notice--warn")).toHaveCount(0, { timeout: 3000 });
-    await expect(page.locator("#run-results-meta")).toHaveText(/^\d+ rows · \d+ ms$/);
+    await expect(page.locator("#run-results-meta")).toHaveText(/^\d+ rows · [\d,]+ ms$/);
     // The cleared notice takes no space and the table stays below the
     // tables panel.
     await expect(page.locator("#run-notice")).not.toBeVisible();
@@ -1137,7 +1137,7 @@ test.describe("Parameters card", () => {
     // still-runnable query) well within the window the card's own
     // `hx-swap-oob` companion — had the signature actually changed — would
     // have replaced the card by.
-    await expect(page.locator("#run-results-meta")).toHaveText(/^\d+ rows · \d+ ms$/, {
+    await expect(page.locator("#run-results-meta")).toHaveText(/^\d+ rows · [\d,]+ ms$/, {
       timeout: 3000,
     });
 
@@ -1787,7 +1787,7 @@ test.describe("Unknown-table lint and Columns", () => {
     await expect(tablesCard.locator(".lib-tables__row", { hasText: "vv" }).locator("a")).toBeVisible();
     await expect(notice).toHaveCount(0, { timeout: 3000 });
     await expect(page.locator(".sql-editor .cm-lintRange-error")).toHaveCount(0);
-    await expect(page.locator("#run-results-meta")).toHaveText(/^\d+ rows · \d+ ms$/, { timeout: 3000 });
+    await expect(page.locator("#run-results-meta")).toHaveText(/^\d+ rows · [\d,]+ ms$/, { timeout: 3000 });
     const resolvedColumnsRow = columnsCard.locator("tbody tr").first();
     await expect(resolvedColumnsRow.locator("td").nth(0)).toHaveText("id");
     await expect(resolvedColumnsRow.locator("td").nth(2)).toHaveText("vv.id", { timeout: 3000 });
@@ -1948,3 +1948,88 @@ test.describe("Format JSON (#1757)", () => {
     }
   });
 });
+
+// #1884: deletion must clean the server-owned rail on its first render.
+for (const [code, route, railKey] of [
+  ["sql-query", "/ui/sql/queries", "sqlQueries"],
+  ["sql-view", "/ui/sql/views", "sqlViews"],
+] as const) {
+  test(`Delete immediately removes a ${code} from All, Recent and last`, async ({ page, request }) => {
+    const ids: string[] = [];
+    const stamp = `e2e_1884_${code}_${Date.now()}`;
+    try {
+      const reset = await request.patch("/_user/settings", { data: { rails: { [railKey]: null } } });
+      expect(reset.ok()).toBeTruthy();
+      for (const suffix of ["keep", "gone"]) {
+        ids.push(await createResource(request, "Library", {
+          name: `${stamp}_${suffix}`, status: "active",
+          type: { coding: [{ system: "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes", code }] },
+          content: [{ contentType: "application/sql", data: Buffer.from("SELECT 1 AS n").toString("base64") }],
+        }));
+      }
+      for (const id of ids) await waitSearchable(request, "Library", id);
+      const [keep, gone] = ids;
+      await page.goto(`${route}?lib=${keep}`);
+      await page.goto(`${route}?lib=${gone}`);
+      await expect(page.locator(`#lib-rail-recent [data-type='${gone}']`)).toBeVisible();
+      await page.locator("[data-crud-delete]").click();
+      await acceptConfirm(page);
+      await expect(page).toHaveURL(new RegExp(`${route}\\?deleted=${gone}$`));
+      await expect(page.locator(`#lib-rail-list [data-type='${gone}'], #lib-rail-recent [data-type='${gone}']`)).toHaveCount(0);
+      await expect(page.locator(`#lib-rail-recent [data-type='${keep}']`)).toBeVisible();
+      await expect(page.locator("input[name='current_path']")).not.toHaveValue(/deleted=/);
+      const settings = await (await request.get("/_user/settings")).json();
+      const rail = settings.rails[railKey];
+      expect(rail.last).not.toBe(gone);
+      expect(rail.recent.map((entry: { id: string }) => entry.id)).not.toContain(gone);
+      // The click handler reconstructs return_to from the browser URL.
+      // Exercise it, rather than checking only the server-rendered href.
+      await page.locator("a[data-editor-link]", { hasText: "Create New" }).click();
+      await page.waitForURL((url) => url.searchParams.get("lib") === "new");
+      expect(new URL(page.url()).searchParams.get("return_to")).not.toContain("deleted=");
+      await page.goto(`${route}?deleted=${gone}`);
+      await page.reload();
+      await expect(page.locator(`#lib-rail-recent [data-type='${gone}']`)).toHaveCount(0);
+      await page.goto(`${route}?lib=${gone}`);
+      await expect(page.locator(".filter-center")).toContainText("Select a query or view");
+      await expect(page.locator(".filter-center")).not.toContainText(/No SQL (queries|views) yet/);
+      await expect(page.locator("textarea[name='json']")).toHaveCount(0);
+    } finally {
+      await deleteResources(request, "Library", ids);
+      await request.patch("/_user/settings", { data: { rails: { [railKey]: null } } });
+    }
+  });
+
+  test(`cancelled or failed Delete preserves a ${code} and its rail`, async ({ page, request }) => {
+    const id = await createResource(request, "Library", {
+      name: `e2e_1884_cancel_${Date.now()}`, status: "active",
+      type: { coding: [{ system: "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes", code }] },
+      content: [{ contentType: "application/sql", data: Buffer.from("SELECT 1 AS n").toString("base64") }],
+    });
+    try {
+      await waitSearchable(request, "Library", id);
+      await page.goto(`${route}?lib=${id}`);
+      const before = await (await request.get("/_user/settings")).json();
+      let deletes = 0;
+      await page.route(`**/Library/${id}`, async (intercept) => {
+        if (intercept.request().method() !== "DELETE") return intercept.continue();
+        deletes += 1;
+        await intercept.fulfill({ status: 500, body: "failed" });
+      });
+      await page.locator("[data-crud-delete]").click();
+      await dismissConfirm(page);
+      expect(deletes).toBe(0);
+      await page.locator("[data-crud-delete]").click();
+      await acceptConfirm(page);
+      await expect(page.locator(".alert--inline[role='alert']:visible")).toContainText("HTTP 500");
+      expect(deletes).toBe(1);
+      await expect(page).toHaveURL(new RegExp(`${route}\\?lib=${id}$`));
+      await expect(page.locator(`#lib-rail-recent [data-type='${id}']`)).toBeVisible();
+      expect((await (await request.get("/_user/settings")).json()).rails[railKey]).toEqual(before.rails[railKey]);
+      expect((await readResource(request, "Library", id)).id).toBe(id);
+    } finally {
+      await deleteResources(request, "Library", [id]);
+      await request.patch("/_user/settings", { data: { rails: { [railKey]: null } } });
+    }
+  });
+}

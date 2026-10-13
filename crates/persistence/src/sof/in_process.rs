@@ -45,6 +45,30 @@ const CHANNEL_BUFFER: usize = 256;
 /// call. Bounds peak memory when scanning large resource types.
 const CHUNK_SIZE: usize = 1024;
 
+/// Most resources [`JobScanCache`] keeps per resource type. A type larger than
+/// this is streamed on every scan, so a job's memory stays bounded.
+const JOB_SCAN_CACHE_MAX_RESOURCES: usize = 20_000;
+
+/// Distinct references a storage-backed resolver may read for one scanned
+/// batch of [`CHUNK_SIZE`] resources (#1858). A batch of Observations already
+/// carries ~1,850 (subject and encounter), so the resolver's general
+/// [`DEFAULT_MAX_FANOUT`](crate::sof::reference_resolver::StorageBackedResolver::DEFAULT_MAX_FANOUT)
+/// of 1,000 silently left almost half of every batch unresolved.
+pub const BATCH_REFERENCE_FANOUT: usize = 8 * CHUNK_SIZE;
+
+/// Whether a ViewDefinition calls FHIRPath `resolve()` anywhere — a column,
+/// a `forEach`, a `where` or a constant. Only such a view needs the scan to
+/// pre-resolve the references in each batch; for every other view that is
+/// one storage read per reference for nothing (#1858).
+fn view_uses_resolve(view: &Value) -> bool {
+    match view {
+        Value::String(s) => s.contains("resolve("),
+        Value::Array(items) => items.iter().any(view_uses_resolve),
+        Value::Object(map) => map.values().any(view_uses_resolve),
+        _ => false,
+    }
+}
+
 /// Number of resource batches that can be queued between the async scan task
 /// and the spawn_blocking engine task before the scan task applies backpressure.
 ///
@@ -136,6 +160,84 @@ impl InProcessSofRunner {
     }
 }
 
+/// A [`ResourceScan`] that remembers each type's resources for the life of one
+/// export job (see [`SofRunner::for_export_job`]).
+///
+/// The first scan of a type streams through to the inner scan and keeps what
+/// it saw; only a scan that read the type to its end and stayed under
+/// [`JOB_SCAN_CACHE_MAX_RESOURCES`] is kept, so one that was dropped part way
+/// (cancelled, or capped by a row limit) or failed leaves nothing behind. Later
+/// scans of the type replay the kept resources instead of reading storage.
+struct JobScanCache {
+    inner: Arc<dyn ResourceScan>,
+    kept: KeptScans,
+}
+
+/// Resources kept per `(tenant id, resource type)`.
+type KeptScans =
+    Arc<parking_lot::Mutex<std::collections::HashMap<(String, String), Arc<Vec<Value>>>>>;
+
+#[async_trait]
+impl ResourceScan for JobScanCache {
+    async fn scan_resources(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+    ) -> Result<ResourceStream, SofError> {
+        let key = (
+            tenant.tenant_id().as_str().to_string(),
+            resource_type.to_string(),
+        );
+        let hit = self.kept.lock().get(&key).cloned();
+        if let Some(resources) = hit {
+            return Ok(
+                futures::stream::unfold((resources, 0usize), |(all, at)| async move {
+                    let next = all.get(at).cloned()?;
+                    Some((Ok(next), (all, at + 1)))
+                })
+                .boxed(),
+            );
+        }
+
+        let inner = self.inner.scan_resources(tenant, resource_type).await?;
+        let kept = Arc::clone(&self.kept);
+        Ok(futures::stream::unfold(
+            (inner, Some(Vec::<Value>::new()), kept, key),
+            |(mut inner, mut buffer, kept, key)| async move {
+                match inner.next().await {
+                    Some(Ok(resource)) => {
+                        if let Some(held) = buffer.as_mut() {
+                            if held.len() < JOB_SCAN_CACHE_MAX_RESOURCES {
+                                held.push(resource.clone());
+                            } else {
+                                buffer = None;
+                            }
+                        }
+                        Some((Ok(resource), (inner, buffer, kept, key)))
+                    }
+                    Some(Err(e)) => Some((Err(e), (inner, None, kept, key))),
+                    None => {
+                        if let Some(held) = buffer {
+                            kept.lock().insert(key, Arc::new(held));
+                        }
+                        None
+                    }
+                }
+            },
+        )
+        .boxed())
+    }
+
+    async fn read_resources(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        ids: &[String],
+    ) -> Result<Vec<Value>, SofError> {
+        self.inner.read_resources(tenant, resource_type, ids).await
+    }
+}
+
 /// Maps a `helios_sof` engine error onto the persistence-layer [`SofError`].
 ///
 /// Structural/validation problems and the spec's absent-target case become
@@ -170,13 +272,13 @@ async fn resolve_batch_external(
     tenant: &TenantContext,
     fhir_version: FhirVersion,
     resources: &[Value],
-) -> Vec<Value> {
+) -> Result<Vec<Value>, SofError> {
     let Some(r) = resolver else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     let refs = collect_missing_references(resources);
     if refs.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     r.resolve(tenant, fhir_version, &refs).await
 }
@@ -187,12 +289,25 @@ impl SofRunner for InProcessSofRunner {
         self.runner_name
     }
 
+    fn for_export_job(&self) -> Option<Arc<dyn SofRunner>> {
+        Some(Arc::new(InProcessSofRunner {
+            scan: Arc::new(JobScanCache {
+                inner: Arc::clone(&self.scan),
+                kept: Arc::default(),
+            }),
+            fhir_version: self.fhir_version,
+            runner_name: self.runner_name,
+            resolver: self.resolver.clone(),
+        }))
+    }
+
     async fn run_view(
         &self,
         tenant: &TenantContext,
         view_definition: Value,
         filters: ViewFilters,
     ) -> Result<RowStream, SofError> {
+        let uses_resolve = view_uses_resolve(&view_definition);
         let view = parse_view_definition_for_version(view_definition, self.fhir_version)
             .map_err(map_engine_error)?;
         let prepared = PreparedViewDefinition::new(view).map_err(map_engine_error)?;
@@ -246,7 +361,11 @@ impl SofRunner for InProcessSofRunner {
         let version = self.fhir_version;
         let since = filters.since;
         let tenant_owned = tenant.clone();
-        let resolver = self.resolver.clone();
+        let resolver = if uses_resolve {
+            self.resolver.clone()
+        } else {
+            None
+        };
 
         // Resource channel: batches of (resources, pre-resolved external refs)
         // from the async scan task to the blocking engine task.
@@ -264,7 +383,13 @@ impl SofRunner for InProcessSofRunner {
         // and forward to the blocking engine via the resource channel.
         tokio::spawn(async move {
             let mut stream = scan_stream;
-            let mut batch: Vec<Value> = Vec::with_capacity(CHUNK_SIZE);
+            // A run with a row cap (a preview) starts with a batch no larger
+            // than the cap, so a simple view yields its rows after reading
+            // about `limit` resources rather than a full CHUNK_SIZE. Each
+            // flushed batch doubles the target up to CHUNK_SIZE, so a view
+            // whose `where` drops most inputs still reaches its cap.
+            let mut batch_target = limit.map_or(CHUNK_SIZE, |cap| cap.clamp(1, CHUNK_SIZE));
+            let mut batch: Vec<Value> = Vec::with_capacity(batch_target);
 
             while let Some(item) = stream.next().await {
                 // The engine is gone (the export was cancelled or failed): stop
@@ -297,9 +422,17 @@ impl SofRunner for InProcessSofRunner {
 
                 batch.push(resource);
 
-                if batch.len() == CHUNK_SIZE {
+                if batch.len() >= batch_target {
                     let external =
-                        resolve_batch_external(&resolver, &tenant_owned, version, &batch).await;
+                        match resolve_batch_external(&resolver, &tenant_owned, version, &batch)
+                            .await
+                        {
+                            Ok(external) => external,
+                            Err(e) => {
+                                let _ = res_tx.send(Err(e)).await;
+                                return;
+                            }
+                        };
                     if res_tx
                         .send(Ok((std::mem::take(&mut batch), external)))
                         .await
@@ -307,13 +440,15 @@ impl SofRunner for InProcessSofRunner {
                     {
                         return;
                     }
+                    batch_target = (batch_target * 2).min(CHUNK_SIZE);
                 }
             }
 
             if !batch.is_empty() {
-                let external =
-                    resolve_batch_external(&resolver, &tenant_owned, version, &batch).await;
-                let _ = res_tx.send(Ok((batch, external))).await;
+                let item = resolve_batch_external(&resolver, &tenant_owned, version, &batch)
+                    .await
+                    .map(|external| (batch, external));
+                let _ = res_tx.send(item).await;
             }
         });
 
@@ -411,6 +546,12 @@ impl SofRunner for InProcessSofRunner {
     }
 }
 
+/// The HL7/sql-on-fhir PR #410 example views shared with the in-DB runner
+/// integration tests.
+#[cfg(all(test, feature = "R4"))]
+#[path = "../../tests/common/sof_pr410_views.rs"]
+mod sof_pr410_views;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -496,8 +637,9 @@ mod tests {
             _tenant: &TenantContext,
             _fhir_version: FhirVersion,
             refs: &[(String, String)],
-        ) -> Vec<Value> {
-            refs.iter()
+        ) -> Result<Vec<Value>, SofError> {
+            Ok(refs
+                .iter()
                 .filter_map(|(rt, id)| {
                     self.pool.iter().find(|r| {
                         r.get("resourceType").and_then(Value::as_str) == Some(rt.as_str())
@@ -505,12 +647,142 @@ mod tests {
                     })
                 })
                 .cloned()
-                .collect()
+                .collect())
         }
+    }
+
+    /// A resolver whose every call fails, as one over its fan-out cap does.
+    struct LimitResolver;
+
+    #[async_trait]
+    impl StorageReferenceResolver for LimitResolver {
+        async fn resolve(
+            &self,
+            _tenant: &TenantContext,
+            _fhir_version: FhirVersion,
+            _refs: &[(String, String)],
+        ) -> Result<Vec<Value>, SofError> {
+            Err(SofError::ResolutionLimit("over the cap".to_string()))
+        }
+    }
+
+    /// #1870: a reference the resolver cannot resolve fails the run instead of
+    /// yielding rows with the resolved columns silently empty.
+    #[tokio::test]
+    async fn a_failed_resolution_fails_the_run() {
+        let runner =
+            InProcessSofRunner::new(StaticScan::of(vec![observation()]), FhirVersion::R4, "test")
+                .with_reference_resolver(Arc::new(LimitResolver));
+        let mut stream = runner
+            .run_view(&tenant(), resolve_view(), ViewFilters::default())
+            .await
+            .expect("run_view");
+        let mut rows = 0;
+        let mut error = None;
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(_) => rows += 1,
+                Err(e) => error = Some(e),
+            }
+        }
+        assert_eq!(rows, 0, "no row may be emitted for an unresolved batch");
+        assert!(
+            matches!(error, Some(SofError::ResolutionLimit(_))),
+            "got {error:?}"
+        );
     }
 
     fn tenant() -> TenantContext {
         TenantContext::new(TenantId::new("t1"), TenantPermissions::full_access())
+    }
+
+    /// The PR #410 example views (and the in-DB runners' corner cases) give
+    /// the same rows through the in-process runner as through `sof-cli`.
+    #[cfg(feature = "R4")]
+    #[tokio::test]
+    async fn pr410_example_views_match_the_reference_rows() {
+        use super::sof_pr410_views as pr410;
+        let resources = pr410::resources().into_iter().map(|(_, r)| r).collect();
+        let runner = InProcessSofRunner::new(StaticScan::of(resources), FhirVersion::R4, "test");
+        let sorted = |mut rows: Vec<Value>| {
+            rows.sort_by_key(|r| r.to_string());
+            rows
+        };
+        for case in pr410::pr410_cases().into_iter().chain(pr410::extra_cases()) {
+            if pr410::IN_DB_ONLY.contains(&case.name) {
+                continue;
+            }
+            let mut stream = runner
+                .run_view(&tenant(), case.view, ViewFilters::default())
+                .await
+                .unwrap_or_else(|e| panic!("{}: {e}", case.name));
+            let mut rows = Vec::new();
+            while let Some(row) = stream.next().await {
+                rows.push(row.unwrap_or_else(|e| panic!("{}: {e}", case.name)));
+            }
+            assert_eq!(sorted(rows), sorted(case.expected), "{}", case.name);
+        }
+    }
+
+    /// A resolver that counts how many times the runner asks it for anything.
+    struct CountingResolver {
+        inner: StaticResolver,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl StorageReferenceResolver for CountingResolver {
+        async fn resolve(
+            &self,
+            tenant: &TenantContext,
+            fhir_version: FhirVersion,
+            refs: &[(String, String)],
+        ) -> Result<Vec<Value>, SofError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.resolve(tenant, fhir_version, refs).await
+        }
+    }
+
+    /// #1858: a view that never calls `resolve()` does not pre-resolve the
+    /// references in its batches; one that does still gets them.
+    #[tokio::test]
+    async fn references_are_pre_resolved_only_for_a_view_that_resolves() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let runner =
+            InProcessSofRunner::new(StaticScan::of(vec![observation()]), FhirVersion::R4, "test")
+                .with_reference_resolver(Arc::new(CountingResolver {
+                    inner: StaticResolver {
+                        pool: vec![patient()],
+                    },
+                    calls: Arc::clone(&calls),
+                }));
+
+        let ids = observation_ids(&runner, ViewFilters::default()).await;
+        assert_eq!(ids, ["o1"]);
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a view without resolve() reads no referenced resources"
+        );
+
+        let rows = collect_rows(&runner).await;
+        assert_eq!(rows[0]["patient_family"], "Smith");
+        assert!(calls.load(std::sync::atomic::Ordering::SeqCst) > 0);
+    }
+
+    #[test]
+    fn view_uses_resolve_finds_it_anywhere_in_the_view() {
+        assert!(view_uses_resolve(&resolve_view()));
+        assert!(!view_uses_resolve(&observation_ids_view()));
+        assert!(view_uses_resolve(
+            &json!({"select": [{"forEach": "subject.resolve()"}]})
+        ));
+        assert!(view_uses_resolve(
+            &json!({"where": [{"path": "encounter.resolve().exists()"}]})
+        ));
+        assert!(!view_uses_resolve(&json!({"select": [{"column": [
+            {"name": "patient_id", "path": "subject.getReferenceKey(Patient)"}
+        ]}]})));
     }
 
     /// A view whose column dereferences `Observation.subject` to a Patient that
@@ -634,7 +906,7 @@ mod tests {
         })
     }
 
-    async fn observation_ids(runner: &InProcessSofRunner, filters: ViewFilters) -> Vec<String> {
+    async fn observation_ids(runner: &dyn SofRunner, filters: ViewFilters) -> Vec<String> {
         let mut stream = runner
             .run_view(&tenant(), observation_ids_view(), filters)
             .await
@@ -802,5 +1074,75 @@ mod tests {
         )
         .await;
         assert_eq!(ids, ["after", "at", "at-offset"]);
+    }
+
+    /// The runner an export job gets reads each type from storage once: later
+    /// views over it replay what the first read. A row-capped run never leaves
+    /// a partial type behind: the view that follows it still sees every row.
+    #[tokio::test]
+    async fn an_export_job_scans_each_type_once() {
+        let resources: Vec<Value> = (0..30)
+            .map(|i| {
+                json!({
+                    "resourceType": "Observation",
+                    "id": format!("o{i}"),
+                    "status": "final",
+                    "code": {"text": "x"}
+                })
+            })
+            .collect();
+        let scan = StaticScan::of(resources);
+        let runner = InProcessSofRunner::new(scan.clone(), FhirVersion::R4, "test");
+        let job = runner.for_export_job().expect("in-process job runner");
+
+        for _ in 0..3 {
+            let ids = observation_ids(job.as_ref(), ViewFilters::default()).await;
+            assert_eq!(ids.len(), 30);
+        }
+        assert_eq!(scan.scanned_types(), ["Observation"]);
+
+        // A capped run must not poison the cache with a partial type.
+        let capped = runner.for_export_job().expect("in-process job runner");
+        let ids = observation_ids(
+            capped.as_ref(),
+            ViewFilters {
+                limit: Some(1),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(ids.len(), 1);
+        let ids = observation_ids(capped.as_ref(), ViewFilters::default()).await;
+        assert_eq!(ids.len(), 30);
+    }
+
+    /// A row cap shrinks the first scan batch, but later batches still grow,
+    /// so a cap larger than one batch is reached and one smaller than a
+    /// batch returns exactly that many rows.
+    #[tokio::test]
+    async fn limit_caps_rows_across_growing_batches() {
+        let resources: Vec<Value> = (0..3000)
+            .map(|i| {
+                json!({
+                    "resourceType": "Observation",
+                    "id": format!("o{i}"),
+                    "status": "final",
+                    "code": {"text": "x"}
+                })
+            })
+            .collect();
+        let runner = InProcessSofRunner::new(StaticScan::of(resources), FhirVersion::R4, "test");
+
+        for cap in [1usize, 50, 1500] {
+            let ids = observation_ids(
+                &runner,
+                ViewFilters {
+                    limit: Some(cap),
+                    ..Default::default()
+                },
+            )
+            .await;
+            assert_eq!(ids.len(), cap, "limit {cap}");
+        }
     }
 }

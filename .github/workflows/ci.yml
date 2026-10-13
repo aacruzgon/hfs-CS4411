@@ -59,14 +59,10 @@ jobs:
           clean: false
 
       # With `clean: false` a reused workspace keeps files materialized under
-      # whatever line-ending rules held when they were first checked out —
-      # checkout's `--force` only rewrites files whose blob changed. Rewrite
-      # the whole tree from the index so the current .gitattributes rules
-      # (eol=lf on the byte-embedded UI content, #671) apply on every run;
-      # on Windows agents a stale CRLF template otherwise fails every
-      # multi-line assertion of rendered HTML.
+      # whatever line-ending rules held when they were first checked out, so
+      # rewrite stale CRLF copies of `eol=lf` files (#671). See the action.
       - name: Renormalize the working tree
-        run: git checkout-index --all --force
+        uses: ./.github/actions/renormalize-eol
 
       - name: Install Rust toolchain (Linux/macOS)
         if: runner.os != 'Windows'
@@ -428,14 +424,10 @@ jobs:
           clean: false
 
       # With `clean: false` a reused workspace keeps files materialized under
-      # whatever line-ending rules held when they were first checked out —
-      # checkout's `--force` only rewrites files whose blob changed. Rewrite
-      # the whole tree from the index so the current .gitattributes rules
-      # (eol=lf on the byte-embedded UI content, #671) apply on every run;
-      # on Windows agents a stale CRLF template otherwise fails every
-      # multi-line assertion of rendered HTML.
+      # whatever line-ending rules held when they were first checked out, so
+      # rewrite stale CRLF copies of `eol=lf` files (#671). See the action.
       - name: Renormalize the working tree
-        run: git checkout-index --all --force
+        uses: ./.github/actions/renormalize-eol
 
       - name: Install Rust toolchain (Linux/macOS)
         if: runner.os != 'Windows'
@@ -525,14 +517,16 @@ jobs:
           clean: false
 
       # With `clean: false` a reused workspace keeps files materialized under
-      # whatever line-ending rules held when they were first checked out —
-      # checkout's `--force` only rewrites files whose blob changed. Rewrite
-      # the whole tree from the index so the current .gitattributes rules
-      # (eol=lf on the byte-embedded UI content, #671) apply on every run;
-      # on Windows agents a stale CRLF template otherwise fails every
-      # multi-line assertion of rendered HTML.
+      # whatever line-ending rules held when they were first checked out, so
+      # rewrite stale CRLF copies of `eol=lf` files (#671). See the action.
       - name: Renormalize the working tree
-        run: git checkout-index --all --force
+        uses: ./.github/actions/renormalize-eol
+
+      # `.agents/skills` (Codex) must stay a byte-for-byte mirror of
+      # `.claude/skills` (#1834).
+      - name: Check agent skill trees are in sync
+        if: runner.os != 'Windows'
+        run: diff -r .agents/skills .claude/skills
 
       - name: Install Rust toolchain (Linux/macOS)
         if: runner.os != 'Windows'
@@ -715,14 +709,10 @@ jobs:
           clean: false
 
       # With `clean: false` a reused workspace keeps files materialized under
-      # whatever line-ending rules held when they were first checked out —
-      # checkout's `--force` only rewrites files whose blob changed. Rewrite
-      # the whole tree from the index so the current .gitattributes rules
-      # (eol=lf on the byte-embedded UI content, #671) apply on every run;
-      # on Windows agents a stale CRLF template otherwise fails every
-      # multi-line assertion of rendered HTML.
+      # whatever line-ending rules held when they were first checked out, so
+      # rewrite stale CRLF copies of `eol=lf` files (#671). See the action.
       - name: Renormalize the working tree
-        run: git checkout-index --all --force
+        uses: ./.github/actions/renormalize-eol
 
       - name: Install Rust toolchain (Linux/macOS)
         if: runner.os != 'Windows'
@@ -872,14 +862,10 @@ jobs:
           clean: false
 
       # With `clean: false` a reused workspace keeps files materialized under
-      # whatever line-ending rules held when they were first checked out —
-      # checkout's `--force` only rewrites files whose blob changed. Rewrite
-      # the whole tree from the index so the current .gitattributes rules
-      # (eol=lf on the byte-embedded UI content, #671) apply on every run;
-      # on Windows agents a stale CRLF template otherwise fails every
-      # multi-line assertion of rendered HTML.
+      # whatever line-ending rules held when they were first checked out, so
+      # rewrite stale CRLF copies of `eol=lf` files (#671). See the action.
       - name: Renormalize the working tree
-        run: git checkout-index --all --force
+        uses: ./.github/actions/renormalize-eol
 
       - name: Install Rust toolchain (Linux/macOS)
         if: runner.os != 'Windows'

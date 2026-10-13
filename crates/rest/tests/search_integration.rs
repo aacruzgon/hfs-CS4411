@@ -859,26 +859,37 @@ mod string_search {
     }
 
     #[tokio::test]
-    async fn test_membership_parameter_in_is_rejected() {
+    async fn test_membership_parameter_in_is_unknown_on_r4() {
         let (server, backend) = create_test_server().await;
         seed_search_test_data(&backend).await;
 
-        // `_in` asks whether the resource belongs to a referenced List or
-        // Group. That is unimplemented, and it must not fall through: on R5/R6
-        // it is a registered `reference` parameter, so lenient handling would
-        // not drop it and the spec's placeholder `Resource.id` expression makes
-        // the backends answer a membership question with an identity test
-        // (PostgreSQL) or with the entire resource type (SQLite). Rejecting is
-        // the only answer that is not silently wrong (#535).
-        let response = server
+        // `_in` does not exist in R4, so it takes the unknown-parameter path:
+        // lenient handling ignores it, reports it, and keeps it out of the self
+        // link; strict handling rejects it (#638).
+        let lenient = server
             .get("/Patient?_in=42")
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
             .await;
+        lenient.assert_status_ok();
+        let body: Value = lenient.json();
+        assert!(
+            !self_link(&body).contains("_in"),
+            "an ignored parameter must not appear in the self link"
+        );
+        assert!(
+            !outcome_entries(&body).is_empty(),
+            "the ignored parameter must be reported"
+        );
 
-        response.assert_status(StatusCode::BAD_REQUEST);
-        let body: Value = response.json();
-        assert_eq!(body["resourceType"], "OperationOutcome");
-        assert_eq!(body["issue"][0]["code"], "invalid");
+        let strict = server
+            .get("/Patient?_in=42")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                HeaderName::from_static("prefer"),
+                HeaderValue::from_static("handling=strict"),
+            )
+            .await;
+        assert_eq!(strict.status_code(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -4763,17 +4774,18 @@ mod contained_search {
     use helios_persistence::search::SearchParameterRegistry;
     use helios_persistence::types::{SearchQuery, StoredResource};
 
-    /// A searchable backend without contained-resource indexing. Its counters
-    /// distinguish a capability refusal from executing an unfiltered search.
-    struct WithoutContainedSearch {
+    /// Counts every search, including list/chain resolution, so an early
+    /// refusal cannot hide an unfiltered or out-of-band storage search.
+    struct CountingSearch {
         inner: Arc<SqliteBackend>,
         search_calls: AtomicUsize,
+        contained_capability: bool,
     }
 
     #[async_trait]
-    impl ResourceStorage for WithoutContainedSearch {
+    impl ResourceStorage for CountingSearch {
         fn backend_name(&self) -> &'static str {
-            "without-contained-search"
+            "counting-search"
         }
 
         async fn create(
@@ -4838,7 +4850,7 @@ mod contained_search {
     }
 
     #[async_trait]
-    impl SearchProvider for WithoutContainedSearch {
+    impl SearchProvider for CountingSearch {
         async fn search(
             &self,
             tenant: &TenantContext,
@@ -4865,16 +4877,24 @@ mod contained_search {
         }
 
         fn supports_contained_search(&self) -> bool {
-            false
+            self.contained_capability
         }
     }
 
     fn server_without_contained_search(
         backend: Arc<SqliteBackend>,
-    ) -> (TestServer, Arc<WithoutContainedSearch>) {
-        let provider = Arc::new(WithoutContainedSearch {
+    ) -> (TestServer, Arc<CountingSearch>) {
+        server_with_counted_search(backend, false)
+    }
+
+    fn server_with_counted_search(
+        backend: Arc<SqliteBackend>,
+        contained_capability: bool,
+    ) -> (TestServer, Arc<CountingSearch>) {
+        let provider = Arc::new(CountingSearch {
             inner: backend.clone(),
             search_calls: AtomicUsize::new(0),
+            contained_capability,
         });
         let config = CompositeConfig::builder()
             .primary("sqlite", BackendKind::Sqlite)
@@ -4908,114 +4928,155 @@ mod contained_search {
         (server, provider)
     }
 
-    /// #1407: SQL contained composite rows do not retain component positions.
-    /// Reject repeated types explicitly, even for an otherwise matching pair,
-    /// rather than allowing A$B to satisfy the swapped query B$A.
+    /// SQL component slots preserve order and identity through both type-level
+    /// HTTP methods, contained return modes, paging and count-only rendering.
     #[tokio::test]
-    async fn test_contained_repeated_type_composites_return_named_400() {
+    async fn test_contained_repeated_type_composites_get_and_post_preserve_pairing() {
         let (server, backend) = create_test_server().await;
-        let observation = |id| {
+        let observation = |id, first, second| {
             json!({
-                "resourceType": "Observation",
-                "id": id,
-                "status": "final",
-                "code": {"coding": [{"code": "A"}]},
-                "valueCodeableConcept": {"coding": [{"code": "B"}]}
+                "resourceType": "Observation", "id": id, "status": "final",
+                "subject": {"reference": "Patient/p1"},
+                "code": {"coding": [{"code": first}]},
+                "valueCodeableConcept": {"coding": [{"code": second}]}
             })
         };
-        backend
-            .create(
-                &test_tenant(),
-                "Observation",
-                observation("top"),
-                FhirVersion::R4,
-            )
-            .await
-            .unwrap();
+        for (id, first, second) in [
+            ("shared", "A", "B"),
+            ("reverse", "B", "A"),
+            ("equal", "A", "A"),
+        ] {
+            backend
+                .create(
+                    &test_tenant(),
+                    "Observation",
+                    observation(id, first, second),
+                    FhirVersion::R4,
+                )
+                .await
+                .unwrap();
+        }
         backend
             .create(
                 &test_tenant(),
                 "DiagnosticReport",
                 json!({
-                    "resourceType": "DiagnosticReport",
-                    "id": "container",
-                    "status": "final",
+                    "resourceType": "DiagnosticReport", "id": "container", "status": "final",
                     "code": {"text": "panel"},
-                    "contained": [observation("inside"), {
-                        "resourceType": "Observation",
-                        "id": "quantity",
-                        "status": "final",
-                        "code": {"coding": [{"code": "Q"}]},
-                        "valueQuantity": {"value": 10}
-                    }]
+                    "contained": [observation("shared", "A", "B"), observation("sibling", "A", "B"),
+                        observation("reverse", "B", "A"), observation("equal", "A", "A"), {
+                            "resourceType": "Observation", "id": "quantity", "status": "final",
+                            "subject": {"reference": "Patient/p1"},
+                            "code": {"coding": [{"code": "Q"}]}, "valueQuantity": {"value": 10}
+                        }]
                 }),
                 FhirVersion::R4,
             )
             .await
             .unwrap();
 
-        for (url, expected) in [
-            ("/Observation?code-value-concept=A%24B", "Observation/top"),
-            (
-                "/Observation?_contained=false&code-value-concept=A%24B",
-                "Observation/top",
-            ),
-            (
-                "/Observation?_contained=true&code=A",
-                "DiagnosticReport/container",
-            ),
-            (
-                "/Observation?_contained=true&_containedType=contained&code=A",
-                "Observation/inside",
-            ),
-        ] {
-            let (status, body) = get(&server, url).await;
-            assert_eq!(status, StatusCode::OK, "{url}: {body}");
-            assert_eq!(entry_ids(&body), [expected], "{url}: {body}");
-        }
-
-        for mode in ["true", "both"] {
+        for mode in ["false", "true", "both"] {
             for returns in ["container", "contained"] {
-                for value in ["A%24B", "B%24A", "A%24A"] {
-                    for suffix in ["", "&_summary=count", "&_count=0", "&_count=1&_offset=1"] {
-                        let url = format!(
-                            "/Observation?_contained={mode}&_containedType={returns}&code-value-concept={value}{suffix}"
-                        );
-                        let (status, body) = get(&server, &url).await;
-                        assert_eq!(status, StatusCode::BAD_REQUEST, "{url}: {body}");
-                        assert_eq!(body["resourceType"], "OperationOutcome", "{url}: {body}");
-                        let text = body["issue"][0]["details"]["text"]
-                            .as_str()
-                            .unwrap_or_default();
-                        assert!(
-                            text.contains("code-value-concept")
-                                && text.contains("_contained")
-                                && text.contains("repeated component types"),
-                            "{url}: {body}"
-                        );
-                        if mode == "true"
-                            && returns == "container"
-                            && value == "B%24A"
-                            && suffix.is_empty()
-                        {
-                            eprintln!("#1407 after HTTP {status}: GET {url}\n{body}");
+                for (value, top_id, child_ids) in [
+                    ("A$B", "shared", vec!["shared", "sibling"]),
+                    ("B$A", "reverse", vec!["reverse"]),
+                    ("A$A", "equal", vec!["equal"]),
+                    ("Z$Z", "absent", vec![]),
+                ] {
+                    let mut expected = Vec::new();
+                    if mode != "true" && top_id != "absent" {
+                        expected.push(format!("Observation/{top_id}"));
+                    }
+                    if mode != "false" && !child_ids.is_empty() {
+                        if returns == "container" {
+                            expected.push("DiagnosticReport/container".to_string());
+                        } else {
+                            expected.extend(child_ids.iter().map(|id| format!("Observation/{id}")));
                         }
                     }
+                    expected.sort(); // Keep duplicate top-level/local IDs.
+                    for suffix in [
+                        "",
+                        "&_summary=count",
+                        "&_count=0",
+                        "&_count=1",
+                        "&_count=1&_offset=99",
+                    ] {
+                        let encoded = value.replace('$', "%24");
+                        let criteria = format!(
+                            "_contained={mode}&_containedType={returns}&code-value-concept={encoded}&_total=accurate{suffix}"
+                        );
+                        for post in [false, true] {
+                            let (status, body) = type_request(&server, &criteria, post).await;
+                            let context =
+                                format!("{} {criteria}", if post { "POST" } else { "GET" });
+                            assert_eq!(status, StatusCode::OK, "{context}: {body}");
+                            assert_eq!(body["total"], json!(expected.len()), "{context}: {body}");
+                            let ids = entry_ids(&body);
+                            if suffix.contains("_summary=count")
+                                || suffix.contains("_count=0")
+                                || suffix.contains("_offset=99")
+                            {
+                                assert!(ids.is_empty(), "{context}: {body}");
+                            } else if suffix == "&_count=1" {
+                                assert_eq!(
+                                    ids.len(),
+                                    usize::from(!expected.is_empty()),
+                                    "{context}: {body}"
+                                );
+                                assert!(
+                                    ids.iter().all(|id| expected.contains(id)),
+                                    "{context}: {body}"
+                                );
+                            } else {
+                                assert_eq!(ids, expected, "{context}: {body}");
+                            }
+                        }
+                    }
+                    // Compartment search remains a GET route and uses the same
+                    // SQL matching, including local IDs equal to top-level IDs.
+                    let url = format!(
+                        "/Patient/p1/Observation?_contained={mode}&_containedType={returns}&code-value-concept={}&_total=accurate",
+                        value.replace('$', "%24")
+                    );
+                    let (status, body) = get(&server, &url).await;
+                    assert_eq!(status, StatusCode::OK, "{url}: {body}");
+                    assert_eq!(entry_ids(&body), expected, "{url}: {body}");
+                    assert_eq!(body["total"], json!(expected.len()), "{url}: {body}");
                 }
-
-                let url = format!(
-                    "/Observation?_contained={mode}&_containedType={returns}&code-value-quantity=Q%24gt5&_total=accurate"
+                let criteria = format!(
+                    "_contained={mode}&_containedType={returns}&code-value-quantity=Q%24gt5&_total=accurate"
                 );
-                let (status, body) = get(&server, &url).await;
-                assert_eq!(status, StatusCode::OK, "{url}: {body}");
-                let expected = if returns == "container" {
-                    "DiagnosticReport/container"
-                } else {
-                    "Observation/quantity"
-                };
-                assert_eq!(entry_ids(&body), [expected], "{url}: {body}");
-                assert_eq!(body["total"], json!(1), "{url}: {body}");
+                for post in [false, true] {
+                    let (status, body) = type_request(&server, &criteria, post).await;
+                    assert_eq!(status, StatusCode::OK, "{criteria}: {body}");
+                    let expected = if mode == "false" {
+                        vec![]
+                    } else if returns == "container" {
+                        vec!["DiagnosticReport/container"]
+                    } else {
+                        vec!["Observation/quantity"]
+                    };
+                    assert_eq!(entry_ids(&body), expected, "{criteria}: {body}");
+                    assert_eq!(body["total"], json!(expected.len()), "{criteria}: {body}");
+                }
             }
+        }
+    }
+
+    async fn type_request(server: &TestServer, criteria: &str, post: bool) -> (StatusCode, Value) {
+        if post {
+            let pairs: Vec<(String, String)> = url::form_urlencoded::parse(criteria.as_bytes())
+                .into_owned()
+                .collect();
+            let response = server
+                .post("/Observation/_search")
+                .form(&pairs)
+                .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                .await;
+            (response.status_code(), response.json())
+        } else {
+            get(server, &format!("/Observation?{criteria}")).await
         }
     }
 
@@ -5260,19 +5321,74 @@ mod contained_search {
 
         for route in ["/Observation", "/Patient/p1/Observation", "/Patient/p1/*"] {
             for mode in ["true", "both"] {
-                for suffix in ["", "&_summary=count"] {
-                    let url = format!("{route}?_contained={mode}{suffix}");
+                for suffix in ["", "&_count=0", "&_count=1", "&_summary=count"] {
+                    for constraint in [
+                        "",
+                        "&_list=l1",
+                        "&_has:Provenance:target:_id=prov1",
+                        "&subject.family=Smith",
+                    ] {
+                        let url = format!("{route}?_contained={mode}{constraint}{suffix}");
+                        let (status, body) = get(&server, &url).await;
+                        assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{url}: {body}");
+                        assert_eq!(body["resourceType"], "OperationOutcome", "{url}: {body}");
+                        assert_eq!(body["issue"][0]["code"], "not-supported", "{url}: {body}");
+                        let text = body["issue"][0]["details"]["text"]
+                            .as_str()
+                            .unwrap_or_default();
+                        assert!(text.contains("_contained"), "{url}: {body}");
+                        assert_eq!(provider.search_calls.load(Ordering::SeqCst), 0, "{url}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Wildcard validation precedes the page cap and every resolver search.
+    #[tokio::test]
+    async fn test_contained_wildcard_forbidden_criteria_return_400_before_search() {
+        let (_server, backend) = create_test_server().await;
+        seed_out_of_band(&backend).await;
+        let (server, provider) = server_with_counted_search(backend, true);
+
+        for mode in ["true", "both"] {
+            for (constraint, named) in [
+                ("_list=l1", "_list"),
+                ("_has:Provenance:target:_id=prov1", "_has"),
+                ("subject.family=Smith", "subject.family"),
+            ] {
+                for suffix in ["", "&_count=0", "&_count=1", "&_summary=count"] {
+                    let url = format!("/Patient/p1/*?_contained={mode}&{constraint}{suffix}");
                     let (status, body) = get(&server, &url).await;
-                    assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{url}: {body}");
+                    assert_eq!(status, StatusCode::BAD_REQUEST, "{url}: {body}");
                     assert_eq!(body["resourceType"], "OperationOutcome", "{url}: {body}");
-                    assert_eq!(body["issue"][0]["code"], "not-supported", "{url}: {body}");
-                    let text = body["issue"][0]["details"]["text"]
-                        .as_str()
-                        .unwrap_or_default();
-                    assert!(text.contains("_contained"), "{url}: {body}");
+                    assert_eq!(body["issue"][0]["code"], "invalid", "{url}: {body}");
+                    let text = body["issue"][0]["details"]["text"].as_str().unwrap();
+                    assert!(
+                        text.contains(named) && text.contains("_contained"),
+                        "{url}: {body}"
+                    );
                     assert_eq!(provider.search_calls.load(Ordering::SeqCst), 0, "{url}");
                 }
             }
+        }
+
+        // Valid zero-sized pages need no list/chain resolution or backend search,
+        // and do not invent a wildcard total when no searches executed.
+        for criteria in [
+            "",
+            "_list=l1",
+            "_has:Provenance:target:_id=prov1",
+            "subject.family=Smith",
+            "_contained=true",
+            "_contained=both",
+        ] {
+            let url = format!("/Patient/p1/*?_count=0&{criteria}");
+            let (status, body) = get(&server, &url).await;
+            assert_eq!(status, StatusCode::OK, "{url}: {body}");
+            assert!(entry_ids(&body).is_empty(), "{url}: {body}");
+            assert!(body.get("total").is_none(), "{url}: {body}");
+            assert_eq!(provider.search_calls.load(Ordering::SeqCst), 0, "{url}");
         }
     }
 

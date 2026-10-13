@@ -267,6 +267,7 @@ pub(crate) struct IndexRow {
     param_name: String,
     param_url: Option<String>,
     composite_group: Option<i32>,
+    composite_slot: Option<i32>,
     value_string: Option<String>,
     value_string_folded: Option<String>,
     value_token_system: Option<String>,
@@ -324,9 +325,9 @@ macro_rules! column {
 /// below never has to NULL-pad.
 fn insert_plan(rows: &[&IndexRow]) -> InsertPlan {
     let mut plan = InsertPlan {
-        columns: Vec::with_capacity(29),
-        casts: Vec::with_capacity(29),
-        params: Vec::with_capacity(29),
+        columns: Vec::with_capacity(30),
+        casts: Vec::with_capacity(30),
+        params: Vec::with_capacity(30),
     };
     let p = &mut plan;
 
@@ -340,6 +341,8 @@ fn insert_plan(rows: &[&IndexRow]) -> InsertPlan {
         .clone());
     column!(p, rows, "composite_group", "int4[]", |r: &&IndexRow| r
         .composite_group);
+    column!(p, rows, "composite_slot", "int4[]", |r: &&IndexRow| r
+        .composite_slot);
     column!(p, rows, "value_string", "text[]", |r: &&IndexRow| r
         .value_string
         .clone());
@@ -468,7 +471,7 @@ fn insert_plan(rows: &[&IndexRow]) -> InsertPlan {
 /// crud run, and never once re-used, because the text changed with the row
 /// count and `execute(&str)` prepares a throwaway statement each call.
 ///
-/// Now there is a single text with 32 parameters — three scalars and 29 arrays —
+/// Now there is a single text with 33 parameters — three scalars and 30 arrays —
 /// whatever the row count, so it is prepared once per connection and every
 /// execution after the fifth runs on a cached generic plan.
 ///
@@ -604,9 +607,9 @@ const MULTI_BATCH_ROWS: usize = 4096;
 /// `build_missing_condition` selects from `resources`; `primary_keyset_key`
 /// pages on `last_updated`; and `build_contained` answers `_id` from the
 /// `contained_local_id` column and refuses `_lastUpdated` (#1373).
-/// `ChainQueryBuilder` was the one path that
-/// still read the rows, for a chained or reverse-chained terminal such as
-/// `Observation?subject:Patient._id=p1`, and it now reads `resources` too.
+/// The native chain builder (since removed, #1341) was the last path that
+/// read the rows, for a chained or reverse-chained terminal such as
+/// `Observation?subject:Patient._id=p1`, and it had moved to `resources` too.
 ///
 /// The rows cost one insert per resource per parameter with no reader. On the
 /// row census for run 33029355759, `Observation | _id` alone is 689,080 rows —
@@ -639,6 +642,7 @@ impl IndexRow {
             last_updated,
             param_name: extracted.param_name.to_string(),
             composite_group: extracted.composite_group.map(|g| g as i32),
+            composite_slot: extracted.composite_slot.map(i32::from),
             ..Default::default()
         };
 
@@ -791,7 +795,7 @@ impl IndexRow {
 ///
 /// Every column the table has, in borrowed form: the three that identify the
 /// resource (bound once per statement, so they are passed in rather than read
-/// off the row) plus all 29 of [`IndexRow`]'s. Two rows with equal keys are the
+/// off the row) plus all 30 of [`IndexRow`]'s. Two rows with equal keys are the
 /// same tuple, byte for byte, and Postgres would store both.
 ///
 /// `f64` is not `Eq`/`Hash`, so the five float columns are keyed on their IEEE
@@ -807,6 +811,7 @@ struct RowKey<'a> {
     param_name: &'a str,
     param_url: Option<&'a String>,
     composite_group: Option<&'a i32>,
+    composite_slot: Option<&'a i32>,
     value_string: Option<&'a String>,
     value_string_folded: Option<&'a String>,
     value_token_system: Option<&'a String>,
@@ -849,6 +854,7 @@ impl IndexRow {
             param_name,
             param_url,
             composite_group,
+            composite_slot,
             value_string,
             value_string_folded,
             value_token_system,
@@ -883,6 +889,7 @@ impl IndexRow {
             param_name: param_name.as_str(),
             param_url: param_url.as_ref(),
             composite_group: composite_group.as_ref(),
+            composite_slot: composite_slot.as_ref(),
             value_string: value_string.as_ref(),
             value_string_folded: value_string_folded.as_ref(),
             value_token_system: value_token_system.as_ref(),
@@ -965,7 +972,6 @@ impl IndexRow {
 ///   they only cost it scan work.
 /// - `sort_expression` correlates `(SELECT MIN(col) …)` / `MAX`. Aggregates over
 ///   a multiset with a repeated element give the same answer.
-/// - `ChainQueryBuilder` nests the same `IN (SELECT …)` sublinks at every depth.
 /// - `resolve_revincludes` is `SELECT DISTINCT` behind a `seen_ids` set;
 ///   `resolve_includes` reads the resource JSON and never touches this table.
 ///
@@ -1729,6 +1735,7 @@ mod tests {
             ("param_name", |r| r.param_name = "x".into()),
             ("param_url", |r| r.param_url = Some("u".into())),
             ("composite_group", |r| r.composite_group = Some(1)),
+            ("composite_slot", |r| r.composite_slot = Some(1)),
             ("value_string", |r| r.value_string = Some("s".into())),
             ("value_string_folded", |r| {
                 r.value_string_folded = Some("s".into())
@@ -1899,6 +1906,35 @@ mod tests {
             .expect("value should map to a row")
     }
 
+    #[test]
+    fn equal_composite_values_keep_their_distinct_slots() {
+        let mut value = extracted(IndexValue::Number(4.0));
+        value.composite_group = Some(1);
+        value.composite_slot = Some(1);
+        let first = IndexRow::from_extracted(&value, "Observation", "o", None).unwrap();
+        value.composite_slot = Some(2);
+        let second = IndexRow::from_extracted(&value, "Observation", "o", None).unwrap();
+        let contained =
+            IndexRow::from_contained(&value, ("Observation", "o"), ("Observation", "child"))
+                .unwrap();
+        assert_eq!(first.composite_slot, Some(1));
+        assert_eq!(second.composite_slot, Some(2));
+        assert_eq!(contained.composite_slot, Some(2));
+        let kept = dedup_rows([
+            ("Observation", "o", &first),
+            ("Observation", "o", &second),
+            ("Observation", "o", &first),
+        ]);
+        assert_eq!(kept.len(), 2);
+        let plan = insert_plan(&[&first, &second, &contained]);
+        let slot = plan
+            .columns
+            .iter()
+            .position(|name| *name == "composite_slot")
+            .unwrap();
+        assert_eq!(plan.casts[slot], "int4[]");
+    }
+
     /// A pre-v18 database is read with the grouped composite form, which only
     /// understands one row per component. If the write path folded anyway, the
     /// table would hold both shapes and the read form would match neither
@@ -1927,6 +1963,10 @@ mod tests {
         let (plain, folded) =
             PostgresSearchIndexWriter::split_for_layout(values.clone(), IndexLayout::Denormalized);
         assert_eq!(folded.len(), 1, "the pair folds into one row");
+        assert_eq!(
+            IndexRow::from_composite(&folded[0], None).composite_slot,
+            None
+        );
         assert!(plain.is_empty(), "nothing is left unfolded");
 
         let (plain, folded) =
@@ -2101,8 +2141,9 @@ mod tests {
     /// The whole of schema v33 rests on this: `value_reference` holds the
     /// version-agnostic base, so `build_reference_condition` can emit one
     /// equality instead of `= OR LIKE '<base>/\_history/%'`, and so the three
-    /// readers that split the column on `/` (`_revinclude`, `ChainQueryBuilder`,
-    /// `:identifier`) see a `Type/id` they can resolve. A later change that
+    /// readers that split the column on `/` (`_revinclude`, the native chain
+    /// builder since removed in #1341, `:identifier`) see a `Type/id` they can
+    /// resolve. A later change that
     /// stored `Reference.reference` verbatim again would not fail anywhere
     /// except in results — a versioned reference would simply stop matching —
     /// so it fails here instead.

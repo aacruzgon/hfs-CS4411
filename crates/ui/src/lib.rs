@@ -64,6 +64,10 @@ pub(crate) use helios_ui_chrome::json_view;
 mod sql_libraries;
 mod sql_views;
 mod subscriptions;
+// Public but hidden: the coordinator's counters and view are what #1849's
+// integration tests and evidence harnesses observe.
+#[doc(hidden)]
+pub mod tenant_inventory;
 mod tenants;
 mod vd_complete;
 
@@ -167,6 +171,10 @@ struct WebState {
     /// not wire storage in (e.g. the UI-only unit tests), in which case the page
     /// reports the registry as unavailable rather than crashing.
     tenants: Option<Arc<dyn ResourceStorage>>,
+    /// The background tenant inventory over `tenants` (#1850): one
+    /// cross-tenant discovery cache and single-flight refresh per mounted
+    /// app. `None` exactly when `tenants` is.
+    tenant_inventory: Option<Arc<tenant_inventory::TenantInventory>>,
     /// Tenant provisioning jobs started from the tenants page (#581).
     provisioning: tenants::ProvisioningRegistry,
     /// Server data directory (`HFS_DATA_DIR`), used to seed a newly-provisioned
@@ -212,6 +220,22 @@ struct WebState {
     /// with [`set_interactive_login`]. `None` means no login and no session
     /// gate — the pre-#1449 behaviour.
     login: Option<Arc<login::LoginRuntime>>,
+}
+
+impl WebState {
+    /// The tenant inventory, when it does not already hear this UI's purge
+    /// and deregistration events through the server's write-observer fan-out
+    /// (see the subscription in [`mount_with_conformance_source_and_runtime`]).
+    /// Handlers notify the inventory directly through this, so each event
+    /// reaches it exactly once.
+    fn unobserved_tenant_inventory(&self) -> Option<&Arc<tenant_inventory::TenantInventory>> {
+        let observed = self
+            .write_observer
+            .as_deref()
+            .and_then(|observer| observer.fan_out())
+            .is_some();
+        self.tenant_inventory.as_ref().filter(|_| !observed)
+    }
 }
 
 /// The settings keys holding the user's FHIR-version and tenant choices, and
@@ -428,8 +452,11 @@ pub(crate) struct UserSummary {
     /// Primary line: the IdP's `name`, else `preferred_username`, else
     /// `email`, else the subject.
     display: String,
-    /// Secondary line: the email when the IdP sent one, else the subject —
-    /// something that still identifies the account when the name is generic.
+    /// Secondary line: the email when the IdP sent one, else the
+    /// `preferred_username` unless it is already the display name, else the
+    /// subject — something that still identifies the account when the name
+    /// is generic. Entra ID sends no `email` for a user without a mailbox, and
+    /// its `sub` is an opaque per-application value (#1874).
     secondary: String,
     /// One or two letters for the avatar when there is no photo: the first
     /// letters of the first two words of the display name.
@@ -445,6 +472,12 @@ impl UserSummary {
         let secondary = principal
             .email
             .clone()
+            .or_else(|| {
+                principal
+                    .preferred_username
+                    .clone()
+                    .filter(|username| *username != display)
+            })
             .unwrap_or_else(|| principal.subject.clone());
         Some(Self {
             initials: initials_of(&display),
@@ -684,6 +717,12 @@ struct ChartSeriesView {
     href: Option<String>,
     /// Whether this series holds the focus â€” picks the link's label.
     focused: bool,
+    /// The series has no storage history yet (#1603): `polyline` covers only
+    /// the buckets its counters recorded, drawn dashed, and `end_x`/`end_y`
+    /// mark its current point so a lone bucket is still visible.
+    partial: bool,
+    end_x: i64,
+    end_y: i64,
 }
 
 /// One row of the chart's tabular alternative: a bucket label and the
@@ -728,6 +767,9 @@ struct LegendEntry {
     color: usize,
     href: Option<String>,
     focused: bool,
+    /// The series' history is still loading (#1603): the entry says so next
+    /// to its total, which is a real figure.
+    partial: bool,
 }
 
 /// One option in the chart's type picker: a link that toggles the type in or
@@ -766,7 +808,8 @@ struct WindowEntry {
 /// - [`Figures::Unsupported`] — [`Self::Unsupported`], undated.
 /// - [`Figures::Exact`] — [`Self::Live`], dated with its `read_at`.
 /// - [`Figures::Approximate`] — [`Self::Approximate`], dated with its
-///   `read_at`.
+///   `read_at`; [`Self::HistoryLoading`] instead when a charted series has
+///   no storage history yet (#1603).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum DashboardNotice {
     /// Exact figures ([`Figures::Exact`]). Its line carries only the "as of"
@@ -779,6 +822,11 @@ enum DashboardNotice {
     /// Measured figures that are not an exact storage match
     /// ([`Figures::Approximate`]).
     Approximate,
+    /// Approximate, and at least one charted series has no storage history
+    /// behind it yet (#1603): its line shows only the writes recorded since
+    /// the counters' base was read, so the note says so. Same slug as
+    /// [`Self::Approximate`] — it is the same reading, said more precisely.
+    HistoryLoading,
     /// This build has no metrics provider at all, so the placeholder snapshot
     /// is rendered — and labelled as invented.
     Sample,
@@ -797,6 +845,7 @@ impl DashboardNotice {
             DashboardNotice::Live => None,
             DashboardNotice::Pending => Some("chart-pending-note"),
             DashboardNotice::Approximate => Some("chart-approximate-note"),
+            DashboardNotice::HistoryLoading => Some("chart-approximate-history-note"),
             DashboardNotice::Sample => Some("chart-sample-note"),
             DashboardNotice::Unsupported => Some("chart-counts-unsupported-note"),
         }
@@ -808,7 +857,7 @@ impl DashboardNotice {
         match self {
             DashboardNotice::Live => "live",
             DashboardNotice::Pending => "pending",
-            DashboardNotice::Approximate => "approximate",
+            DashboardNotice::Approximate | DashboardNotice::HistoryLoading => "approximate",
             DashboardNotice::Sample => "sample",
             DashboardNotice::Unsupported => "unsupported",
         }
@@ -821,7 +870,10 @@ impl DashboardNotice {
     fn is_warning(self) -> bool {
         !matches!(
             self,
-            DashboardNotice::Live | DashboardNotice::Approximate | DashboardNotice::Unsupported
+            DashboardNotice::Live
+                | DashboardNotice::Approximate
+                | DashboardNotice::HistoryLoading
+                | DashboardNotice::Unsupported
         )
     }
 
@@ -871,6 +923,11 @@ fn dashboard_notice(state: &SnapshotState, now: DateTime<Utc>) -> NoticeLine {
         SnapshotState::Ready(snapshot) => {
             let kind = match snapshot.figures {
                 Figures::Exact { .. } => DashboardNotice::Live,
+                Figures::Approximate { .. }
+                    if snapshot.series.iter().any(|s| s.recorded_from.is_some()) =>
+                {
+                    DashboardNotice::HistoryLoading
+                }
                 Figures::Approximate { .. } => DashboardNotice::Approximate,
                 Figures::Pending => DashboardNotice::Pending,
                 Figures::Unsupported => DashboardNotice::Unsupported,
@@ -1233,8 +1290,6 @@ struct BatchPage {
 struct JsonViewFragment {
     i18n: I18n,
     json_lines: Vec<json_view::JsonLine>,
-    json_view_id: String,
-    json_view_paths: bool,
 }
 
 /// Compartment viewer & route tester (#237). Read-only: the base definitions
@@ -1877,6 +1932,21 @@ pub fn mount_with_conformance_source_and_runtime(
         router = router.route("/ui/search", get(search));
     }
 
+    // One inventory per mounted app, never process-global (#1850). It also
+    // follows purges and deregistrations made outside this UI (the
+    // `/admin/tenants` API) when the server's observer is its fan-out; the
+    // subscription holds the inventory weakly, and the fan-out drops it on a
+    // later subscription once this app is torn down.
+    let tenant_inventory = tenants
+        .clone()
+        .map(tenant_inventory::TenantInventory::over_storage);
+    if let (Some(inventory), Some(fan_out)) = (
+        tenant_inventory.as_ref(),
+        write_observer.as_deref().and_then(|o| o.fan_out()),
+    ) {
+        fan_out.subscribe(inventory.observer());
+    }
+
     let state = WebState {
         version: hfs_version,
         sp_catalog: Arc::new(search_params::SpCatalog::new(source.clone())),
@@ -1884,6 +1954,7 @@ pub fn mount_with_conformance_source_and_runtime(
         conformance: source,
         nl: Arc::new(nl),
         tenants,
+        tenant_inventory,
         provisioning: Default::default(),
         settings,
         bulk_provider,
@@ -2689,23 +2760,14 @@ async fn prune_gone_recents(
     rail: rail_state::RailState,
     live_ids: &std::collections::HashSet<String>,
 ) -> rail_state::RailState {
-    let mut verdicts = Vec::new();
-    for entry in &rail.recent {
-        if live_ids.contains(&entry.id) {
-            continue;
-        }
-        let verdict = state
-            .conformance
-            .resource_exists(resource_type, &entry.id, version, tenant)
-            .await;
-        if let Err(error) = &verdict {
-            tracing::debug!(
-                "existence check failed for {resource_type}/{}: {error}",
-                entry.id
-            );
-        }
-        verdicts.push((entry.id.clone(), verdict));
-    }
+    let candidates = rail
+        .recent
+        .iter()
+        .filter(|entry| !live_ids.contains(&entry.id))
+        .map(|entry| entry.id.clone())
+        .collect();
+    let verdicts =
+        resource_existence_verdicts(state, tenant, version, resource_type, candidates).await;
     match rail.prune_gone(&verdicts) {
         Some(next) => {
             rail_state::persist(&state.settings, user_key, tenant, page, &next).await;
@@ -2713,6 +2775,33 @@ async fn prune_gone_recents(
         }
         None => rail,
     }
+}
+
+/// Check only explicit candidates, once per ID. Search results are not an
+/// existence verdict: only the source's definitive absence permits pruning.
+async fn resource_existence_verdicts(
+    state: &WebState,
+    tenant: &str,
+    version: helios_fhir::FhirVersion,
+    resource_type: &str,
+    candidates: Vec<String>,
+) -> Vec<(String, Result<bool, String>)> {
+    let mut checked = std::collections::HashSet::new();
+    let mut verdicts = Vec::new();
+    for id in candidates {
+        if !checked.insert(id.clone()) {
+            continue;
+        }
+        let verdict = state
+            .conformance
+            .resource_exists(resource_type, &id, version, tenant)
+            .await;
+        if let Err(error) = &verdict {
+            tracing::debug!("existence check failed for {resource_type}/{id}: {error}");
+        }
+        verdicts.push((id, verdict));
+    }
+    verdicts
 }
 
 /// Search page: natural language and the visual builder over one editable query.
@@ -3248,8 +3337,6 @@ async fn render_json_view(
     render(JsonViewFragment {
         i18n: I18n::new(locale),
         json_lines,
-        json_view_id: String::new(),
-        json_view_paths: false,
     })
 }
 
@@ -3512,7 +3599,12 @@ fn sql_editor_path(base: &str, selection: &str, id: &str, current: Option<&str>)
             fragment = url.fragment().map(|f| format!("#{f}")).unwrap_or_default();
             pairs.extend(
                 url.query_pairs()
-                    .filter(|(key, _)| key != "return_to" && key != "saved" && key != selection)
+                    .filter(|(key, _)| {
+                        key != "return_to"
+                            && key != "saved"
+                            && key != selection
+                            && !(selection == "lib" && key == "deleted")
+                    })
                     .map(|(key, value)| (key.into_owned(), value.into_owned())),
             );
         }
@@ -3624,6 +3716,7 @@ fn invalid_form_pane(
         pretty: text,
         error_count: 0,
         orphan_errors: Vec::new(),
+        issues_json: "[]".to_string(),
         parse_error: Some(parse_error),
         focus_path: String::new(),
         auto_open_add: false,
@@ -5566,6 +5659,11 @@ impl LibRunNotice {
 #[derive(Template)]
 #[template(path = "pages/sql-library.html")]
 struct SqlLibraryPage {
+    /// Delete signals are candidates for the next authoritative render.
+    delete_redirect: String,
+    /// An incomplete fetch or a still-existing/unverifiable off-list candidate
+    /// prevents claiming that the collection is empty.
+    collection_unverified: bool,
     navigation: SqlEditorNavigation,
     status: Status,
     i18n: I18n,
@@ -5664,6 +5762,8 @@ struct SelectedLib {
 struct SqlLibQuery {
     return_to: Option<String>,
     lib: Option<String>,
+    /// Untrusted hint from a successful DELETE; always verify it.
+    deleted: Option<String>,
     filter: Option<String>,
     /// `?saved=1` (Save's own redirect): renders the just-saved Library's
     /// `$sql-run` results server-side. There is no `?run=1` — the live
@@ -5826,6 +5926,37 @@ async fn sql_library_page(
             (Vec::new(), Some(error))
         }
     };
+    let stored_rail = settings.rail(kind.page, &rt.id);
+    let is_new = query.lib.as_deref() == Some("new");
+    // Five recent IDs, plus an explicit selection and a deletion hint: at
+    // most seven reads. Even IDs still returned by search must be checked.
+    let candidates = stored_rail
+        .recent
+        .iter()
+        .map(|entry| entry.id.clone())
+        .chain(query.lib.iter().filter(|id| id.as_str() != "new").cloned())
+        .chain(query.deleted.iter().cloned())
+        .collect();
+    let verdicts = resource_existence_verdicts(&state, &rt.id, rv.0, "Library", candidates).await;
+    let gone: std::collections::HashSet<&str> = verdicts
+        .iter()
+        .filter_map(|(id, verdict)| matches!(verdict, Ok(false)).then_some(id.as_str()))
+        .collect();
+    libraries.retain(|lib| {
+        !lib.get("id")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|id| gone.contains(id))
+    });
+    let collection_unverified = degraded.is_some()
+        || verdicts.iter().any(|(id, verdict)| {
+            !matches!(verdict, Ok(false))
+                && !libraries.iter().any(|lib| {
+                    lib.get("id").and_then(serde_json::Value::as_str) == Some(id.as_str())
+                })
+        });
+    let rail_before = stored_rail
+        .prune_gone(&verdicts)
+        .unwrap_or_else(|| stored_rail.clone());
     let summaries = {
         let mut s = sql_libraries::summarize(&libraries, kind.code);
         if !filter.is_empty() {
@@ -5835,11 +5966,9 @@ async fn sql_library_page(
         s
     };
 
-    let rail_before = settings.rail(kind.page, &rt.id);
-    let is_new = query.lib.as_deref() == Some("new");
     let (selected, selected_value, rail) = if is_new {
-        // "Create New" is never a selection (the `?lib=new` exception):
-        // nothing here reads or writes `rails.<page>`.
+        // "Create New" never records a selection. The existence sweep
+        // may still have cleaned a confirmed deletion from this rail.
         (
             Some(SelectedLib {
                 id: String::new(),
@@ -5863,15 +5992,7 @@ async fn sql_library_page(
                 let status = sql_libraries::extract_status(&lib);
                 let meta = (!status.is_empty()).then(|| status.clone());
                 let entry = rail_state::RailEntry::with_snapshot(id.clone(), name.clone(), meta);
-                let rail = record_snapshot_selection(
-                    &state,
-                    &settings.user_key,
-                    &rt.id,
-                    kind.page,
-                    rail_before,
-                    entry,
-                )
-                .await;
+                let rail = rail_before.select(entry).unwrap_or(rail_before);
                 (
                     Some(SelectedLib {
                         id,
@@ -5885,21 +6006,9 @@ async fn sql_library_page(
                     rail,
                 )
             }
-            None => {
-                // A stale or mistyped explicit id is pruned from the
-                // registry; the page itself keeps its current "no selection"
-                // render either way.
-                let rail = prune_stale_selection(
-                    &state,
-                    &settings.user_key,
-                    &rt.id,
-                    kind.page,
-                    rail_before,
-                    &explicit_id,
-                )
-                .await;
-                (None, None, rail)
-            }
+            // Absence from a filtered, incomplete or failed list is not
+            // evidence of deletion. The existence sweep already decided it.
+            None => (None, None, rail_before),
         }
     } else {
         // No explicit selection: try the stored `last`, falling back to
@@ -5939,6 +6048,17 @@ async fn sql_library_page(
             None => (None, None, rail_before),
         }
     };
+
+    if rail != stored_rail {
+        rail_state::persist(
+            &state.settings,
+            &settings.user_key,
+            &rt.id,
+            kind.page,
+            &rail,
+        )
+        .await;
+    }
 
     let selection_filtered = !filter.is_empty()
         && selected_value
@@ -6163,6 +6283,8 @@ async fn sql_library_page(
     let details = lib_details_pane_for_selection(i18n, rv.0, kind, is_new, selected_value.as_ref());
 
     render(SqlLibraryPage {
+        delete_redirect: sql_library_delete_redirect(kind.base_href, &selected_id),
+        collection_unverified,
         navigation,
         selection_filtered,
         status: current_status(&state, rv.0, &rt),
@@ -6199,6 +6321,13 @@ async fn sql_library_page(
         rail_page: kind.page.key(),
         max_recent: rail_state::MAX_RECENT,
     })
+}
+
+fn sql_library_delete_redirect(base: &str, id: &str) -> String {
+    let query = form_urlencoded::Serializer::new(String::new())
+        .append_pair("deleted", id)
+        .finish();
+    format!("{base}?{query}")
 }
 
 #[derive(Default)]
@@ -6418,6 +6547,8 @@ async fn render_lib_document_page(
         .is_some()
         .then(|| build_columns_card(i18n, kind, Vec::new(), false));
     SqlLibraryPage {
+        delete_redirect: sql_library_delete_redirect(kind.base_href, &id),
+        collection_unverified: false,
         navigation,
         selection_filtered: false,
         status: current_status(state, version, rt),
@@ -6803,15 +6934,11 @@ async fn columns_fragment_for_success(
     raw_rows: &[serde_json::Value],
     sql: &str,
     deps: &[sql_libraries::TableDependency],
+    libraries: &[serde_json::Value],
 ) -> ColumnsFragment {
     let used_deps = sql_libraries::dependencies_used_by_sql(sql, deps);
-    let libraries = state
-        .conformance
-        .fetch("Library", version, tenant)
-        .await
-        .unwrap_or_default();
     let view_definitions =
-        resolve_view_definition_dependencies(state, version, tenant, &used_deps, &libraries).await;
+        resolve_view_definition_dependencies(state, version, tenant, &used_deps, libraries).await;
     let columns_rows = sql_libraries::analyze_columns(&table.columns, raw_rows, &view_definitions);
     ColumnsFragment::Filled(build_columns_card(i18n, kind, columns_rows, true))
 }
@@ -6945,12 +7072,17 @@ async fn sql_library_run(
     let unknown_tables = sql_libraries::unknown_tables(&sql, &deps);
     let unknown_names: Vec<String> = unknown_tables.iter().map(|t| t.name.clone()).collect();
     let tables_signature = sql_libraries::tables_signature_with_unknown(&deps, &unknown_names);
+    // The Library collection is read at most once per request: the Tables
+    // card and the Columns card both resolve against it.
+    let mut libraries: Option<Vec<serde_json::Value>> = None;
     let tables_card = if tables_signature != form.tables_sig {
-        let libraries = state
-            .conformance
-            .fetch("Library", rv.0, &rt.id)
-            .await
-            .unwrap_or_default();
+        let libraries = libraries.insert(
+            state
+                .conformance
+                .fetch("Library", rv.0, &rt.id)
+                .await
+                .unwrap_or_default(),
+        );
         let jobs = sql_export::jobs_for_used_by(&state, &user_key, &rt.id).await;
         let analysis = analyze_tables(
             &state,
@@ -6959,7 +7091,7 @@ async fn sql_library_run(
             &resource,
             &deps,
             &unknown_tables,
-            &libraries,
+            libraries,
             &jobs,
         )
         .await;
@@ -7008,8 +7140,18 @@ async fn sql_library_run(
                         kind = kind.code,
                         "ran a Library preview"
                     );
+                    let libs = match libraries.as_deref() {
+                        Some(libs) => libs,
+                        None => libraries.insert(
+                            state
+                                .conformance
+                                .fetch("Library", rv.0, &rt.id)
+                                .await
+                                .unwrap_or_default(),
+                        ),
+                    };
                     let columns = columns_fragment_for_success(
-                        &state, rv.0, &rt.id, i18n, kind, &table, &raw_rows, &sql, &deps,
+                        &state, rv.0, &rt.id, i18n, kind, &table, &raw_rows, &sql, &deps, libs,
                     )
                     .await;
                     (standard(RunResultsState::Success(table, ms)), columns)
@@ -7051,8 +7193,18 @@ async fn sql_library_run(
                     kind = kind.code,
                     "ran a Library preview"
                 );
+                let libs = match libraries.as_deref() {
+                    Some(libs) => libs,
+                    None => libraries.insert(
+                        state
+                            .conformance
+                            .fetch("Library", rv.0, &rt.id)
+                            .await
+                            .unwrap_or_default(),
+                    ),
+                };
                 let columns = columns_fragment_for_success(
-                    &state, rv.0, &rt.id, i18n, kind, &table, &raw_rows, &sql, &deps,
+                    &state, rv.0, &rt.id, i18n, kind, &table, &raw_rows, &sql, &deps, libs,
                 )
                 .await;
                 (standard(RunResultsState::Success(table, ms)), columns)
@@ -8682,6 +8834,13 @@ fn dash_state(
     for series in &snapshot.series {
         series.resource_type.hash(&mut hasher);
         series.total.hash(&mut hasher);
+        // History arriving changes how the line is drawn even when every
+        // point keeps its value (nothing written in the window), so it must
+        // change the digest too (#1603).
+        series
+            .recorded_from
+            .map(|t| t.timestamp())
+            .hash(&mut hasher);
         for point in &series.points {
             point.bucket_start.timestamp().hash(&mut hasher);
             point.delta.hash(&mut hasher);
@@ -9030,6 +9189,7 @@ fn build_dashboard(
                 color: i % SERIES_COLORS + 1,
                 href,
                 focused,
+                partial: s.recorded_from.is_some(),
             }
         })
         .collect();
@@ -9174,6 +9334,25 @@ fn build_chart(
         n => format!("{} +{}", plotted[0].resource_type, n - 1),
     };
 
+    // Where each series' measurements begin (#1603): the index of the bucket
+    // holding `recorded_from`, or 0 when the whole window is history. Points
+    // before it are not drawn, tipped or tabled.
+    let bucket = window.bucket_seconds();
+    let known_from: Vec<usize> = plotted
+        .iter()
+        .map(|s| match s.recorded_from {
+            None => 0,
+            Some(from) => {
+                let floor = from.timestamp() - from.timestamp().rem_euclid(bucket);
+                // At least the current point is always a measurement.
+                s.points
+                    .iter()
+                    .position(|p| p.bucket_start.timestamp() >= floor)
+                    .unwrap_or(s.points.len() - 1)
+            }
+        })
+        .collect();
+
     if plotted.is_empty() {
         return ChartView {
             has_data: false,
@@ -9198,8 +9377,9 @@ fn build_chart(
     // unless a series is focused, in which case the axis fits that series.
     let peak = plotted
         .iter()
-        .filter(|s| focus.is_none() || focus == Some(s.resource_type.as_str()))
-        .flat_map(|s| s.points.iter().map(|p| p.cumulative))
+        .zip(&known_from)
+        .filter(|(s, _)| focus.is_none() || focus == Some(s.resource_type.as_str()))
+        .flat_map(|(s, &from)| s.points[from..].iter().map(|p| p.cumulative))
         .max()
         .unwrap_or(0);
     let axis_max = nice_ceil(peak).max(1);
@@ -9216,26 +9396,34 @@ fn build_chart(
 
     let series: Vec<ChartSeriesView> = plotted
         .iter()
+        .zip(&known_from)
         .enumerate()
-        .map(|(si, s)| ChartSeriesView {
-            resource_type: s.resource_type.clone(),
-            color: si % SERIES_COLORS + 1,
-            polyline: s
-                .points
-                .iter()
-                .enumerate()
-                .map(|(i, p)| format!("{},{}", x_at(i as i64), y_at(p.cumulative)))
-                .collect::<Vec<_>>()
-                .join(" "),
-            emphasis: match focus {
-                None => "",
-                Some(f) if f == s.resource_type => " series--focused",
-                Some(_) => " series--receded",
-            },
-            // build_dashboard fills the focus link in; geometry stays the
-            // only concern here.
-            href: None,
-            focused: focus == Some(s.resource_type.as_str()),
+        .map(|(si, (s, &from))| {
+            let last = s.points.len() - 1;
+            ChartSeriesView {
+                resource_type: s.resource_type.clone(),
+                color: si % SERIES_COLORS + 1,
+                polyline: s
+                    .points
+                    .iter()
+                    .enumerate()
+                    .skip(from)
+                    .map(|(i, p)| format!("{},{}", x_at(i as i64), y_at(p.cumulative)))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                emphasis: match focus {
+                    None => "",
+                    Some(f) if f == s.resource_type => " series--focused",
+                    Some(_) => " series--receded",
+                },
+                // build_dashboard fills the focus link in; geometry stays the
+                // only concern here.
+                href: None,
+                focused: focus == Some(s.resource_type.as_str()),
+                partial: s.recorded_from.is_some(),
+                end_x: x_at(last as i64),
+                end_y: y_at(s.points[last].cumulative),
+            }
         })
         .collect();
 
@@ -9262,7 +9450,11 @@ fn build_chart(
                 label,
                 values: plotted
                     .iter()
-                    .map(|s| {
+                    .zip(&known_from)
+                    .map(|(s, &from)| {
+                        if (idx as usize) < from {
+                            return UNMEASURED.to_string();
+                        }
                         s.points
                             .get(idx as usize)
                             .map(|p| grouped(p.cumulative, lang))
@@ -9283,12 +9475,19 @@ fn build_chart(
         "xs": (0..n).map(&x_at).collect::<Vec<_>>(),
         "series": plotted
             .iter()
+            .zip(&known_from)
             .enumerate()
-            .map(|(si, s)| serde_json::json!({
+            .map(|(si, (s, &from))| serde_json::json!({
                 "type": s.resource_type,
                 "color": si % SERIES_COLORS + 1,
-                "values": s.points.iter().map(|p| p.cumulative).collect::<Vec<_>>(),
-                "ys": s.points.iter().map(|p| y_at(p.cumulative)).collect::<Vec<_>>(),
+                // `null` before the series' measurements begin (#1603); the
+                // script shows a dash there, never a number.
+                "values": s.points.iter().enumerate()
+                    .map(|(i, p)| (i >= from).then_some(p.cumulative))
+                    .collect::<Vec<_>>(),
+                "ys": s.points.iter().enumerate()
+                    .map(|(i, p)| (i >= from).then(|| y_at(p.cumulative)))
+                    .collect::<Vec<_>>(),
             }))
             .collect::<Vec<_>>(),
     })
@@ -9306,6 +9505,10 @@ fn build_chart(
         pick_label,
     }
 }
+
+/// What the chart's table shows for a bucket a series has no measurement
+/// for (#1603): a dash, never a number.
+const UNMEASURED: &str = "—";
 
 /// Five horizontal value gridlines from `axis_max` (top) down to `0` (bottom).
 fn y_axis_ticks(axis_max: u64, _height: i64, plot_bottom: i64, lang: &str) -> Vec<AxisTick> {
@@ -9417,6 +9620,7 @@ fn sample_snapshot(window: DashboardWindow) -> DashboardSnapshot {
             resource_type: resource_type.to_string(),
             total: cumulative,
             points,
+            recorded_from: None,
         }
     };
 
@@ -10476,6 +10680,7 @@ mod tests {
                 resource_type: "Patient".to_string(),
                 total: 5,
                 points: vec![point_at(1_752_451_200, 5, 5)],
+                recorded_from: None,
             }],
             available: vec![helios_observability::dashboard::TypeCount {
                 resource_type: "Patient".to_string(),
@@ -10535,6 +10740,7 @@ mod tests {
                 resource_type: "Patient".to_string(),
                 total: 5,
                 points: vec![point_at(1_752_451_200, 5, 5)],
+                recorded_from: None,
             }],
             ..DashboardSnapshot::default()
         };
@@ -10562,6 +10768,7 @@ mod tests {
                 point_at(1_752_454_800, 0, 0),
                 point_at(1_752_458_400, 0, 0),
             ],
+            recorded_from: None,
         };
         let chart = build_chart(
             std::slice::from_ref(&empty_type),
@@ -10933,6 +11140,7 @@ mod tests {
             resource_type: "Patient".to_string(),
             total: 5,
             points: vec![point_at(1_752_503_400, 5, 5)],
+            recorded_from: None,
         };
         let chart = build_chart(
             std::slice::from_ref(&series),
@@ -10961,6 +11169,7 @@ mod tests {
                 point_at(1_752_503_460, -6, 4),
                 point_at(1_752_503_520, 0, 4),
             ],
+            recorded_from: None,
         };
         let chart = build_chart(
             std::slice::from_ref(&series),
@@ -10983,6 +11192,142 @@ mod tests {
                 "y {y} escaped the plot"
             );
         }
+    }
+
+    /// #1603: a series whose window history is not loaded plots only the
+    /// buckets its counters recorded — from the bucket holding
+    /// `recorded_from` to the current one — dashed and with its current point
+    /// marked. The earlier buckets are not drawn, tipped or tabled as numbers:
+    /// before the fix they were a flat line at today's total.
+    #[test]
+    fn a_series_without_history_plots_only_its_recorded_buckets() {
+        // Three one-minute buckets; the counters' base was read 10 s into the
+        // second, so the first bucket is not a measurement.
+        let series = DashboardSeries {
+            resource_type: "Observation".to_string(),
+            total: 7_699_987,
+            points: vec![
+                point_at(1_752_503_400, 0, 7_699_987),
+                point_at(1_752_503_460, 0, 7_699_987),
+                point_at(1_752_503_520, 0, 7_699_987),
+            ],
+            recorded_from: DateTime::from_timestamp(1_752_503_470, 0),
+        };
+        let chart = build_chart(
+            std::slice::from_ref(&series),
+            DashboardWindow::LastHour,
+            None,
+            "en",
+        );
+        let s = &chart.series[0];
+        assert!(s.partial);
+        let pairs: Vec<&str> = s.polyline.split(' ').collect();
+        assert_eq!(
+            pairs.len(),
+            2,
+            "the first bucket is not drawn: {}",
+            s.polyline
+        );
+        // x of the second of three buckets: 40 + 1020 / 2.
+        assert!(pairs[0].starts_with("550,"), "{}", s.polyline);
+        assert_eq!(format!("{},{}", s.end_x, s.end_y), pairs[1]);
+        let tip: serde_json::Value = serde_json::from_str(&chart.tip_json).expect("json");
+        assert_eq!(tip["series"][0]["values"][0], serde_json::Value::Null);
+        assert_eq!(tip["series"][0]["ys"][0], serde_json::Value::Null);
+        assert_eq!(tip["series"][0]["values"][1], 7_699_987);
+        assert_eq!(chart.table.len(), 3);
+        assert_eq!(chart.table[0].values[0], UNMEASURED);
+        assert_eq!(chart.table[1].values[0], "7,699,987");
+
+        // The same points with their history loaded are the whole line.
+        let seeded = DashboardSeries {
+            recorded_from: None,
+            ..series
+        };
+        let chart = build_chart(
+            std::slice::from_ref(&seeded),
+            DashboardWindow::LastHour,
+            None,
+            "en",
+        );
+        assert!(!chart.series[0].partial);
+        assert_eq!(chart.series[0].polyline.split(' ').count(), 3);
+        assert_eq!(chart.table[0].values[0], "7,699,987");
+    }
+
+    /// A `recorded_from` past the last bucket (a skewed clock) still plots
+    /// the current point: the total is always a measurement.
+    #[test]
+    fn a_series_recorded_from_the_future_keeps_its_current_point() {
+        let series = DashboardSeries {
+            resource_type: "Patient".to_string(),
+            total: 5,
+            points: vec![point_at(1_752_503_400, 0, 5), point_at(1_752_503_460, 0, 5)],
+            recorded_from: DateTime::from_timestamp(1_752_507_000, 0),
+        };
+        let chart = build_chart(
+            std::slice::from_ref(&series),
+            DashboardWindow::LastHour,
+            None,
+            "en",
+        );
+        let s = &chart.series[0];
+        assert!(s.partial);
+        assert_eq!(s.polyline, format!("{},{}", s.end_x, s.end_y));
+        assert_eq!(chart.table[0].values[0], UNMEASURED);
+        assert_eq!(chart.table[1].values[0], "5");
+    }
+
+    /// #1603: history still loading is said next to the series' total in the
+    /// legend and by the notice line — under the "approximate" slug, since it
+    /// is the same reading said more precisely — and it changes the refresh
+    /// digest, so the whole line is drawn as soon as the history lands even
+    /// when no point changes value.
+    #[test]
+    fn history_loading_is_said_in_the_legend_and_the_note() {
+        let read_at = DateTime::from_timestamp(1_752_503_400, 0).expect("valid instant");
+        let reconciled_at = read_at - Duration::seconds(30);
+        let now = read_at + Duration::seconds(5);
+        let snapshot = |loading: bool| DashboardSnapshot {
+            series: vec![
+                DashboardSeries {
+                    resource_type: "Observation".to_string(),
+                    total: 9,
+                    points: vec![point_at(1_752_503_340, 0, 9), point_at(1_752_503_400, 0, 9)],
+                    recorded_from: loading.then_some(reconciled_at),
+                },
+                DashboardSeries {
+                    resource_type: "Patient".to_string(),
+                    total: 2,
+                    points: vec![point_at(1_752_503_340, 0, 2), point_at(1_752_503_400, 0, 2)],
+                    recorded_from: None,
+                },
+            ],
+            figures: Figures::Approximate {
+                read_at,
+                reconciled_at,
+            },
+            ..Default::default()
+        };
+
+        let dash = build_dashboard(&snapshot(true), false, &[], None, "en");
+        assert!(dash.legend[0].partial && !dash.legend[1].partial);
+        assert!(dash.chart.series[0].partial && !dash.chart.series[1].partial);
+
+        let line = dashboard_notice(&SnapshotState::Ready(snapshot(true)), now);
+        assert_eq!(line.kind, DashboardNotice::HistoryLoading);
+        assert_eq!(line.kind.slug(), "approximate");
+        assert_eq!(line.kind.key(), Some("chart-approximate-history-note"));
+        assert!(!line.kind.is_warning() && !line.kind.is_waiting());
+        assert!(line.as_of.is_some(), "a measured reading is dated");
+        let settled = dashboard_notice(&SnapshotState::Ready(snapshot(false)), now);
+        assert_eq!(settled.kind, DashboardNotice::Approximate);
+
+        assert_ne!(
+            dash_state(&snapshot(true), &[], false, now),
+            dash_state(&snapshot(false), &[], false, now),
+            "history arriving must redraw the line"
+        );
     }
 }
 
@@ -11052,6 +11397,20 @@ mod user_summary_tests {
         );
 
         assert!(UserSummary::from_session(None).is_none());
+    }
+
+    #[test]
+    fn without_an_email_the_secondary_line_is_the_username() {
+        // Entra ID: a user without a mailbox has no `email`, and `sub` is an
+        // opaque pairwise value; `preferred_username` is the sign-in name.
+        let mut entra = principal();
+        entra.name = Some("Demo User".to_string());
+        entra.preferred_username = Some("demo@contoso.example".to_string());
+        entra.email = None;
+        entra.subject = "AAAAAAAAAAAAAAAAAAAAAIkzqFVrSaSaFHy782bbtaQ".to_string();
+        let summary = UserSummary::from_session(Some(&entra)).unwrap();
+        assert_eq!(summary.display, "Demo User");
+        assert_eq!(summary.secondary, "demo@contoso.example");
     }
 
     #[test]

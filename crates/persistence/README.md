@@ -107,7 +107,6 @@ helios-persistence/
 │   │   │   ├── bulk_submit.rs  # BulkSubmitProvider implementation
 │   │   │   └── search/         # Search query building
 │   │   │       ├── query_builder.rs      # SQL query construction
-│   │   │       ├── chain_builder.rs      # Chained parameter resolution
 │   │   │       ├── filter_parser.rs      # _filter parameter parsing
 │   │   │       ├── fts.rs                # FTS5 full-text search
 │   │   │       ├── modifier_handlers.rs  # Search modifier logic
@@ -217,8 +216,7 @@ Backend (connection management, capabilities)
     ├── SearchProvider (search, search_count)
     │       │
     │       ├── IncludeProvider (_include resolution)
-    │       ├── RevincludeProvider (_revinclude resolution)
-    │       └── ChainedSearchProvider (chained parameters, _has)
+    │       └── RevincludeProvider (_revinclude resolution)
     │
     └── TransactionProvider (begin, commit, rollback)
 ```
@@ -226,7 +224,7 @@ Backend (connection management, capabilities)
 ## Features
 
 - **Multiple Backends**: SQLite, PostgreSQL, Cassandra, MongoDB, Neo4j, Elasticsearch, S3
-- **Multitenancy**: Shared-schema isolation via a `tenant_id` discriminator on every backend, with a mandatory `TenantContext` on every tenant-scoped operation (the S3 backend additionally offers a bucket-per-tenant mode to embedders; the `hfs` binary configures prefix-per-tenant only — see S3 tenancy below)
+- **Multitenancy**: Shared-schema isolation via a `tenant_id` discriminator on every backend, with a mandatory `TenantContext` on every tenant-scoped operation (the S3 backend additionally offers a bucket-per-tenant mode, `HFS_S3_TENANCY=bucket-per-tenant` in the `hfs` binary — see S3 tenancy below)
 - **Full FHIR Search**: All parameter types, modifiers, chaining, \_include/\_revinclude
 - **Versioning**: Complete resource history with optimistic locking
 - **Transactions**: ACID transactions with FHIR bundle support
@@ -251,17 +249,19 @@ backend applies the discriminator in its own idiom:
 | **PostgreSQL**    | `tenant_id` column; `PRIMARY KEY (tenant_id, resource_type, id)`          |
 | **MongoDB**       | `tenant_id` field on every document                                       |
 | **Elasticsearch** | Per-tenant index (`{prefix}_{tenant}_{type}`) **and** a `tenant_id` filter |
-| **S3**            | Tenant-scoped key prefix (what the `hfs` binary configures); a dedicated bucket per tenant is a library mode (see below) |
+| **S3**            | Tenant-scoped key prefix (`prefix-per-tenant`, the default) or a dedicated bucket per tenant (`bucket-per-tenant`, see below) |
 
 The S3 backend is the one place HFS offers a genuine per-tenant *physical*
 boundary: `S3TenancyMode::BucketPerTenant` gives each mapped tenant its own
-bucket, with its own IAM/policy surface (tenants absent from the bucket map
-fall back to the shared system bucket). The `hfs` binary does not reach that
-mode: it builds `PrefixPerTenant` from `HFS_S3_BUCKET` at every S3 wiring site
-and no `HFS_S3_*` variable selects bucket-per-tenant, so every `hfs`
-deployment is shared-schema on S3 as well; the mode is for embedders that
-construct `S3Backend` themselves (#1514). Making it configurable from the
-binary is #1598. Every other backend is shared-schema.
+bucket, with its own IAM/policy surface. A tenant absent from the bucket map
+is refused with `TenantError::UnmappedTenant` (on request *and* on
+`register_tenant`, so the registry cannot name a tenant that has no bucket);
+only `__system__` falls back, to the optional `default_system_bucket`, which
+also hosts the cross-tenant control-plane state. The `hfs` binary selects the
+mode with `HFS_S3_TENANCY=bucket-per-tenant`, maps tenants with
+`HFS_S3_TENANT_BUCKETS=tenant=bucket,…` and names the system bucket with
+`HFS_S3_SYSTEM_BUCKET` (#1598; the `/run-hfs-server` skill has the rules).
+Every other backend is shared-schema.
 Note that Elasticsearch gives each tenant its own index, but within a single
 cluster and credential, so that is a naming boundary rather than a physical
 one — the term filter is what actually isolates.
@@ -375,7 +375,7 @@ For a capability-by-capability narrative of FHIR Search against the [spec](https
 | [Number](https://build.fhir.org/search.html#number)                         | ✓      | ✓          | ✓       | ✗         | ○     | ✓             | ○   |
 | [Quantity](https://build.fhir.org/search.html#quantity)                     | ✓      | ✓          | ✓       | ✗         | ✗     | ✓             | ○   |
 | [URI](https://build.fhir.org/search.html#uri)                               | ✓      | ✓          | ✓       | ○         | ○     | ✓             | ○   |
-| [Composite](https://build.fhir.org/search.html#composite)                   | ✓      | ✓          | ○       | ✗         | ○     | ✓             | ✗   |
+| [Composite](https://build.fhir.org/search.html#composite)                   | ✓      | ✓          | ✓       | ✗         | ○     | ✓             | ✗   |
 | **[Search Modifiers](https://build.fhir.org/search.html#modifiers)**        |
 | [:exact](https://build.fhir.org/search.html#modifiers)                      | ✓      | ✓          | ✓       | ○         | ○     | ✓             | ○   |
 | [:contains](https://build.fhir.org/search.html#modifiers)                   | ✓      | ✓          | ✓       | ✗         | ○     | ✓             | ✗   |
@@ -428,27 +428,61 @@ For a capability-by-capability narrative of FHIR Search against the [spec](https
   server before the query reaches the backend; `:not-in` returns `501 Not Implemented`. No
   backend resolves these natively.
 - **Chained / `_has`** — chained and reverse-chained parameters are resolved by the persistence
-  layer's backend-agnostic resolver (`search::resolve_chains`), not natively in any backend: each
-  hop is one plain `search()` against the backend, and the result is folded into an `_id` filter
+  layer's backend-agnostic resolver (`search::resolve_chains`): each hop is one plain `search()`
+  against the backend, and the result is folded into an `_id` filter
   that the backend's ordinary `search()` executes. Because the rewrite happens above the backend,
   `GET /Observation?subject.name=Smith` and `?_has:Observation:subject:code=…` work end-to-end on
-  every search-capable backend — SQLite, PostgreSQL, Elasticsearch, and MongoDB alike. (The native
-  `ChainedSearchProvider` trait is not wired into request handling.)
-- **Composite** — SQLite, PostgreSQL, and Elasticsearch evaluate composite component values
-  (token, string, number, quantity, date) end-to-end (✓): the REST layer resolves component types
-  from the registry and the extractor indexes each composite instance as a `composite_group`.
-  SQLite matches components within one group via `GROUP BY … HAVING`. PostgreSQL standard
-  searches in the denormalized layout use folded rows with per-type component columns; contained searches use unfolded
-  rows grouped per contained resource and composite instance. Elasticsearch indexes each instance
-  as one nested object with inline component values and matches with a single nested query.
-  SQLite and PostgreSQL reject `_contained=true|both` composites whose declared components repeat
-  a search parameter type (for example, token + token `code-value-concept`) with HTTP 400
-  (`InvalidComposite`). Their contained index rows do not preserve equal-type component positions,
-  so allowing these queries could confuse `A$B` with `B$A`. Distinct-type contained composites
-  remain supported. This restriction applies to both search results and count-only requests,
-  regardless of stored data or pagination; `$reindex` does not remove it. `_contained=false` is
-  unchanged, including SQLite's existing ambiguity for ordinary equal-type composites.
-  See `docs/search-spec-assessment.md`.
+  every search-capable backend — SQLite, PostgreSQL, Elasticsearch, and MongoDB alike. A backend
+  may answer a specific shape faster through a `SearchProvider` hook, reusing its ordinary search
+  matching: standalone SQLite reads a `_has` hop's references from its index in one statement
+  (`search_reference_values`), and PostgreSQL evaluates
+  `Patient?_has:Observation:patient:code=system|code` inside `search()`
+  on R4 with the denormalized index layout (`supports_native_reverse_chains`).
+- **Composite** — SQLite, PostgreSQL, MongoDB, and Elasticsearch evaluate component values
+  within one composite instance. SQLite and PostgreSQL unfolded rows share a `composite_group`
+  and retain per-type component ordinals in `composite_slot`; predicates for repeated types also
+  require the corresponding slot. Thus `A$B`, `B$A`, and `A$A` preserve their declared positions
+  in ordinary and contained search, including counts and paging. Contained matches belong to one
+  contained entity and group; top-level composite subqueries exclude contained rows. MongoDB uses
+  the same group/slot identity with value-index probes. Elasticsearch uses one nested object per
+  instance with inline component values; this SQL change does not expand its repeated-type support.
+  See [`docs/search-spec-assessment.md`](docs/search-spec-assessment.md).
+
+#### SQL composite slots and upgrade recovery
+
+SQLite schema **38** and PostgreSQL schema **48** add a nullable `composite_slot` without assigning
+positions to old rows. New unfolded SQL rows preserve the extractor's ordinal among components of
+one type (Token–Quantity–Token uses slots 1, 1, 2). Repeated Token, Number, Quantity, String and Date
+components are supported by SQLite and PostgreSQL unfolded readers, up to 255 components of one
+type. PostgreSQL's Legacy ordinary reader also accepts valid transitional folded Token/Number
+rows. Its Denormalized ordinary reader retains the existing folded columns: at most two Token or
+two Number components and one component of each other family. Consequently Token–Quantity–Token
+is representable; repeated String/Date/Quantity or a third Token/Number is unsupported for ordinary
+or `_contained=both` Denormalized searches. These shapes return a named 400, and `$reindex` does
+not make them representable. `_contained=true` uses unfolded rows in either PostgreSQL layout.
+
+Ordinary composite `:missing=true|false` checks only parameter presence, so it needs neither slots
+nor a representable positional shape and bypasses these SQL legacy guards. Contained `:missing`
+remains unsupported.
+
+For positional matching of a supported repeated-type parameter, SQL conservatively refuses a search
+if ambiguous old unfolded rows exist for that tenant, searched resource type, parameter and requested
+top-level or contained scope. The named 400 asks for `$reindex` even when the requested value has no matches or
+`_count=0`. Valid folded rows and distinct-type composites remain usable. MongoDB's corresponding
+guard is value-dependent: it refuses when a component's value probe encounters an old matching row.
+
+Upgrade **all writers** before rebuilding each affected tenant with `POST /$reindex` and
+`clearExisting=false` (the default with no body). Use the tenant-wide route rather than a
+type-limited rebuild: contained resources are indexed under their container's type. Poll
+`GET /$reindex-status/{job_id}` on the **same server node** until `status=completed` and
+`errorCount=0`. Keep old writers from reintroducing missing slots during or after recovery.
+
+SQL startup creates sparse indexes for the legacy probes, so the first upgrade can take longer on
+a large index. SQLite creates ordinary and contained probes; PostgreSQL creates the contained
+probe in migration 48 and the three family-aware ordinary probes only when initializing a Legacy
+layout. PostgreSQL builds these under the startup advisory lock with transaction-local statement
+timeouts disabled, restoring the session timeout afterward. Fresh Denormalized databases do not
+create the ordinary Legacy probes. Existing ambiguous rows stay nullable until the rebuild.
 
 The S3 backend is intentionally storage-focused (CRUD/version/history and the full `$bulk-submit` surface) and does not act as a full FHIR search engine; the one conditional interaction it serves is an identifier-scoped conditional create (`_id` and `identifier` criteria, decided by reading the stored objects, #1435). For bulk export, S3 can feed system-level batches through `ExportDataProvider` and can store output files through `S3OutputStore`, but export job state belongs to SQLite or PostgreSQL. `$bulk-submit` is different: S3 hosts its own job state, since the submission and manifest objects the ingestion engine writes *are* the job state — leases are compare-and-swapped against those objects' ETags, with a small cross-tenant index for claim/poll-token/TTL lookups. Patient-level and Group-level export on S3 enumerate the compartment by reading every current object of each type and applying the Patient compartment parameters in memory (`PatientCompartmentMatcher`), which is correct but scans the whole type per batch. For query-heavy deployments, use a DB/search backend as primary query engine and compose S3 as archive/history/output storage.
 
@@ -586,6 +620,32 @@ HFS_DATABASE_URL="postgresql://hfs:hfs@localhost:5432/fhir" \
   ./target/release/hfs
 ```
 
+The cross-tenant `count_by_tenant` aggregate (Tenants UI, `/admin/tenants`, console tenant
+metrics) runs in its own read-only transaction under
+`HFS_PG_COUNT_BY_TENANT_STATEMENT_TIMEOUT_MS` (default: `25000`; must be 1 to 2147483647),
+applied with `SET LOCAL statement_timeout` so the pooled session keeps
+`HFS_PG_STATEMENT_TIMEOUT_MS` for everything else. The count runs under the smaller of the two.
+Past the budget the call fails with `BackendError::Timeout` (`504` on the REST endpoints while
+the budget, plus the pool checkout and the handler's earlier work, is below `HFS_REQUEST_TIMEOUT`). The session stays owned by the count until
+PostgreSQL ends it, even if the caller is dropped first (#1826, #1911).
+
+Schema v49 adds the partial index `idx_resources_live_tenant ON resources (tenant_id) WHERE
+is_deleted = FALSE`, so the count is an index-only scan of a narrow index instead of the wider
+`idx_resources_reindex_id`. The first startup on v49 builds it with `CREATE INDEX CONCURRENTLY`
+under the migration lock: writes to `resources` continue, but the build waits for transactions
+older than it (long exports, sessions idle in a transaction) and blocks other DDL and `VACUUM` on
+the table while it runs. v49 is recorded only once the catalog shows a valid index of the expected
+shape; an interrupted build is dropped and rebuilt on the next startup. Measured on a
+~19M-resource corpus (PostgreSQL 16): 12.3 s and 125.3 MiB to build, and the warm count went from
+about 2.43 s to 1.00 s (0.60 s once `VACUUM` had set the visibility map). Operators who want the
+build out of the startup path can run it beforehand; v49 then finds it and only records the
+version:
+
+```sql
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_resources_live_tenant
+  ON resources (tenant_id) WHERE is_deleted = FALSE;
+```
+
 ### PostgreSQL + Elasticsearch
 
 PostgreSQL handles CRUD, versioning, history, and transactions with ACID guarantees. Elasticsearch handles all search operations. Combines PostgreSQL's production-grade storage with Elasticsearch's search capabilities.
@@ -630,9 +690,9 @@ MongoDB provides document-centric primary storage with full FHIR capabilities in
 - Versioning and history providers (`vread`, instance/type/system history)
 - Transaction bundles with urn:uuid reference resolution (requires replica set; see
   [cache sizing](#sizing-the-wiredtiger-cache-for-transaction-bundles))
-- Native search (string, token, reference, date, number, quantity, URI parameters; composite
-  parameters, `_text`/`_content`, and most modifiers beyond `:exact`/`:contains` are not yet
-  supported; chained/`_has` work via the REST-layer resolver)
+- Native search (string, token, reference, date, number, quantity, URI and composite parameters;
+  `_text`/`_content` and most modifiers beyond `:exact`/`:contains` are not yet supported;
+  chained/`_has` work via the REST-layer resolver)
 - `_include` and `_revinclude` resolution
 - Conditional create, update, and delete operations
 - Cursor and offset pagination; sorting by `_id`/`_lastUpdated` or by up to 15 indexed search
@@ -640,6 +700,10 @@ MongoDB provides document-centric primary storage with full FHIR capabilities in
   `_id`/`_lastUpdated`/`_score` or with cursor pagination)
 - Shared-schema multitenancy with strict tenant filtering
 - Optimistic locking with ETag support
+
+MongoDB records supported missing parameters on each resource. See
+[missing-parameter metadata](../../docs/mongodb/search-indexes.md#missing-parameter-metadata)
+for the index, compatibility behavior, rollout and definition maintenance.
 
 **Prerequisites:** A running MongoDB instance. Use standalone for basic deployments or replica set/sharded topology for transaction bundle support.
 
@@ -671,6 +735,10 @@ MongoDB runtime configuration also supports:
   Bundles run at once per server (default: `4`; `0` means no limit). See the sizing section below.
 - `HFS_MONGODB_TRANSACTION_BUNDLE_WEIGHT_ENTRIES` for the entry count of one standard Bundle
   (default: `1000`; `0` counts every Bundle as one slot).
+- `HFS_MONGODB_COUNT_BY_TENANT_MAX_TIME_MS` for the server execution budget (`maxTimeMS`) of
+  the cross-tenant `count_by_tenant` aggregate, and of no other command (default: `25000`; must
+  be 1 to 2147483647). Past it the call fails with `BackendError::Timeout`. It does not bound
+  server selection, waiting for a pooled connection or socket time.
 
 #### Sizing the WiredTiger cache for transaction Bundles
 
@@ -680,9 +748,10 @@ history rows and their search-index entries) must fit in WiredTiger's cache whil
 transaction runs, and each Bundle running at the same time needs room of its own.
 
 Past what the cache can hold, MongoDB aborts the oldest transaction ("oldest pinned transaction
-ID rolled back for eviction"). HFS retries such aborts (#1641, #1700) and returns `503` with
-`Retry-After` when the retries run out, but retries cannot fix this: the Bundles that collide
-again run into the same cache limit. A Bundle that is too large for the cache fails on every retry.
+ID rolled back for eviction"). HFS replays such aborts (#1641, #1700), except for a Bundle that
+runs alone (see below), and returns `503` with `Retry-After` when the replays run out, but
+replays cannot fix this: the Bundles that collide again run into the same cache limit. A Bundle
+that is too large for the cache fails on every replay.
 
 So HFS admits transaction Bundles while their entries fit in
 `HFS_MONGODB_MAX_CONCURRENT_TRANSACTION_BUNDLES` x `HFS_MONGODB_TRANSACTION_BUNDLE_WEIGHT_ENTRIES`
@@ -760,6 +829,21 @@ or split such Bundles. A 2 GB cache is too small for the largest Bundles of the 
 corpus: in the HFS benchmark (MongoDB with `--wiredTigerCacheSizeGB 2`, 20 virtual users, 1,000
 Synthea transaction Bundles), 8 Bundles of 6,400-7,600 entries each failed this way.
 
+MongoDB sends 388 only when the transaction holds more than 75% of the cache's dirty bytes
+(`transactionTooLargeForCacheThreshold`). When other dirty data shares the cache, the same
+rollback arrives as `WriteConflict` (112, labelled `TransientTransactionError`, "oldest pinned
+transaction ID rolled back for eviction"), or as `TemporarilyUnavailable` (365) at commit. A
+Bundle that takes the whole room (its entries are at least the limit x the weight, 4,000 by
+default) runs alone, so that rollback is its own write set meeting the cache; in the benchmark 49
+of 50 such replays failed again at nearly the same entry while holding the whole room. HFS does
+not replay it. It answers the same `500` `too-costly` as for 388 and logs one `WARN`,
+"transaction bundle rolled back for eviction while running alone; not retrying", with
+`lone=true`, `entries`, `failed_entry` (absent at commit), `error_code` and `attempt` (#1895).
+Bundles that shared the room, and plain write conflicts, are still replayed. With a weight of `0` or no limit no
+Bundle counts as alone. Raising the limit x the weight above the largest Bundle restores the
+replays, at the cost of sharing the cache. The room is per backend instance: Bundles sent to
+another HFS instance on the same MongoDB are not seen.
+
 Two caveats. In `hfs` the replay budget (`bundle_transaction_budget`: `HFS_REQUEST_TIMEOUT` less
 2 s, capped at 120 s) counts from admission. The whole call, wait included, stays within
 `HFS_REQUEST_TIMEOUT` less 2 s (`bundle_transaction_deadline`), so no replay starts that would run
@@ -774,7 +858,7 @@ container; `HFS_TEST_BUNDLE_LOAD_LIMIT`, `HFS_TEST_BUNDLE_LOAD_WEIGHT_ENTRIES`,
 `HFS_TEST_BUNDLE_LOAD_WT_CACHE_GB` and `HFS_TEST_BUNDLE_LOAD_BUNDLES` vary the run;
 `HFS_TEST_BUNDLE_LOAD_LIMIT=0` reproduces the pre-#1776 behaviour,
 `HFS_TEST_BUNDLE_LOAD_WEIGHT_ENTRIES=0` the count-based gate of #1776, and
-`HFS_TEST_BUNDLE_LOAD_EXPECT_ALL_OK=1` fails the run if any Bundle ends transient):
+`HFS_TEST_BUNDLE_LOAD_EXPECT_ALL_OK=1` fails the run if any Bundle ends transient or too-costly):
 
 ```bash
 cargo test -p helios-persistence --features mongodb --test mongodb_tests \
@@ -855,7 +939,10 @@ HFS_ELASTICSEARCH_NODES=http://localhost:9200 \
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `HFS_S3_BUCKET` | `hfs` | S3 bucket name |
+| `HFS_S3_TENANCY` | `prefix-per-tenant` | `prefix-per-tenant` or `bucket-per-tenant` |
+| `HFS_S3_BUCKET` | `hfs` | The shared bucket (prefix-per-tenant only) |
+| `HFS_S3_TENANT_BUCKETS` | (none) | Bucket-per-tenant, required: `tenant=bucket,…` including `HFS_DEFAULT_TENANT` |
+| `HFS_S3_SYSTEM_BUCKET` | (none) | Bucket-per-tenant, optional: `default_system_bucket` |
 | `HFS_S3_REGION` | (provider chain) | AWS region override |
 | `HFS_S3_PREFIX` | (none) | Optional global key prefix |
 | `HFS_S3_VALIDATE_BUCKETS` | `true` | Validate buckets on startup via `HeadBucket` |
@@ -1023,7 +1110,7 @@ let config = S3BackendConfig {
 | Mode | Description |
 |------|-------------|
 | **PrefixPerTenant** | All tenants share one bucket with tenant-specific key prefixes |
-| **BucketPerTenant** | Each tenant maps to a specific bucket via an explicit tenant→bucket map. Library mode only: the `hfs` binary has no environment for it (#1514, #1598) |
+| **BucketPerTenant** | Each tenant maps to a specific bucket via an explicit tenant→bucket map; an unmapped tenant is refused (`TenantError::UnmappedTenant`). In the `hfs` binary: `HFS_S3_TENANCY=bucket-per-tenant` + `HFS_S3_TENANT_BUCKETS` (+ optional `HFS_S3_SYSTEM_BUCKET`), #1598 |
 
 ### Object Model
 
@@ -1438,7 +1525,7 @@ The SQLite backend includes a complete FHIR search implementation using pre-comp
       number, quantity, URI, composite; supports `:exact`/`:contains`/`:not`/`:missing`/`:of-type`
       and URI `:above`/`:below`; the `:text-advanced` modifier is not yet implemented). Composite
       search works end-to-end (REST → registry-resolved components → grouped index → query).
-- [x] ChainedSearchProvider and reverse chaining (\_has)
+- [x] Chained search and reverse chaining (\_has), through the shared resolver
 - [x] Full-text search (tsvector/tsquery)
 - [x] `_sort` by `_id`/`_lastUpdated` and any indexed search parameter via a search_index
       correlated subquery (first-page and offset paths)

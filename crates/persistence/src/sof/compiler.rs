@@ -24,13 +24,10 @@ use crate::core::sof_runner::SofError;
 use super::compile_view::build_plan;
 use super::dialect::{Dialect, PgDialect, SqliteDialect};
 use super::emit::emit_plan;
-#[cfg(any(feature = "sqlite", feature = "postgres", test))]
-use super::emit::{RESOURCES_TABLE, tenant_predicate};
 use super::ir::PlanNode;
 
-/// Where a runtime cap can be applied without changing the existing sort's
-/// treatment of ties between rows produced by one resource. PostgreSQL
-/// retains its client-side cap for row-producing expansions, unions and recursion.
+/// Whether the final SELECT has the complete resource/occurrence order needed
+/// for a SQL cap. Unions and recursion retain their existing runtime cap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum OutputLimitStrategy {
     Direct,
@@ -38,15 +35,13 @@ pub(super) enum OutputLimitStrategy {
 }
 
 impl OutputLimitStrategy {
-    fn for_plan(plan: &PlanNode) -> Self {
+    pub(super) fn for_plan(plan: &PlanNode) -> Self {
         match plan {
             PlanNode::Scan { .. } => Self::Direct,
-            PlanNode::Project { parent, .. } | PlanNode::Filter { parent, .. } => {
-                Self::for_plan(parent)
-            }
-            PlanNode::LateralUnnest { .. } | PlanNode::Union(_) | PlanNode::Recurse { .. } => {
-                Self::RuntimeOnly
-            }
+            PlanNode::Project { parent, .. }
+            | PlanNode::Filter { parent, .. }
+            | PlanNode::LateralUnnest { parent, .. } => Self::for_plan(parent),
+            PlanNode::Union(_) | PlanNode::Recurse { .. } => Self::RuntimeOnly,
         }
     }
 }
@@ -136,53 +131,11 @@ pub struct CompiledPipeline {
 }
 
 /// Picks the dialect implementation for a given [`SqlDialect`].
-fn dialect_for(d: SqlDialect) -> Box<dyn Dialect> {
+pub(super) fn dialect_for(d: SqlDialect) -> Box<dyn Dialect> {
     match d {
         SqlDialect::Sqlite => Box::new(SqliteDialect),
         SqlDialect::Postgres => Box::new(PgDialect),
     }
-}
-
-/// Attaches runtime filter `conditions` (already AND-joined and parameterised)
-/// to every scan of `resources r` in compiled `sql`: each `unionAll` branch,
-/// each `repeat` seed and the `repeat` join-back, not just the last `WHERE`
-/// (#1701). Every scan carries the emitter's tenant predicate, so the
-/// conditions go right after each occurrence of it.
-///
-/// Returns [`SofError::Uncompilable`] when the number of tenant predicates
-/// differs from the number of `resources r` scans: a scan the conditions
-/// cannot be attached to must not run unfiltered.
-#[cfg(any(feature = "sqlite", feature = "postgres", test))]
-pub(super) fn attach_runtime_conditions(
-    sql: &str,
-    dialect: SqlDialect,
-    conditions: &str,
-) -> Result<String, SofError> {
-    let anchor = tenant_predicate(dialect_for(dialect).as_ref());
-    let anchors = sql.matches(anchor.as_str()).count();
-    let scans = count_resource_scans(sql);
-    if anchors == 0 || anchors != scans {
-        return Err(SofError::Uncompilable {
-            reason: format!(
-                "the patient, group and _since filters cannot be applied to every part of \
-                 this view ({anchors} tenant predicates for {scans} scans of {RESOURCES_TABLE})"
-            ),
-        });
-    }
-    Ok(sql.replace(anchor.as_str(), &format!("{anchor} AND {conditions}")))
-}
-
-/// Counts scans of `resources r`, ignoring matches inside a longer identifier.
-#[cfg(any(feature = "sqlite", feature = "postgres", test))]
-fn count_resource_scans(sql: &str) -> usize {
-    let needle = format!("{RESOURCES_TABLE} r");
-    let is_ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
-    sql.match_indices(needle.as_str())
-        .filter(|(i, m)| {
-            !sql[..*i].chars().next_back().is_some_and(is_ident)
-                && !sql[i + m.len()..].chars().next().is_some_and(is_ident)
-        })
-        .count()
 }
 
 /// Compiles a raw ViewDefinition JSON value into a [`CompiledQuery`] for SQLite.
@@ -216,9 +169,9 @@ pub fn compile_view_definition_dialect(
         .map(|(query, _)| query)
 }
 
-/// Compile once and retain the IR's row shape for PostgreSQL's runtime cap.
-/// Scalar expressions and their intrinsic LIMIT 1 remain inside projections;
-/// row-producing plan nodes retain the existing runtime-only cap.
+/// Compile once and retain the IR's row shape for the final output cap.
+/// Scalar expressions keep their intrinsic LIMIT 1 inside projections;
+/// unnests inherit their parent's strategy, including a recursive parent.
 pub(super) fn compile_view_definition_with_limit_strategy(
     view_json: &Value,
     dialect: SqlDialect,
@@ -332,12 +285,12 @@ mod tests {
             (
                 json!({"resource":"Patient","where":[{"path":"active"}],
                 "select":[{"forEach":"name","column":[{"name":"family","path":"family"}]}]}),
-                OutputLimitStrategy::RuntimeOnly,
+                OutputLimitStrategy::Direct,
             ),
             (
                 json!({"resource":"Patient","select":[{"forEachOrNull":"name",
                 "column":[{"name":"family","path":"family"}]}]}),
-                OutputLimitStrategy::RuntimeOnly,
+                OutputLimitStrategy::Direct,
             ),
             (
                 json!({"resource":"Patient","select":[{"unionAll":[
@@ -382,11 +335,12 @@ mod tests {
     }
 
     #[test]
-    fn test_indexed_lateral_under_project_and_filter_keeps_runtime_only_limit() {
+    fn test_indexed_lateral_under_project_and_filter_inherits_direct_limit() {
         use super::super::ir::{LitValue, SqlExpr};
         let scan = PlanNode::Scan {
             alias: "r".into(),
             resource_type: "Patient".into(),
+            filter: Default::default(),
         };
         let plan = PlanNode::Project {
             columns: Vec::new(),
@@ -401,6 +355,32 @@ mod tests {
                     flat_index: Some(0),
                 }),
             }),
+        };
+        assert_eq!(
+            OutputLimitStrategy::for_plan(&plan),
+            OutputLimitStrategy::Direct
+        );
+    }
+
+    #[test]
+    fn test_lateral_wrapping_recursion_keeps_runtime_only_limit() {
+        use super::super::ir::{JsonPath, LitValue, PathStep, SqlExpr};
+        let plan = PlanNode::LateralUnnest {
+            parent: Box::new(PlanNode::Recurse {
+                parent: Box::new(PlanNode::Scan {
+                    alias: "r".into(),
+                    resource_type: "QuestionnaireResponse".into(),
+                    filter: Default::default(),
+                }),
+                seed_root: "r.data".to_string(),
+                step_paths: vec![JsonPath(vec![PathStep::Field("item".into())])],
+                out_alias: "rec_0".into(),
+            }),
+            source: SqlExpr::Lit(LitValue::Null),
+            out_alias: "fe".into(),
+            left_join: false,
+            on_filter: None,
+            flat_index: None,
         };
         assert_eq!(
             OutputLimitStrategy::for_plan(&plan),
@@ -544,8 +524,9 @@ mod tests {
         });
         let q = compile(view).unwrap();
         assert_eq!(q.columns, vec!["family", "use"]);
+        // Type-guarded so a singleton object is not iterated member-wise.
         assert!(
-            q.sql.contains("JOIN json_each(r.data, '$.name') fe ON 1=1"),
+            q.sql.contains("JOIN json_each(CASE WHEN json_type(r.data, '$.name') = 'array' THEN json_extract(r.data, '$.name')") && q.sql.contains("ELSE '[]' END) fe ON 1=1"),
             "{}",
             q.sql
         );
@@ -570,8 +551,8 @@ mod tests {
         });
         let q = compile(view).unwrap();
         assert!(
-            q.sql
-                .contains("LEFT JOIN json_each(r.data, '$.name') fe ON 1=1"),
+            q.sql.contains("LEFT JOIN json_each(CASE WHEN json_type(r.data, '$.name') = 'array' THEN json_extract(r.data, '$.name')")
+                && q.sql.contains("ELSE '[]' END) fe ON 1=1"),
             "{}",
             q.sql
         );
@@ -601,8 +582,9 @@ mod tests {
             "{}",
             q.sql
         );
+        // Type-guarded so a singleton object is not iterated member-wise.
         assert!(
-            q.sql.contains("JOIN json_each(r.data, '$.name') fe ON 1=1"),
+            q.sql.contains("JOIN json_each(CASE WHEN json_type(r.data, '$.name') = 'array' THEN json_extract(r.data, '$.name')") && q.sql.contains("ELSE '[]' END) fe ON 1=1"),
             "{}",
             q.sql
         );
@@ -627,50 +609,6 @@ mod tests {
             "expected UNION ALL in compiled SQL: {}",
             q.sql
         );
-    }
-
-    #[test]
-    fn test_attach_runtime_conditions_refuses_a_scan_without_the_tenant_predicate() {
-        for dialect in [SqlDialect::Sqlite, SqlDialect::Postgres] {
-            let bare = "SELECT r.id FROM resources r WHERE r.id = 'x'";
-            assert!(matches!(
-                attach_runtime_conditions(bare, dialect, "1=0"),
-                Err(SofError::Uncompilable { .. })
-            ));
-
-            let view = json!({
-                "resourceType": "ViewDefinition",
-                "resource": "Patient",
-                "status": "active",
-                "select": [{"column": [{"path": "id", "name": "id"}]}]
-            });
-            let flat =
-                compile_view_definition_dialect(&view, dialect, FhirVersion::default_enabled())
-                    .unwrap();
-            let extra_scan = format!("{} UNION ALL SELECT r.id FROM resources r", flat.sql);
-            assert!(matches!(
-                attach_runtime_conditions(&extra_scan, dialect, "1=0"),
-                Err(SofError::Uncompilable { .. })
-            ));
-
-            let union_view = json!({
-                "resourceType": "ViewDefinition",
-                "resource": "Patient",
-                "status": "active",
-                "select": [{"unionAll": [
-                    {"column": [{"path": "id", "name": "id"}]},
-                    {"column": [{"path": "id", "name": "id"}]}
-                ]}]
-            });
-            let union = compile_view_definition_dialect(
-                &union_view,
-                dialect,
-                FhirVersion::default_enabled(),
-            )
-            .unwrap();
-            let attached = attach_runtime_conditions(&union.sql, dialect, "1=0").unwrap();
-            assert_eq!(attached.matches(" AND 1=0").count(), 2, "{attached}");
-        }
     }
 
     #[test]
@@ -719,12 +657,12 @@ mod tests {
         assert_eq!(q.columns, vec!["family", "city"]);
         // First unnest keeps the `fe` alias (legacy), second uses `fe2`.
         assert!(
-            q.sql.contains("JOIN json_each(r.data, '$.name') fe ON"),
+            q.sql.contains("JOIN json_each(CASE WHEN json_type(r.data, '$.name') = 'array' THEN json_extract(r.data, '$.name')") && q.sql.contains("END) fe ON"),
             "{}",
             q.sql
         );
         assert!(
-            q.sql.contains("JOIN json_each(r.data, '$.address') fe2 ON"),
+            q.sql.contains("JOIN json_each(CASE WHEN json_type(r.data, '$.address') = 'array' THEN json_extract(r.data, '$.address')") && q.sql.contains("END) fe2 ON"),
             "{}",
             q.sql
         );
@@ -1019,6 +957,179 @@ mod tests {
         assert_eq!(q.columns, vec!["id", "linkId", "text"]);
         assert!(q.sql.contains("WITH RECURSIVE"), "{}", q.sql);
         assert!(q.sql.contains("UNION ALL"), "{}", q.sql);
+    }
+
+    /// A `Questionnaire` view whose select list is `select`.
+    fn questionnaire_view(select: serde_json::Value) -> serde_json::Value {
+        json!({
+            "resourceType": "ViewDefinition",
+            "resource": "Questionnaire",
+            "status": "active",
+            "select": select
+        })
+    }
+
+    /// Compiles `view` for both SQL dialects and returns `(sqlite, postgres)`.
+    fn compile_both(view: serde_json::Value) -> (CompiledQuery, CompiledQuery) {
+        let sqlite = compile(view.clone()).expect("sqlite compiles");
+        let postgres = compile_pg(view).expect("postgres compiles");
+        (sqlite, postgres)
+    }
+
+    #[test]
+    fn test_repeat_inside_foreach_compiles() {
+        let view = questionnaire_view(json!([
+            {"column": [{"path": "id", "name": "id"}]},
+            {"forEach": "item", "select": [
+                {"column": [{"path": "linkId", "name": "top"}]},
+                {"repeat": ["item"], "column": [{"path": "linkId", "name": "child"}]}
+            ]}
+        ]));
+        let (sqlite, postgres) = compile_both(view);
+        for q in [&sqlite, &postgres] {
+            assert_eq!(q.columns, vec!["id", "top", "child"]);
+            assert!(q.sql.contains("WITH RECURSIVE"), "{}", q.sql);
+        }
+    }
+
+    #[test]
+    fn test_nested_and_sibling_repeats_compile() {
+        let nested = questionnaire_view(json!([
+            {"repeat": ["item"], "select": [
+                {"column": [{"path": "linkId", "name": "parent"}]},
+                {"repeat": ["item"], "column": [{"path": "linkId", "name": "child"}]}
+            ]}
+        ]));
+        let siblings = questionnaire_view(json!([
+            {"repeat": ["item"], "column": [{"path": "linkId", "name": "a"}]},
+            {"repeat": ["item"], "column": [{"path": "linkId", "name": "b"}]}
+        ]));
+        for (what, view, columns) in [
+            ("nested", nested, vec!["parent", "child"]),
+            ("siblings", siblings, vec!["a", "b"]),
+        ] {
+            let (sqlite, postgres) = compile_both(view);
+            for q in [&sqlite, &postgres] {
+                assert_eq!(q.columns, columns, "{what}");
+                assert!(q.sql.contains("WITH RECURSIVE"), "{what}: {}", q.sql);
+                // One recursive CTE per `repeat`.
+                assert!(q.sql.contains("rec_"), "{what}: {}", q.sql);
+            }
+        }
+    }
+
+    #[test]
+    fn test_union_all_nested_in_select_becomes_root_union() {
+        // `unionAll` inside a nested `select` of a `forEach` is distributed
+        // to the root: one branch per alternative, joined by `UNION ALL`.
+        let view = json!({
+            "resourceType": "ViewDefinition",
+            "resource": "Patient",
+            "status": "active",
+            "select": [
+                {"column": [{"path": "id", "name": "id"}]},
+                {"forEach": "contact", "select": [
+                    {"unionAll": [
+                        {"forEach": "telecom", "column": [{"path": "value", "name": "value"}]},
+                        {"column": [{"path": "name.family", "name": "value"}]}
+                    ]}
+                ]}
+            ]
+        });
+        let (sqlite, postgres) = compile_both(view);
+        for q in [&sqlite, &postgres] {
+            assert_eq!(q.columns, vec!["id", "value"]);
+            assert!(q.sql.contains("UNION ALL"), "{}", q.sql);
+        }
+    }
+
+    #[test]
+    fn test_union_all_inside_repeat_keeps_the_descent() {
+        // The recursion must survive in every branch (it used to be dropped,
+        // yielding resource-level rows instead of one per visited node).
+        let view = questionnaire_view(json!([
+            {"repeat": ["item"], "unionAll": [
+                {"column": [{"path": "'link'", "name": "kind"}, {"path": "linkId", "name": "value"}]},
+                {"column": [{"path": "'text'", "name": "kind"}, {"path": "text", "name": "value"}]}
+            ]}
+        ]));
+        let (sqlite, postgres) = compile_both(view);
+        for q in [&sqlite, &postgres] {
+            assert_eq!(q.columns, vec!["kind", "value"]);
+            assert!(q.sql.contains("WITH RECURSIVE"), "{}", q.sql);
+            assert!(q.sql.contains("UNION ALL"), "{}", q.sql);
+        }
+    }
+
+    #[test]
+    fn test_repeat_with_foreach_in_one_clause_is_still_rejected() {
+        // The in-process lint rejects this combination too.
+        let view = questionnaire_view(json!([
+            {"forEach": "item", "repeat": ["item"], "column": [{"path": "linkId", "name": "l"}]}
+        ]));
+        assert!(compile(view).is_err());
+    }
+
+    #[test]
+    fn test_indexed_foreach_combined_with_repeat_compiles() {
+        // A trailing-`[N]` forEach next to / under a `repeat` lowers to a
+        // filter the keyed-CTE emitter applies in the main query.
+        let sibling = questionnaire_view(json!([
+            {"forEach": "item[0]", "column": [{"path": "linkId", "name": "first"}]},
+            {"repeat": ["item"], "column": [{"path": "linkId", "name": "l"}]}
+        ]));
+        let nested = questionnaire_view(json!([
+            {"repeat": ["item"], "select": [
+                {"forEach": "item[0]", "column": [{"path": "linkId", "name": "l"}]}
+            ]}
+        ]));
+        for view in [sibling, nested] {
+            let (sqlite, postgres) = compile_both(view);
+            for q in [&sqlite, &postgres] {
+                assert!(q.sql.contains("WITH RECURSIVE"), "{}", q.sql);
+            }
+        }
+    }
+
+    #[test]
+    fn test_empty_for_each_or_null_keeps_the_null_row_below_a_repeat() {
+        let view = questionnaire_view(json!([
+            {"forEachOrNull": "item", "select": [
+                {"column": [{"path": "linkId", "name": "top"}]},
+                {"repeat": ["item"], "column": [{"path": "linkId", "name": "l"}]}
+            ]}
+        ]));
+        let (sqlite, postgres) = compile_both(view);
+        for q in [&sqlite, &postgres] {
+            assert!(q.sql.contains("LEFT JOIN rec_1 ON"), "{}", q.sql);
+            assert!(q.sql.contains("rec_1.rid IS NOT NULL OR"), "{}", q.sql);
+        }
+    }
+
+    #[test]
+    fn test_nested_select_under_indexed_foreach_compiles() {
+        // A trailing-`[N]` forEach with a nested `select` unnests a one-element
+        // array holding the N-th flattened element, so nested clauses iterate
+        // relative to it.
+        let view = questionnaire_view(json!([
+            {"forEach": "item[0]", "select": [
+                {"column": [{"path": "linkId", "name": "l"}]},
+                {"forEach": "item", "column": [{"path": "linkId", "name": "c"}]}
+            ]}
+        ]));
+        let (sqlite, postgres) = compile_both(view);
+        assert!(sqlite.sql.contains("json_array("), "{}", sqlite.sql);
+        assert!(sqlite.sql.contains("LIMIT 1 OFFSET 0"), "{}", sqlite.sql);
+        assert!(
+            postgres.sql.contains("jsonb_build_array("),
+            "{}",
+            postgres.sql
+        );
+        assert!(
+            postgres.sql.contains("LIMIT 1 OFFSET 0"),
+            "{}",
+            postgres.sql
+        );
     }
 
     #[test]
@@ -1340,6 +1451,27 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_nul_in_a_computed_unnest_focus_is_rejected() {
+        // The second where iterates a computed extension() result. Its
+        // focus used to suppress the first where's literal-lowering error.
+        for path in [
+            "extension('a\\u0000b').where(true).exists()",
+            "extension('a\0b').where(true).exists()",
+        ] {
+            let view = where_view(path);
+            for (label, result) in [
+                ("sqlite", compile(view.clone())),
+                ("postgres", compile_pg(view)),
+            ] {
+                let Err(SofError::Uncompilable { reason }) = result else {
+                    panic!("{label}: expected NUL source to be refused")
+                };
+                assert!(reason.contains("NUL"), "{label}: {reason}");
+            }
+        }
+    }
+
     // --- Per-column decode modes (#1769) ---
 
     fn decodes(view: Value) -> Vec<ColumnDecode> {
@@ -1406,7 +1538,7 @@ mod tests {
     }
 
     #[test]
-    fn test_untyped_unresolved_stays_auto() {
+    fn test_untyped_unresolved_projects_json_representation() {
         let view = json!({
             "resourceType": "ViewDefinition",
             "resource": "Patient",
@@ -1421,12 +1553,19 @@ mod tests {
                 ]
             }]
         });
-        // `family` resolves through the forEach focus type; the rest can't.
-        let d = decodes(view);
+        // `family` resolves through the forEach focus type; `exists()` is
+        // boolean by construction; `notAField` can't be typed, so it is
+        // projected as its JSON representation and parsed as JSON.
+        let q = compile(view).unwrap();
         assert_eq!(
-            d,
-            vec![ColumnDecode::Text, ColumnDecode::Auto, ColumnDecode::Auto]
+            q.column_decodes,
+            vec![
+                ColumnDecode::Text,
+                ColumnDecode::Boolean,
+                ColumnDecode::Json
+            ]
         );
+        assert!(q.sql.contains("(r.data -> '$.notAField')"), "{}", q.sql);
     }
 
     #[test]
@@ -1481,7 +1620,7 @@ mod tests {
     }
 
     #[test]
-    fn test_untyped_repeating_last_field_stays_auto() {
+    fn test_untyped_repeating_last_field_projects_json_representation() {
         let view = json!({
             "resourceType": "ViewDefinition",
             "resource": "Patient",
@@ -1494,7 +1633,7 @@ mod tests {
         });
         assert_eq!(
             decodes(view),
-            vec![ColumnDecode::Auto, ColumnDecode::Auto, ColumnDecode::Text]
+            vec![ColumnDecode::Json, ColumnDecode::Json, ColumnDecode::Text]
         );
     }
 }

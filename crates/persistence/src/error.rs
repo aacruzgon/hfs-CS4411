@@ -168,6 +168,25 @@ pub enum TenantError {
         tenant_id: TenantId,
     },
 
+    /// The tenant is well-formed but this deployment has nowhere to store it.
+    ///
+    /// Raised by the S3 backend in bucket-per-tenant mode for a tenant absent
+    /// from its tenant→bucket map, both when a request names such a tenant and
+    /// when `register_tenant` is asked to provision one: registering it would
+    /// succeed and then every request for it would fail, so the mint point is
+    /// refused instead. Distinct from [`InvalidTenant`](Self::InvalidTenant)
+    /// because the fix is operational (map the tenant to a bucket and restart),
+    /// not a malformed id, and the message has to say so.
+    // One line on purpose: thiserror re-emits the literal, and a `\`-continued
+    // literal reached the wire with its indentation intact.
+    #[error(
+        "tenant '{tenant_id}' has no bucket assigned: bucket-per-tenant storage serves only the tenants in its tenant-to-bucket map; add the tenant and its bucket to the map and restart"
+    )]
+    UnmappedTenant {
+        /// The tenant that has no bucket.
+        tenant_id: TenantId,
+    },
+
     /// A tenant id offered for provisioning is not canonical.
     ///
     /// Distinct from [`InvalidTenant`](Self::InvalidTenant) because it carries
@@ -480,7 +499,10 @@ pub enum TransactionError {
     /// The transaction's uncommitted writes did not fit in the backend's
     /// storage-engine cache, and the backend rolled it back (#1837). For MongoDB
     /// this is `TransactionTooLargeForCache` (388): WiredTiger's "transaction is
-    /// too large and will not fit in the storage engine cache".
+    /// too large and will not fit in the storage engine cache". It is also a
+    /// cache-pressure rollback (112 "rolled back for eviction", or 365) of a
+    /// Bundle that held the whole admission room and so ran alone, which a
+    /// replay meets again (#1895).
     ///
     /// Distinct from [`Transient`](Self::Transient): running it again meets the
     /// same cache, so the backend does not. Distinct from
@@ -1083,10 +1105,12 @@ const MONGO_EXCEEDED_TIME_LIMIT: i32 = 262;
 /// - everything else — unchanged: [`BackendError::Internal`], byte-for-byte the
 ///   message this helper's callers produced before.
 ///
-/// Note that HFS does not currently set `maxTimeMS` on its queries, so the
-/// timeout arm fires only when the deadline comes from the server or a
-/// connection-string option. Wiring an HFS-side query deadline is tracked
-/// separately; the classification is in place either way.
+/// HFS sets `maxTimeMS` on one command only: the cross-tenant
+/// `count_by_tenant` aggregate (#1828,
+/// `MongoBackendConfig::count_by_tenant_max_time_ms`). Elsewhere the timeout
+/// arm fires only when the deadline comes from the server or a
+/// connection-string option. `maxTimeMS` bounds server execution at interrupt
+/// points; server selection, pool checkout and socket time are outside it.
 #[cfg(feature = "mongodb")]
 pub fn classify_mongodb_error(context: &str, err: mongodb::error::Error) -> BackendError {
     use mongodb::error::ErrorKind;

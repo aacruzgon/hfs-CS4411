@@ -5,7 +5,6 @@
 //! - [`MultiTypeSearchProvider`] - Search across multiple resource types
 //! - [`IncludeProvider`] - Support for _include
 //! - [`RevincludeProvider`] - Support for _revinclude
-//! - [`ChainedSearchProvider`] - Chained parameters and _has
 //! - [`TerminologySearchProvider`] - :above, :below, :in, :not-in
 //! - [`TextSearchProvider`] - Full-text search (_text, _content, :text)
 
@@ -20,8 +19,8 @@ use crate::error::StorageResult;
 use crate::search::{IndexValue, SearchParameterExtractor, SearchParameterRegistry};
 use crate::tenant::TenantContext;
 use crate::types::{
-    IncludeDirective, IncludeType, Page, ReverseChainedParameter, SearchBundle, SearchParamType,
-    SearchParameter, SearchQuery, SearchValue, StoredResource,
+    IncludeDirective, IncludeType, Page, SearchBundle, SearchParamType, SearchParameter,
+    SearchQuery, SearchValue, StoredResource,
 };
 
 use super::storage::ResourceStorage;
@@ -500,6 +499,23 @@ pub trait SearchProvider: ResourceStorage {
             .map(|resource| resource.id().to_string()))
     }
 
+    /// The indexed values of the reference parameter `reference_param` on
+    /// every current resource matching `query`, in one pass and without
+    /// paging (#1930). Each value is the reference exactly as the search
+    /// index stores it, which is what the chain resolver would extract from
+    /// the resource itself. `None` means the provider has no such path for
+    /// this query; the resolver then drains the matches page by page and
+    /// extracts the references itself.
+    async fn search_reference_values(
+        &self,
+        tenant: &TenantContext,
+        query: &SearchQuery,
+        reference_param: &str,
+    ) -> StorageResult<Option<Vec<String>>> {
+        let _ = (tenant, query, reference_param);
+        Ok(None)
+    }
+
     /// Counts resources matching the query without returning them.
     ///
     /// This is more efficient than search when you only need the count.
@@ -940,56 +956,6 @@ fn active_labels(includes: &[IncludeDirective], first_hop: bool) -> String {
         .join(",")
 }
 
-/// Search provider that supports chained parameters and _has.
-///
-/// Chained parameters search on referenced resources:
-/// `Observation?patient.name=Smith`
-///
-/// _has searches for resources referenced by other resources:
-/// `Patient?_has:Observation:patient:code=1234-5`
-#[async_trait]
-pub trait ChainedSearchProvider: SearchProvider {
-    /// Evaluates a chained search and returns matching resource IDs.
-    ///
-    /// This is used internally to resolve chains before the main search.
-    ///
-    /// # Arguments
-    ///
-    /// * `tenant` - The tenant context for this operation
-    /// * `base_type` - The base resource type being searched
-    /// * `chain` - The chain path (e.g., "patient.organization.name")
-    /// * `value` - The value to match
-    ///
-    /// # Returns
-    ///
-    /// IDs of base resources that match the chain condition.
-    async fn resolve_chain(
-        &self,
-        tenant: &TenantContext,
-        base_type: &str,
-        chain: &str,
-        value: &str,
-    ) -> StorageResult<Vec<String>>;
-
-    /// Evaluates a reverse chain (_has) and returns matching resource IDs.
-    ///
-    /// # Arguments
-    ///
-    /// * `tenant` - The tenant context for this operation
-    /// * `base_type` - The base resource type being searched
-    /// * `reverse_chain` - The reverse chain parameters
-    ///
-    /// # Returns
-    ///
-    /// IDs of base resources that are referenced by matching resources.
-    async fn resolve_reverse_chain(
-        &self,
-        tenant: &TenantContext,
-        base_type: &str,
-        reverse_chain: &ReverseChainedParameter,
-    ) -> StorageResult<Vec<String>>;
-}
-
 /// Search provider that supports terminology-aware modifiers.
 ///
 /// These modifiers require integration with a terminology service:
@@ -1088,21 +1054,13 @@ pub trait TextSearchProvider: SearchProvider {
 ///
 /// This is a convenience trait that combines all search capabilities.
 pub trait FullSearchProvider:
-    SearchProvider
-    + MultiTypeSearchProvider
-    + IncludeProvider
-    + RevincludeProvider
-    + ChainedSearchProvider
+    SearchProvider + MultiTypeSearchProvider + IncludeProvider + RevincludeProvider
 {
 }
 
 // Blanket implementation for types that implement all required traits
 impl<T> FullSearchProvider for T where
-    T: SearchProvider
-        + MultiTypeSearchProvider
-        + IncludeProvider
-        + RevincludeProvider
-        + ChainedSearchProvider
+    T: SearchProvider + MultiTypeSearchProvider + IncludeProvider + RevincludeProvider
 {
 }
 

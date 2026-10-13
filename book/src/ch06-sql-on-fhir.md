@@ -338,9 +338,74 @@ curl -X POST http://localhost:8080/\$sql-run \
 
 ---
 
+## HFS stored-data ordering
+
+For the same stored resources, tenant, ViewDefinition and filters, HFS's
+SQLite and PostgreSQL runners apply the following ordering contract.
+
+| Runner and view shape | Row order and preview | Collection cells |
+|-----------------------|-----------------------|------------------|
+| **SQLite/PostgreSQL, flat** | Ascending stored update timestamp, then bytewise resource ID. Preview is a prefix of unlimited output, and of export on SQLite. | Source occurrence order. |
+| **SQLite/PostgreSQL, forEach/forEachOrNull without unionAll/repeat** | The same resource order, then the source occurrence tuple. Preview is a prefix of unlimited output, and of export on SQLite. | Source occurrence order. |
+| **PostgreSQL export (`$sql-export`), all view shapes** | Ascending bytewise resource ID, then the source occurrence tuple for expanded views. Export is not ordered by update timestamp, so preview is not a prefix of export. | Source occurrence order. |
+| **PostgreSQL, unionAll/repeat** | No total global order guarantee; the output cap remains on the client. | Source occurrence order. |
+| **SQLite, unionAll/repeat** | No total global order guarantee; the legacy final SQL LIMIT remains. | Source occurrence order. |
+| **Other runners and the standalone evaluator** | Existing behavior; this stored-data SQL contract adds no ordering guarantee. | Existing behavior. |
+
+The occurrence tuple follows select declaration and path order, including
+nested, chained and Cartesian expansions. Empty nullable expansions retain
+their placeholder occurrence. Each collection array and `join()` string
+follows its own source iterations. A scalar first-match `where()` pick, such
+as `name.where(use = 'official').first().family`, selects the first matching
+source occurrence. These cell rules also apply inside SQL-compilable
+`unionAll` and `repeat` views; content, cardinality, casts and null handling
+remain unchanged.
+
+For the covered flat and expanded roots, `_limit=N` returns the first N
+rows of unlimited output. On SQLite, export preserves that same sequence;
+read shards in manifest order. This comparison assumes unchanged data and
+identical filters. The requested output cap is applied once after filtering
+and ordering; intrinsic scalar picks retain their own limits.
+
+On PostgreSQL, `$sql-export` reads each view in pages of resources in
+bytewise resource ID order, so that a view over a large resource type does
+not have to sort the whole type before returning its first row. Read shards
+in manifest order. Each page is a separate statement, so an export does not
+read from a single database snapshot: a resource created or deleted while
+the export runs may or may not appear, while resources that stay unchanged are neither
+repeated nor skipped. `unionAll` and `repeat` views are paged the same way
+and keep their lack of a total global order.
+
+The [#1623 regression](https://github.com/HeliosSoftware/hfs/issues/1623)
+uses `p-large` with 150 names, `p-empty` with no names and `p-filtered` with
+one temporary name. A `forEachOrNull: "name"` view produces 152 unlimited
+rows. Within `p-large`, `Family-1`, `Family-2` and `Family-3` retain their
+source order. `_limit=50` returns the first 50 rows of that full sequence,
+including any preceding nullable rows, with the same data and filters.
+
+A `forEach` inside `unionAll` or `repeat` follows its parent's legacy
+exception. Total global order for those shapes, and changes to indexed
+paths or `%rowIndex`, remain follow-up work in
+[#1867](https://github.com/HeliosSoftware/hfs/issues/1867).
+
+Previously tied expanded rows and unordered collection cells may now appear
+in a different sequence. The additional sort keys can increase query cost,
+especially for unlimited output; a preview limit does not guarantee that
+the database reads only N source rows.
+
+---
+
 ## SQL Query and SQL View Subjects
 
 The HFS server's `$sql-run` and `$sql-export` operations accept a SQL Query or SQL View Library as the subject, as well as a ViewDefinition. A ViewDefinition runs inside the storage backend (SQL on SQLite and PostgreSQL, an aggregation pipeline on MongoDB). A SQL Query or SQL View does not: its SQL runs in an embedded SQLite database that is created for each request, whichever backend stores the data. Before that SQL runs, each `depends-on` ViewDefinition or nested SQL View is materialized into the embedded database in full, and the query's `WHERE` clause is applied afterwards, to the materialized rows. Each dependency is therefore subject to a per-dependency row cap, `HFS_SOF_SQLQUERY_MAX_SOURCE_ROWS_PER_VD` (default 1,000,000). A dependency that produces more rows fails the request with a `422` that names the dependency. To stay under the cap, narrow the dependency itself by adding a `where` to its ViewDefinition, so the filtering happens before the rows are materialized. Raising the cap also works, but it loads more rows into the request's memory. A Library may declare at most 4 × `HFS_SOF_SQLQUERY_MAX_VDS` `depends-on` entries (64 by default) and a request at most 256 `context` entries; exceeding either is a `400` before that Library's own dependencies are fetched. `$sql-export` also accepts at most 64 `subject` entries, both operations accept at most 1000 `patient` plus `group` values, and a tenant may have at most `HFS_EXPORT_MAX_JOBS_PER_TENANT` (default 8) export jobs queued or running, with a `429` and `Retry-After` beyond that.
+
+A `unionAll` ViewDefinition can be a dependency of either Library type. Its dependency table has one column per distinct name, retaining the first declaration's position and type; every branch contributes its rows, including duplicates. The SQL emitters still require the branches to declare the same columns in the same order.
+
+For `$sql-run` on HFS and sof-server, a `patient` or `group` body parameter must contain a nonblank `valueReference.reference` or `valueString`. The value is trimmed. Identifier-only or display-only references, unsupported value fields, and empty values return a `400` OperationOutcome naming the parameter. HFS applies this rule to inline resources, stored ViewDefinitions and Library subjects; `$sql-export` uses the same rule.
+
+Stored-data runners on SQLite, PostgreSQL and S3 use `HFS_DEFAULT_FHIR_VERSION` for FHIR metadata. A server configured for R5 therefore uses R5 cardinality and compartment rules; correcting an earlier R4 default can change stored-data results on such a server.
+
+When SQLite or PostgreSQL cannot lower a computed iteration source, a direct ViewDefinition `$sql-run` returns `422`, including a NUL string literal inside a nested `extension()` or `where()` focus. It no longer substitutes an empty source. A non-path `forEach` source remains unsupported. A compilation failure inside a SQL Query or SQL View dependency currently surfaces as `500`; preserving its `422` through dependency execution is tracked in [#1864](https://github.com/HeliosSoftware/hfs/issues/1864).
 
 These limits apply to SQL Query and SQL View subjects of `$sql-run` and `$sql-export`:
 

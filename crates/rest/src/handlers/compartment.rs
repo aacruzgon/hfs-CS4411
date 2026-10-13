@@ -99,6 +99,7 @@ where
 
     // A parameter with no value is ignored, as in a type-level search (#1380).
     let pairs = crate::extractors::drop_empty_parameters(pairs);
+    crate::handlers::search::validate_membership_params(&pairs, fhir_version)?;
     let mut search_params = SearchParams::from_pairs(pairs);
 
     // Unknown search parameters. Per FHIR search error handling these may be
@@ -151,7 +152,7 @@ where
         .min(state.max_page_size());
     query.count = Some(count as u32);
 
-    let query = resolve_out_of_band(&state, &tenant, query).await?;
+    let query = resolve_out_of_band(&state, &tenant, query, fhir_version).await?;
 
     // Execute the search
     let result = state
@@ -234,6 +235,7 @@ where
     let compartment_ref = format!("{}/{}", compartment_type, compartment_id);
     // A parameter with no value is ignored, as in a type-level search (#1380).
     let pairs = crate::extractors::drop_empty_parameters(pairs);
+    crate::handlers::search::validate_membership_params(&pairs, fhir_version)?;
     let mut search_params = SearchParams::from_pairs(pairs);
 
     // Member types of this compartment, resolved once: they decide both which
@@ -346,13 +348,20 @@ where
         }
     }
 
+    // Validate without resolving lists or chains. Even a zero-sized page must
+    // refuse unsupported contained search and incompatible criteria before the
+    // cap prevents any member-type search from executing.
+    for query in &queries {
+        validate_out_of_band(state.storage().supports_contained_search(), query)?;
+    }
+
     // Run each member-type search, accumulating matches up to the page-size cap.
     let mut collected: Vec<helios_persistence::types::StoredResource> = Vec::new();
     for query in queries {
         if collected.len() >= count {
             break;
         }
-        let query = &resolve_out_of_band(&state, &tenant, query).await?;
+        let query = &resolve_out_of_band(&state, &tenant, query, fhir_version).await?;
         match state.storage().search(tenant.context(), query).await {
             Ok(result) => collected.extend(result.resources.items),
             Err(e) => {
@@ -418,12 +427,43 @@ async fn resolve_out_of_band<S>(
     state: &AppState<S>,
     tenant: &TenantExtractor,
     query: helios_persistence::types::SearchQuery,
+    fhir_version: helios_fhir::FhirVersion,
 ) -> RestResult<helios_persistence::types::SearchQuery>
 where
     S: ResourceStorage + SearchProvider + Send + Sync,
 {
+    validate_out_of_band(state.storage().supports_contained_search(), &query)?;
+    if let Some(functional) = query.list.iter().find(|v| v.starts_with('$')) {
+        return Err(RestError::NotImplemented {
+            feature: format!(
+                "functional list '{functional}' is not supported; \
+                 use '_list=[List id]' with a stored List resource"
+            ),
+        });
+    }
+    let query = helios_persistence::search::resolve_list(state.storage(), tenant.context(), &query)
+        .await
+        .map_err(RestError::from)?;
+    let query = crate::handlers::search::resolve_membership(
+        state.storage(),
+        tenant.context(),
+        query,
+        fhir_version,
+    )
+    .await?;
+    helios_persistence::search::resolve_chains(state.storage(), tenant.context(), &query)
+        .await
+        .map_err(RestError::from)
+}
+
+/// Checks criteria that require no storage reads, including for wildcard pages
+/// that do not execute a search. Resolution stays in `resolve_out_of_band`.
+fn validate_out_of_band(
+    supports_contained_search: bool,
+    query: &helios_persistence::types::SearchQuery,
+) -> RestResult<()> {
     if query.contained != helios_persistence::types::ContainedMode::Off {
-        if !state.storage().supports_contained_search() {
+        if !supports_contained_search {
             return Err(RestError::NotImplemented {
                 feature: "'_contained' search is not supported by this storage backend".to_string(),
             });
@@ -431,6 +471,8 @@ where
         let chained = query.parameters.iter().find(|p| !p.chain.is_empty());
         let refused = if !query.list.is_empty() {
             Some("_list".to_string())
+        } else if helios_persistence::search::query_has_in(query) {
+            Some("_in".to_string())
         } else if !query.reverse_chains.is_empty() {
             Some("_has".to_string())
         } else {
@@ -450,20 +492,7 @@ where
         }
     }
 
-    if let Some(functional) = query.list.iter().find(|v| v.starts_with('$')) {
-        return Err(RestError::NotImplemented {
-            feature: format!(
-                "functional list '{functional}' is not supported; \
-                 use '_list=[List id]' with a stored List resource"
-            ),
-        });
-    }
-    let query = helios_persistence::search::resolve_list(state.storage(), tenant.context(), &query)
-        .await
-        .map_err(RestError::from)?;
-    helios_persistence::search::resolve_chains(state.storage(), tenant.context(), &query)
-        .await
-        .map_err(RestError::from)
+    Ok(())
 }
 
 /// Applies FHIR unknown-parameter handling to a compartment search.

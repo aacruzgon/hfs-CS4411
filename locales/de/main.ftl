@@ -148,6 +148,33 @@ tenants-delete-confirm = Mandant „{ $id }" abmelden? Die gespeicherten Daten b
 tenants-row-provisioning = Wird bereitgestellt … das kann einen Moment dauern.
 tenants-row-failed = Der Mandant konnte nicht bereitgestellt werden.
 tenants-dismiss = Verwerfen
+tenants-stat-total-sub-partial = { $count ->
+    [one] { $count } registriert · Erkennung unvollständig
+   *[other] { $count } registriert · Erkennung unvollständig
+}
+tenants-stat-resources-sub-stale = über alle Mandanten · möglicherweise veraltet
+tenants-stat-pending = Wird gezählt …
+tenants-stat-unavailable = Derzeit nicht verfügbar
+tenants-stat-unsupported = Auf diesem Speicher nicht verfügbar
+tenants-counts-pending = Ressourcen aller Mandanten werden gezählt …
+tenants-counts-refreshing = Zählung wird aktualisiert; angezeigt wird der Stand von { $time }.
+tenants-counts-ready = Ressourcen gezählt: { $time }.
+tenants-counts-partial = Ressourcen gezählt: { $time }, aber nicht alle Mandanten konnten geprüft werden.
+tenants-counts-stale = Die Zählung von { $time } ist möglicherweise veraltet: Die letzte Zählung ist fehlgeschlagen.
+tenants-counts-unavailable = Ressourcenzählungen sind derzeit nicht verfügbar.
+tenants-counts-unsupported = Dieser Speicher kann Ressourcen nicht pro Mandant zählen.
+tenants-counts-presence = Dieser Speicher meldet, welche Mandanten Daten enthalten, nicht wie viele Ressourcen.
+tenants-counts-approx-pointers = Die Zählungen sind ungefähr: Speicherzeiger, gelöschte Ressourcen eingeschlossen.
+tenants-counts-approx-index = Die Zählungen stammen aus dem Suchindex und können neuen Schreibvorgängen hinterherhinken.
+tenants-counts-refresh = Aktualisieren
+tenants-count-pending = Wird gezählt …
+tenants-count-unknown = Unbekannt
+tenants-count-unsupported = Auf diesem Speicher nicht gezählt
+tenants-count-unavailable = Zählung nicht verfügbar
+tenants-count-present = enthält Daten
+tenants-count-present-note = Enthält Daten; dieser Speicher zählt sie nicht
+tenants-count-stale = möglicherweise veraltet
+tenants-count-approx = ungefähr, keine exakte Zählung aktiver Ressourcen
 
 tenant-heading = Tenants
 tenant-all = Alle Tenants
@@ -187,6 +214,8 @@ chart-pending-retry = Jetzt erneut versuchen
 # #1078: gemessen, aber aus Schreibzählern im Speicher statt aus einem exakten
 # Speicherlesevorgang gezählt. Eine Kennzeichnung, keine Warnung.
 chart-approximate-note = Näherungswert: aus den jüngsten Schreibvorgängen gezählt und noch nicht mit dem Speicher abgeglichen.
+chart-approximate-history-note = Näherungswert: aus den jüngsten Schreibvorgängen gezählt und noch nicht mit dem Speicher abgeglichen. Eine gestrichelte Linie zeigt nur die Schreibvorgänge seit dem Lesen der Zähler aus dem Speicher; ihr früherer Verlauf wird noch geladen.
+chart-legend-history-loading = Verlauf wird geladen
 chart-counts-unsupported = Ressourcenzählungen sind für dieses Speicher-Backend nicht verfügbar.
 chart-counts-unsupported-note = Dieses Speicher-Backend kann gespeicherte Ressourcen nicht zählen, daher werden weder Summen noch ein Diagramm angezeigt. Das bedeutet nicht, dass der Mandant leer ist.
 # #1078: wann die Zahlen auf der Seite gelesen wurden. $time ist eine UTC-Uhrzeit,
@@ -511,13 +540,15 @@ editor-id-exists-confirm = Neue Version speichern
 # the confirm shown for in-page closes (a modal, an addbox disclosure).
 unsaved-changes = Ungespeicherte Änderungen
 unsaved-discard-confirm = Es gibt ungespeicherte Änderungen. Verwerfen und schließen?
+unsaved-leave-confirm = Es gibt ungespeicherte Änderungen. Verwerfen und diese Seite verlassen?
+unsaved-leave-action = Verwerfen und verlassen
 # The shared in-page confirmation's confirm button (#1667); its cancel
 # button reuses action-cancel.
 confirm-dialog-ok = Bestätigen
 editor-load-error = Diese Ressource konnte nicht geladen werden.
 editor-confirm-delete = Diese Ressource löschen? Das lässt sich nicht rückgängig machen.
 editor-invalid-json = Das ist kein gültiges JSON und kann daher nicht als Formular bearbeitet werden. Ihr Text bleibt unverändert.
-editor-source-hint = Bearbeiten Sie den Quelltext direkt. Beim Zurückwechseln wird er geparst.
+editor-source-hint = Bearbeite hier oder im geführten Formular: beide zeigen immer dasselbe Dokument.
 editor-format = Formatieren
 editor-format-title = Dokument formatieren (Shift+Alt+F)
 editor-format-invalid = Behebe zuerst die JSON-Syntaxfehler, bevor du formatierst.
@@ -567,7 +598,6 @@ editor-primitive-extension-hint = Dieser Wert trägt eigene Extensions (ein `_`-
 editor-collapse-all = Alle einklappen
 editor-expand-all = Alle ausklappen
 json-view-toggle-fold = JSON-Abschnitt umschalten
-editor-edit-raw = Rohtext bearbeiten
 editor-versions = Versionen
 editor-versions-none = Keine früheren Versionen.
 ## Verlauf & Versionen (#236)
@@ -705,6 +735,11 @@ ui-combobox-removed = Entfernt
 ui-combobox-loading = Vorschläge werden geladen …
 ui-combobox-results-updated = Verfügbare Vorschläge:
 ui-combobox-error = Vorschläge konnten nicht geladen werden. Versuchen Sie es erneut.
+ui-combobox-name-now = jetzt { $name }
+ui-combobox-footer-total = { $count } Treffer · scrollen für mehr
+ui-combobox-footer-more = Weitere Treffer · scrollen für mehr
+ui-combobox-footer-end = Ende der Ergebnisse
+ui-combobox-loading-more = Weitere Treffer werden geladen…
 editor-orphans-title = Diese Probleme haben noch kein Feld — fügen Sie die Elemente hinzu, um sie zu beheben
 editor-hint-date = FHIR date: YYYY, YYYY-MM oder YYYY-MM-DD
 editor-hint-datetime = FHIR dateTime: YYYY, YYYY-MM, YYYY-MM-DD oder ein vollständiger Zeitstempel mit Zeitzone (2024-05-17T14:30:00+02:00)
@@ -1869,3 +1904,9 @@ auth-bearer-only = Die Authentifizierung ist auf diesem Server aktiviert, aber k
 batch-sign-in-required = Dieser Server hat keine Browser-Anmeldung konfiguriert, daher kann diese Seite die Anfrage nicht authentifizieren. Setzen Sie HFS_UI_LOGIN_CLIENT_ID, um Bundles von hier auszuführen.
 batch-too-large = Das Bundle ist größer, als dieser Server annimmt. Teilen Sie es in kleinere Bundles auf oder erhöhen Sie HFS_MAX_BODY_SIZE auf dem Server.
 batch-connection-dropped = Die Verbindung wurde geschlossen, bevor der Server geantwortet hat. Falls Ihre Sitzung abgelaufen ist, melden Sie sich erneut an; das Bundle kann auch größer sein, als dieser Server annimmt.
+
+# SQL Library selection and unavailable collection states (#1884).
+sql-library-select-title = Abfrage oder Ansicht auswählen
+sql-library-select-lede = Wähle einen Eintrag aus der Liste oder erstelle einen neuen.
+sql-library-unavailable-title = Die Auswahl ist nicht verfügbar
+sql-library-unavailable-lede = Die verfügbaren Abfragen und Ansichten konnten nicht überprüft werden.
