@@ -1,16 +1,6 @@
 # Cassandra Persistence Backend for Helios
 
-Alan Cruz, Anastasia Bryzgalova, Diya Subhashbhai Patel, Sara Lahourpour, Samuel Michaels Rodriguez · Draft, October 2026
-
-## Summary
-
-We propose adding an Apache Cassandra backend to `helios-persistence`, scoped to the capabilities the [Backend Capability Matrix](https://github.com/aacruzgon/hfs-CS4411/blob/a5e74a3604b181722a2d02b11f29cc76e91520bd/crates/persistence/README.md#backend-capability-matrix) marks as planned (○) for Cassandra, minus bulk export, bulk-submit ingest and the `:exact` modifier. That means create, read, update and delete (CRUD), version-specific read (vread), optimistic locking, batch bundles, token, date and URI search, and cursor pagination.
-
-The backend must fit the architecture laid out in [Building a Modern FHIR Persistence Layer (discussion #28)](https://github.com/HeliosSoftware/hfs/discussions/28). Concretely, we will implement the focused storage traits rather than a new interface, scope every operation by `TenantContext`, report only what we actually support, and reject the rest explicitly.
-
-With that scope and architecture in mind, this document is written for maintainers and the team. We would like feedback on four things: the trait surface we plan to implement, the Cassandra data model, the consistency strategy between resource rows and index rows, and the decisions we have taken where the code, the matrix or the spec left a choice open. Each of those is marked **Decision** in the section it belongs to.
-
-This is the design discussion behind our CS 4411 project proposal. The baseline revision we refer to throughout is `a5e74a3604b181722a2d02b11f29cc76e91520bd`, which exists in our fork and upstream.
+Alan Cruz, Anastasia Bryzgalova, Diya Subhashbhai Patel, Sara Lahourpour, Samuel Michaels Rodriguez
 
 ## Background: the architecture we must respect
 
