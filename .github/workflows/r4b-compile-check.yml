@@ -37,18 +37,22 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Keep the job token out of .git/config, where build scripts and
+          # proc-macros run by cargo could read it.
+          persist-credentials: false
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master, 2026-10-09
         with:
           toolchain: stable
 
-      - name: Cache cargo registry and target
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          # rustup and its proxies live in ~/.cargo/bin on this runner; never
-          # restore them from a cache.
-          cache-bin: "false"
-
+      # No rust-cache: the runner is one fixed machine (ADR-sam-michaels-0002).
+      # The cargo registry already persists in the runner user's ~/.cargo, and
+      # the target directory lives next to the checkout, not in it, so the
+      # checkout's git clean leaves it alone and cargo reuses every unchanged
+      # crate, the generated FHIR models included.
       - name: cargo check -p helios-persistence --no-default-features --features cassandra,R4B
+        env:
+          CARGO_TARGET_DIR: ${{ runner.workspace }}/target/r4b-compile-check
         run: cargo check -p helios-persistence --no-default-features --features cassandra,R4B
