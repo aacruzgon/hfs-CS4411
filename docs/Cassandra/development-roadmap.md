@@ -67,7 +67,7 @@ One row per checkable item, grouped by step; the milestone column says which gat
 | 0.7 | Synthea datasets (fixed seed, Patient and Observation) for 10,000 and 100,000 resources; version, seed, modules and checksums recorded; generation script committed | C | E | ☐ | | |
 | 0.8 | PostgreSQL baseline CSVs for both dataset sizes; decide whether the `synchronous_commit = off` baseline (`docker/postgres/docker-compose.async.yml`) is run too, and label every number with its baseline (ADR-aacruzgon-0005) | C | E | ☐ | | |
 | 0.9 | Demonstration script written and passing against PostgreSQL | C | E | ☐ | | |
-| 0.10 | Cassandra spike done and write-up in `docs/Cassandra/`, read before the schema session | A | A | ✅ | 2026-10-13 | `docs/Cassandra/spike-findings.md` with transcripts and traces in `docs/Cassandra/spike/`; every listed experiment plus LWT durability under `kill -9`; all design assumptions held, and six points for the schema session |
+| 0.10 | Cassandra spike done and write-up in `docs/Cassandra/`, read before the schema session | A | A | ✅ | 2026-10-13 | PR #12: `docs/Cassandra/spike-findings.md` with transcripts and traces in `docs/Cassandra/spike/`; every listed experiment plus LWT durability under `kill -9`; all design assumptions held, and six points for the schema session |
 | 0.11 | Upstream canary workflow scheduled and has run once; weekly `sync/upstream-*` merge in place | A | E | ☐ | | |
 | 1.1 | `schema.cql` applies cleanly to a fresh node; every checklist item in Step 1 decided and recorded | A | W | ☐ | | |
 | 1.2 | Paper walk-through of every in-scope operation and the sweeper path | A | all | ☐ | | |
