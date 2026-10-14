@@ -21,7 +21,7 @@ Roadmap item 0.10. **Read this before the schema session (Step 1).** Every exper
 
 ## Lightweight transactions (A1)
 
-The write path picks 404, 409 or 410 from the result of a failed CAS, without a second read. That works:
+The write path tells "gone", "not there" and "lost the race" apart from the result of a failed CAS, without a second read. That works:
 
 ```text
 UPDATE … IF version_id = 1 AND deleted_at = null      -- row is already at version 2
@@ -29,7 +29,7 @@ UPDATE … IF version_id = 1 AND deleted_at = null      -- row is already at ver
      False |          2 |       null                      -> 409
 
 UPDATE … IF version_id = 3 AND deleted_at = null      -- row was soft-deleted at version 3
-     False |          3 | 2026-10-14 02:54:22.511000+0000 -> 410
+     False |          3 | 2026-10-14 02:54:22.511000+0000 -> deleted (404 for a write, see point 3)
 
 UPDATE … WHERE id = 'missing1' IF version_id = 1
      False                                                -> 404 (no columns at all)
@@ -107,7 +107,7 @@ A Paxos commit does not force a commit-log sync. `system.paxos` is flushed and r
 
 1. **Tracing needs `system_traces` at RF 1 on a single node.** It defaults to RF 2, so fetching a trace at `LOCAL_QUORUM` fails with `Cannot achieve consistency level LOCAL_QUORUM … alive_replicas 1`. Both spike halves had to run `ALTER KEYSPACE system_traces WITH replication = {'class': 'NetworkTopologyStrategy', 'helios-dc1': 1}`. Decide where that belongs: a single-node setup step, not `schema.cql`, since the backend should not alter system keyspaces.
 2. **Keep the three CAS forms** the design already names. Create is `IF NOT EXISTS`; update and delete are `IF version_id = N AND deleted_at = null`; revive is `IF version_id = N`. Never a null-only condition.
-3. **Map the CAS result without a second read:** no columns means 404, `deleted_at` set means 410, anything else is 409.
+3. **Map the CAS result without a second read:** no columns means 404; `deleted_at` set means the resource was deleted; anything else is 409. *Correction, found in the schema walk-through:* for a write, a deleted resource is also 404, as the design says (`ResourceError::NotFound`). The race suite accepts `NotFound` or `Gone` from a writer that lost to a delete, and requires `NotFound` from a repeated `delete_versioned`. 410 is for `read` and `vread` only.
 4. **Keep index batches under 5 KiB**; they are multi-partition. A single-partition batch would not be checked, so nothing should rely on the threshold for those.
 5. **At RF 1, a node crash loses up to about 10 s of acknowledged writes.** B4 measured this on one table. Because all tables share one commit log, replayed in order, we expect the loss to be a time-ordered suffix across every table. That is an inference, not measured. If it holds, the sweeper is safe: an intent row is written before its CAS, so a surviving CAS implies a surviving intent row.
     - The design's failure handling covers a Helios crash.

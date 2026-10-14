@@ -52,3 +52,7 @@ A choice between two or more workable designs; a change to a trait surface, tabl
 | [0005](2026-10-13/0005-postgres-synchronous-commit.md) | 2026-10-13 | `synchronous_commit` for the PostgreSQL baseline | accepted |
 | [0006](2026-10-13/0006-postgres-server-settings.md) | 2026-10-13 | PostgreSQL server settings inside the shared envelope | accepted |
 | [0007](2026-10-13/0007-non-standard-host-ports.md) | 2026-10-13 | Non-standard host ports for the benchmark databases | accepted |
+| [0008](2026-10-13/0008-keyspace-outside-schema-file.md) | 2026-10-13 | Keep the keyspace out of `schema.cql` | accepted |
+| [0009](2026-10-13/0009-gc-grace-seconds.md) | 2026-10-13 | `gc_grace_seconds` per table | accepted |
+| [0010](2026-10-13/0010-compaction-default.md) | 2026-10-13 | Compaction stays at the node default for every table | accepted |
+| [0011](2026-10-13/0011-created-at.md) | 2026-10-13 | Where `created_at` lives and what revive does to it | accepted |

@@ -1,0 +1,30 @@
+# ADR-aacruzgon-0011: Where `created_at` lives and what revive does to it
+
+- **Date:** 2026-10-13
+- **Status:** accepted (team review at the schema session, roadmap item 1.4)
+- **Context:**
+    - **The checklist puts `created_at`** on `resources` only, and `StoredResource::from_storage` needs one for every row, including each version that `vread` returns.
+    - **The existing backends disagree:**
+        - PostgreSQL stores no `created_at`. It passes `last_updated` for both current and historical rows, and a revive therefore resets it.
+        - MongoDB stores `created_at`, keeps the original across a revive, and still passes a version's own `last_updated` from `vread`.
+- **Decision:**
+    - **`created_at timestamp` on `resources` only,** written at version 1.
+    - **Revive keeps it,** as MongoDB does.
+    - **`vread` and `list_versions` pass the version's own `last_updated`,** as both backends do. So `resource_versions` has no `created_at`.
+- **Alternatives considered:**
+    - **No column, as in PostgreSQL:** lost. The original creation time would be lost on every update, although the checklist already lists the column.
+    - **`created_at` on every version row:** lost. No reader uses it; both backends ignore it for historical versions.
+    - **Reset on revive:** lost. A revive continues the same resource and version chain, so its creation time has not changed.
+- **Consequences:**
+    - **The revive compare-and-swap must not overwrite `created_at`.**
+    - **`read` and `vread` can report different `created_at` values** for the same version. That matches MongoDB, and no Helios caller compares them.
+- **AI involvement:**
+    - **Tools:** Claude Code (Opus 5.5), with a Sonnet 5.5 subagent that read both backends.
+    - **What the AI proposed:** the decision as written.
+    - **What the human changed:** nothing. Alan went through the choice and its alternatives with the AI and accepted it as proposed.
+    - **Verified by reading the code:**
+        - PostgreSQL: `vread` and `read` pass `last_updated` as `created_at`, and `restore_deleted` returns a new one.
+        - MongoDB: it stores `created_at`, keeps it through `restore_deleted`, and its history parser ignores it.
+- **Links:**
+    - **Files:** `docs/Cassandra/schema/schema.cql`, `docs/Cassandra/schema/README.md`.
+    - **Docs:** roadmap Step 1 checklist "`resources` regular columns" row; walk-through gaps G13 and G14.
