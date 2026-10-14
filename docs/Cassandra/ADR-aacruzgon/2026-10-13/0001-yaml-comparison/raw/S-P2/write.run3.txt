@@ -1,0 +1,186 @@
+******************** Stress Settings ********************
+Command:
+  Type: write
+  Count: -1
+  Duration: 60 SECONDS
+  No Warmup: true
+  Consistency Level: LOCAL_QUORUM
+  Target Uncertainty: not applicable
+  Key Size (bytes): 10
+  Counter Increment Distibution: add=fixed(1)
+Rate:
+  Auto: false
+  Thread Count: 32
+  OpsPer Sec: 0
+Population:
+  Sequence: 1..1000000
+  Order: ARBITRARY
+  Wrap: true
+Insert:
+  Revisits: Uniform:  min=1,max=1000000
+  Visits: Fixed:  key=1
+  Row Population Ratio: Ratio: divisor=1.000000;delegate=Fixed:  key=1
+  Batch Type: not batching
+Columns:
+  Max Columns Per Key: 5
+  Column Names: [C0, C1, C2, C3, C4]
+  Comparator: AsciiType
+  Timestamp: null
+  Variable Column Count: false
+  Slice: false
+  Size Distribution: Fixed:  key=34
+  Count Distribution: Fixed:  key=5
+Errors:
+  Ignore: false
+  Tries: 10
+Log:
+  No Summary: false
+  No Settings: false
+  File: null
+  Interval Millis: 1000
+  Level: NORMAL
+Mode:
+  API: JAVA_DRIVER_NATIVE
+  Connection Style: CQL_PREPARED
+  Protocol Version: V5
+  Username: null
+  Password: null
+  Auth Provide Class: null
+  Max Pending Per Connection: 128
+  Connections Per Host: 8
+  Compression: NONE
+Node:
+  Nodes: [lb-srv]
+  Is White List: false
+  Datacenter: null
+Schema:
+  Keyspace: keyspace1
+  Replication Strategy: org.apache.cassandra.locator.NetworkTopologyStrategy
+  Replication Strategy Options: {dc1=1}
+  Table Compression: null
+  Table Compaction Strategy: null
+  Table Compaction Strategy Options: {}
+Transport:
+  Truststore: null
+  Truststore Password: null
+  Keystore: null
+  Keystore Password: null
+  SSL Protocol: TLS
+  SSL Algorithm: null
+  SSL Ciphers: null
+Port:
+  Native Port: 9042
+  JMX Port: 7199
+JMX:
+  Username: null
+  Password: *not set*
+Graph:
+  File: null
+  Revision: unknown
+  Title: null
+  Operation: WRITE
+TokenRange:
+  Wrap: false
+  Split Factor: 1
+Credentials file:
+  File: *not set*
+  CQL username: *not set*
+  CQL password: *not set*
+  JMX username: *not set*
+  JMX password: *not set*
+  Transport truststore password: *not set*
+  Transport keystore password: *not set*
+Reporting:
+  Output frequency: 1s
+  Header frequency: *not set*
+
+Connected to cluster: helios, max pending requests per connection 128, max connections per host 8
+Datacenter: dc1; Host: lb-srv/192.168.117.2:9042; Rack: rack1
+Created keyspaces. Sleeping 1s for propagation.
+Sleeping 2s...
+Running WRITE with 32 threads 60 seconds
+Failed to connect over JMX; not collecting these stats
+type                                               total ops,    op/s,    pk/s,   row/s,    mean,     med,     .95,     .99,    .999,     max,   time,   stderr, errors,  gc: #,  max ms,  sum ms,  sdv ms,      mb
+total,                                                  5402,    5402,    5402,    5402,     3.0,     1.2,     7.1,    47.7,    53.0,    55.4,    1.0,  0.00000,      0,      0,       0,       0,       0,       0
+total,                                                 36720,   31318,   31318,   31318,     1.0,     0.6,     2.0,    13.6,    36.4,    41.0,    2.0,  0.49635,      0,      0,       0,       0,       0,       0
+total,                                                100672,   63952,   63952,   63952,     0.5,     0.4,     0.9,     2.0,    18.2,    30.4,    3.0,  0.40902,      0,      0,       0,       0,       0,       0
+total,                                                189517,   88845,   88845,   88845,     0.3,     0.3,     0.6,     1.0,     7.9,    19.9,    4.0,  0.33088,      0,      0,       0,       0,       0,       0
+total,                                                286088,   96571,   96571,   96571,     0.3,     0.3,     0.6,     0.8,     7.2,    17.3,    5.0,  0.26686,      0,      0,       0,       0,       0,       0
+total,                                                380140,   94052,   94052,   94052,     0.3,     0.3,     0.6,     0.9,     4.1,     9.7,    6.0,  0.21893,      0,      0,       0,       0,       0,       0
+total,                                                464428,   84288,   84288,   84288,     0.4,     0.3,     0.7,     1.1,     7.4,    18.4,    7.0,  0.18398,      0,      0,       0,       0,       0,       0
+total,                                                517419,   52991,   52991,   52991,     0.6,     0.4,     1.2,     2.9,    14.1,    19.6,    8.0,  0.16692,      0,      0,       0,       0,       0,       0
+total,                                                580159,   62740,   62740,   62740,     0.5,     0.3,     0.8,     1.6,    39.5,    46.1,    9.0,  0.14843,      0,      0,       0,       0,       0,       0
+total,                                                665395,   85236,   85236,   85236,     0.4,     0.3,     0.6,     1.0,    12.6,    15.1,   10.0,  0.13268,      0,      0,       0,       0,       0,       0
+total,                                                753784,   88389,   88389,   88389,     0.4,     0.3,     0.6,     1.0,    10.6,    22.6,   11.0,  0.12035,      0,      0,       0,       0,       0,       0
+total,                                                814424,   60640,   60640,   60640,     0.5,     0.4,     1.0,     2.5,     9.4,    44.7,   12.0,  0.11145,      0,      0,       0,       0,       0,       0
+total,                                                869514,   55090,   55090,   55090,     0.6,     0.4,     1.1,     2.8,    20.2,    43.7,   13.0,  0.10504,      0,      0,       0,       0,       0,       0
+total,                                                924875,   55361,   55361,   55361,     0.6,     0.4,     1.0,     2.4,    41.5,    45.9,   14.0,  0.09921,      0,      0,       0,       0,       0,       0
+total,                                                984051,   59176,   59176,   59176,     0.5,     0.4,     1.0,     1.6,    32.6,    35.7,   15.0,  0.09339,      0,      0,       0,       0,       0,       0
+total,                                               1052435,   68384,   68384,   68384,     0.5,     0.4,     0.9,     1.7,     9.2,    39.9,   16.0,  0.08732,      0,      0,       0,       0,       0,       0
+total,                                               1134416,   81981,   81981,   81981,     0.4,     0.3,     0.7,     1.2,     5.7,    14.6,   17.0,  0.08211,      0,      0,       0,       0,       0,       0
+total,                                               1227164,   92748,   92748,   92748,     0.3,     0.3,     0.6,     1.0,     4.8,     7.6,   18.0,  0.07840,      0,      0,       0,       0,       0,       0
+total,                                               1323597,   96433,   96433,   96433,     0.3,     0.3,     0.6,     0.9,     4.6,    15.3,   19.0,  0.07546,      0,      0,       0,       0,       0,       0
+total,                                               1420471,   96874,   96874,   96874,     0.3,     0.3,     0.6,     0.9,     3.3,    14.3,   20.0,  0.07263,      0,      0,       0,       0,       0,       0
+total,                                               1511029,   90558,   90558,   90558,     0.3,     0.3,     0.6,     0.9,     7.0,    18.6,   21.0,  0.06939,      0,      0,       0,       0,       0,       0
+total,                                               1597902,   86873,   86873,   86873,     0.4,     0.3,     0.7,     1.0,     7.0,    22.6,   22.0,  0.06625,      0,      0,       0,       0,       0,       0
+total,                                               1700159,  102257,  102257,  102257,     0.3,     0.3,     0.5,     0.8,     3.1,    18.6,   23.0,  0.06449,      0,      0,       0,       0,       0,       0
+total,                                               1799630,   99471,   99471,   99471,     0.3,     0.3,     0.6,     0.8,     4.1,    19.5,   24.0,  0.06246,      0,      0,       0,       0,       0,       0
+total,                                               1897521,   97891,   97891,   97891,     0.3,     0.3,     0.6,     0.8,     2.2,    17.2,   25.0,  0.06037,      0,      0,       0,       0,       0,       0
+total,                                               1991139,   93618,   93618,   93618,     0.3,     0.3,     0.6,     0.9,     4.5,    14.5,   26.0,  0.05815,      0,      0,       0,       0,       0,       0
+total,                                               2068446,   77307,   77307,   77307,     0.4,     0.3,     0.7,     1.1,     8.1,    25.4,   27.0,  0.05598,      0,      0,       0,       0,       0,       0
+total,                                               2151409,   82963,   82963,   82963,     0.4,     0.3,     0.7,     1.9,     8.1,    22.6,   28.0,  0.05389,      0,      0,       0,       0,       0,       0
+total,                                               2248511,   97102,   97102,   97102,     0.3,     0.3,     0.6,     0.9,     2.1,     7.8,   29.0,  0.05225,      0,      0,       0,       0,       0,       0
+total,                                               2339869,   91358,   91358,   91358,     0.3,     0.3,     0.6,     0.9,     3.6,    20.0,   30.0,  0.05054,      0,      0,       0,       0,       0,       0
+total,                                               2435539,   95670,   95670,   95670,     0.3,     0.3,     0.6,     0.8,     3.3,    21.2,   31.0,  0.04908,      0,      0,       0,       0,       0,       0
+total,                                               2502698,   67159,   67159,   67159,     0.5,     0.4,     0.9,     1.7,     8.9,    13.4,   32.0,  0.04800,      0,      0,       0,       0,       0,       0
+total,                                               2566519,   63821,   63821,   63821,     0.5,     0.4,     0.9,     1.5,    13.5,    29.7,   33.0,  0.04710,      0,      0,       0,       0,       0,       0
+total,                                               2651921,   85402,   85402,   85402,     0.4,     0.3,     0.7,     0.9,     9.1,    12.8,   34.0,  0.04567,      0,      0,       0,       0,       0,       0
+total,                                               2739542,   87621,   87621,   87621,     0.4,     0.3,     0.6,     0.9,    12.4,    21.8,   35.0,  0.04434,      0,      0,       0,       0,       0,       0
+total,                                               2832720,   93178,   93178,   93178,     0.3,     0.3,     0.6,     1.0,     4.7,    31.2,   36.0,  0.04322,      0,      0,       0,       0,       0,       0
+total,                                               2915220,   82500,   82500,   82500,     0.4,     0.3,     0.7,     1.4,     4.0,    23.0,   37.0,  0.04202,      0,      0,       0,       0,       0,       0
+total,                                               2996319,   81099,   81099,   81099,     0.4,     0.3,     0.7,     1.2,     4.0,    30.3,   38.0,  0.04088,      0,      0,       0,       0,       0,       0
+total,                                               3072865,   76546,   76546,   76546,     0.4,     0.3,     0.8,     1.2,    19.8,    31.0,   39.0,  0.03986,      0,      0,       0,       0,       0,       0
+total,                                               3145855,   72990,   72990,   72990,     0.4,     0.3,     0.9,     1.5,     7.0,    29.6,   40.0,  0.03896,      0,      0,       0,       0,       0,       0
+total,                                               3197527,   51672,   51672,   51672,     0.6,     0.4,     1.1,     2.0,    26.5,    97.8,   41.0,  0.03892,      0,      0,       0,       0,       0,       0
+total,                                               3255384,   57857,   57857,   57857,     0.5,     0.4,     1.1,     2.3,    12.3,    27.8,   42.0,  0.03869,      0,      0,       0,       0,       0,       0
+total,                                               3326153,   70769,   70769,   70769,     0.4,     0.4,     0.8,     1.2,     9.9,    42.7,   43.0,  0.03789,      0,      0,       0,       0,       0,       0
+total,                                               3416961,   90808,   90808,   90808,     0.3,     0.3,     0.6,     0.9,     8.0,    18.2,   44.0,  0.03708,      0,      0,       0,       0,       0,       0
+total,                                               3499546,   82585,   82585,   82585,     0.4,     0.3,     0.7,     1.0,     8.4,    34.7,   45.0,  0.03623,      0,      0,       0,       0,       0,       0
+total,                                               3585027,   85481,   85481,   85481,     0.4,     0.3,     0.7,     1.0,     9.2,    30.1,   46.0,  0.03543,      0,      0,       0,       0,       0,       0
+total,                                               3671656,   86629,   86629,   86629,     0.4,     0.3,     0.7,     1.0,     7.3,    39.6,   47.0,  0.03469,      0,      0,       0,       0,       0,       0
+total,                                               3721520,   49864,   49864,   49864,     0.6,     0.4,     1.2,     2.8,    39.2,    43.7,   48.0,  0.03498,      0,      0,       0,       0,       0,       0
+total,                                               3809656,   88136,   88136,   88136,     0.4,     0.3,     0.7,     1.0,     7.2,    18.3,   49.0,  0.03427,      0,      0,       0,       0,       0,       0
+total,                                               3899306,   89650,   89650,   89650,     0.3,     0.3,     0.6,     1.0,     8.4,    30.8,   50.0,  0.03363,      0,      0,       0,       0,       0,       0
+total,                                               3987737,   88431,   88431,   88431,     0.4,     0.3,     0.7,     1.0,    12.6,    30.8,   51.0,  0.03299,      0,      0,       0,       0,       0,       0
+total,                                               4078147,   90410,   90410,   90410,     0.3,     0.3,     0.6,     1.0,     8.3,    24.3,   52.0,  0.03239,      0,      0,       0,       0,       0,       0
+total,                                               4168739,   90592,   90592,   90592,     0.3,     0.3,     0.6,     0.9,    11.8,    27.3,   53.0,  0.03182,      0,      0,       0,       0,       0,       0
+total,                                               4260420,   91681,   91681,   91681,     0.3,     0.3,     0.6,     0.9,     7.9,    21.1,   54.0,  0.03128,      0,      0,       0,       0,       0,       0
+total,                                               4352834,   92414,   92414,   92414,     0.3,     0.3,     0.6,     1.0,     5.9,    32.4,   55.0,  0.03078,      0,      0,       0,       0,       0,       0
+total,                                               4419494,   66660,   66660,   66660,     0.5,     0.3,     0.8,     1.5,    25.3,    69.0,   56.0,  0.03037,      0,      0,       0,       0,       0,       0
+total,                                               4449152,   29658,   29658,   29658,     1.1,     0.6,     1.9,    10.8,    45.4,    49.2,   57.0,  0.03204,      0,      0,       0,       0,       0,       0
+total,                                               4498396,   49244,   49244,   49244,     0.6,     0.4,     1.1,     2.4,    17.1,   113.6,   58.0,  0.03209,      0,      0,       0,       0,       0,       0
+total,                                               4562287,   63891,   63891,   63891,     0.5,     0.4,     0.9,     1.5,    52.2,    91.1,   59.0,  0.03167,      0,      0,       0,       0,       0,       0
+total,                                               4624256,   61969,   61969,   61969,     0.5,     0.4,     0.9,     1.9,    22.6,    69.7,   60.0,  0.03135,      0,      0,       0,       0,       0,       0
+total,                                               4654555,   63304,   63304,   63304,     0.5,     0.4,     0.8,     1.5,    51.0,    55.6,   60.5,  0.03092,      0,      0,       0,       0,       0,       0
+
+
+Results:
+Op rate                   :   76,962 op/s  [WRITE: 76,962 op/s]
+Partition rate            :   76,962 pk/s  [WRITE: 76,962 pk/s]
+Row rate                  :   76,962 row/s [WRITE: 76,962 row/s]
+Latency mean              :    0.4 ms [WRITE: 0.4 ms]
+Latency median            :    0.3 ms [WRITE: 0.3 ms]
+Latency 95th percentile   :    0.8 ms [WRITE: 0.8 ms]
+Latency 99th percentile   :    1.3 ms [WRITE: 1.3 ms]
+Latency 99.9th percentile :   11.5 ms [WRITE: 11.5 ms]
+Latency max               :  113.6 ms [WRITE: 113.6 ms]
+Total partitions          :  4,654,555 [WRITE: 4,654,555]
+Total errors              :          0 [WRITE: 0]
+Total GC count            : 0
+Total GC memory           : 0 B
+Total GC time             :    0.0 seconds
+Avg GC time               :    NaN ms
+StdDev GC time            :    0.0 ms
+Total operation time      : 00:01:00
+
+END

@@ -1,0 +1,51 @@
+Total number of tables: 1
+----------------
+Keyspace: lwtbench
+	Read Count: 2051175
+	Read Latency: 0.3020957017319341 ms
+	Write Count: 1700363
+	Write Latency: 0.02044397284579822 ms
+	Pending Flushes: 0
+		Table: blogposts
+		SSTable count: 13
+		Old SSTable count: 0
+		Max SSTable size: 161.353MiB
+		SSTables in each level: [0, 10, 3, 0, 0, 0, 0, 0, 0]
+		SSTable bytes in each level: [0, 1650926825, 503347318, 0, 0, 0, 0, 0, 0]
+		Space used (live): 2171892721
+		Space used (total): 2171892721
+		Space used by snapshots (total): 0
+		Off heap memory used (total): 1591272
+		SSTable Compression Ratio: 0.99691
+		Number of partitions (estimate): 697784
+		Memtable cell count: 0
+		Memtable data size: 0
+		Memtable off heap memory used: 0
+		Memtable switch count: 22
+		Speculative retries: 0
+		Local read count: 2051175
+		Local read latency: 0.602 ms
+		Local write count: 1700363
+		Local write latency: 0.024 ms
+		Local read/write ratio: 1.20632
+		Pending flushes: 0
+		Percent repaired: 0.0
+		Bytes repaired: 0B
+		Bytes unrepaired: 2.013GiB
+		Bytes pending repair: 0B
+		Bloom filter false positives: 0
+		Bloom filter false ratio: 0.00000
+		Bloom filter space used: 536040
+		Bloom filter off heap memory used: 535936
+		Index summary off heap memory used: 0
+		Compression metadata off heap memory used: 1055336
+		Compacted partition minimum bytes: 259
+		Compacted partition maximum bytes: 24601
+		Compacted partition mean bytes: 3252
+		Average live cells per slice (last five minutes): 1.0006656865147432
+		Maximum live cells per slice (last five minutes): 3
+		Average tombstones per slice (last five minutes): 1.0
+		Maximum tombstones per slice (last five minutes): 1
+		Droppable tombstone ratio: 0.00000
+
+----------------

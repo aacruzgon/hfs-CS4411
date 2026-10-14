@@ -1,0 +1,39 @@
+# ADR-aacruzgon-0003: Snitch, data-centre, rack and cluster names
+
+- **Date:** 2026-10-13
+- **Status:** accepted
+- **Context:**
+    - **Requirement.** The Step 1 checklist says the keyspace uses `NetworkTopologyStrategy` with a DC name that matches the Compose files' `GossipingPropertyFileSnitch` setting.
+    - **Image default.** The image defaults to `SimpleSnitch`, DC `datacenter1`, rack `rack1` and cluster `Test Cluster`.
+    - **Why the names must be chosen now.** Cassandra records the DC, rack and cluster name in a node's data on first boot and refuses to start under different names afterwards. Changing them later means wiping the data volume on every machine.
+- **Decision:**
+    - **Snitch:** the single node runs `GossipingPropertyFileSnitch`, like the three-node cluster.
+    - **Names:** DC `helios-dc1`, rack `helios-rack1` and cluster `helios`.
+    - **Keyspace:** `{'class': 'NetworkTopologyStrategy', 'helios-dc1': 1}` locally and `'helios-dc1': 3` on the cluster.
+- **Alternatives considered:**
+    - **`SimpleSnitch` on the single node:** lost. The keyspace definition, and therefore `schema.cql` and the backend's `initialize`, would then differ between the single node (`datacenter1`) and the cluster.
+    - **`dc1` and `rack1`, the AI's first proposal:** lost. The names are permanent per data volume, so they were made project-specific while no data volume exists yet.
+- **Consequences:**
+    - **One set of names across files.** The same names are used in item 0.3, `schema.cql` (item 1.1) and the backend config.
+    - **`LOCAL_*` consistency.** `LOCAL_QUORUM` and `LOCAL_SERIAL` resolve against `helios-dc1`.
+    - **A wrong DC name fails at creation.** A keyspace naming any other DC is rejected by `CREATE KEYSPACE` (`Unrecognized strategy option {dc1} passed to NetworkTopologyStrategy`). A stale DC name in `schema.cql` therefore fails at creation, not at the first write.
+    - **Renaming needs a wipe.** Changing any of the three names needs `docker compose … down -v`.
+    - **Single DC is assumed.** `LOCAL_SERIAL` is linearizable only within one DC; the design already assumes that.
+    - **Item 0.3 decides the cluster's rack layout:** all nodes in `helios-rack1`, or one rack per node (`helios-rack1` to `helios-rack3`). It matters because `cassandra_latest.yaml` sets `batchlog_endpoint_strategy: dynamic_remote` (ADR-aacruzgon-0001), which avoids the local rack for the batchlog when it can.
+- **AI involvement:**
+    - **Tools:** Claude Code (Opus 5.5), with Haiku 5.5 subagents.
+    - **What the AI proposed:** the AI proposed `GossipingPropertyFileSnitch` with `dc1`, `rack1` and `helios`. It pointed out that the names are fixed once a node has data.
+    - **What the human changed:** Alan renamed the DC to `helios-dc1`. He then asked whether the rack should follow, and renamed it to `helios-rack1`.
+    - **Verified on a cold boot from an empty volume:**
+        - `system.local` reports `helios | helios-dc1 | helios-rack1`.
+        - A `{'helios-dc1': 1}` keyspace accepts an LWT at `LOCAL_QUORUM`/`LOCAL_SERIAL`.
+        - A `{'dc1': 1}` keyspace is rejected at creation.
+    - **Verified refusals:** on the same data volume, a node started with a changed name exits with code 100:
+        - DC: "Cannot start node if snitch's data center (dc1) differs from previous data center (helios-dc1)".
+        - Rack: "Cannot start node if snitch's rack (rack1) differs from previous rack (helios-rack1)".
+        - Cluster: "Saved cluster name helios != configured name other".
+        - Control: a restart with the names unchanged starts normally.
+- **Links:**
+    - **Commits:** first version in commit `1a0bb61bd` (`dc1`, `rack1`); revised on branch `chore/cassandra-single-node`.
+    - **Files:** `docker/cassandra/docker-compose.yml` and `docker/cassandra/README.md`.
+    - **Docs:** roadmap Step 1 checklist "Keyspace" row and item 0.3; ADR-aacruzgon-0001.

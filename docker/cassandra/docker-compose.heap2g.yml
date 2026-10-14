@@ -1,0 +1,21 @@
+# Override for the 32 GB machines and for every benchmark run in the report
+# (development-roadmap.md, section 1 "Machines"). Use together with
+# docker-compose.yml; only the values below change.
+#
+#   Heap             MAX_HEAP_SIZE=2G
+#   Direct memory    MAX_DIRECT_MEMORY_SIZE=1G (half the heap)
+#   CPU limit        4 CPUs (unchanged)
+#   Memory limit     5 GiB, swap disabled (indicative, Apple-silicon 18 GB
+#                    laptop under OrbStack, cassandra_latest.yaml: 2.65 GiB at
+#                    idle, peak 3.31 GiB under a 32-thread write load, no OOM
+#                    kill)
+#
+# The PostgreSQL benchmark container uses the same CPU and memory limits.
+
+services:
+  cassandra:
+    environment:
+      MAX_HEAP_SIZE: 2G
+      MAX_DIRECT_MEMORY_SIZE: 1G
+    mem_limit: 5g
+    memswap_limit: 5g

@@ -1,0 +1,137 @@
+******************** Stress Settings ********************
+Command:
+  Type: write
+  Count: 1,000,000
+  No Warmup: true
+  Consistency Level: LOCAL_QUORUM
+  Target Uncertainty: not applicable
+  Key Size (bytes): 10
+  Counter Increment Distibution: add=fixed(1)
+Rate:
+  Auto: false
+  Thread Count: 32
+  OpsPer Sec: 0
+Population:
+  Sequence: 1..1000000
+  Order: ARBITRARY
+  Wrap: true
+Insert:
+  Revisits: Uniform:  min=1,max=1000000
+  Visits: Fixed:  key=1
+  Row Population Ratio: Ratio: divisor=1.000000;delegate=Fixed:  key=1
+  Batch Type: not batching
+Columns:
+  Max Columns Per Key: 5
+  Column Names: [C0, C1, C2, C3, C4]
+  Comparator: AsciiType
+  Timestamp: null
+  Variable Column Count: false
+  Slice: false
+  Size Distribution: Fixed:  key=34
+  Count Distribution: Fixed:  key=5
+Errors:
+  Ignore: false
+  Tries: 10
+Log:
+  No Summary: false
+  No Settings: false
+  File: null
+  Interval Millis: 1000
+  Level: NORMAL
+Mode:
+  API: JAVA_DRIVER_NATIVE
+  Connection Style: CQL_PREPARED
+  Protocol Version: V5
+  Username: null
+  Password: null
+  Auth Provide Class: null
+  Max Pending Per Connection: 128
+  Connections Per Host: 8
+  Compression: NONE
+Node:
+  Nodes: [lb-srv]
+  Is White List: false
+  Datacenter: null
+Schema:
+  Keyspace: keyspace1
+  Replication Strategy: org.apache.cassandra.locator.NetworkTopologyStrategy
+  Replication Strategy Options: {dc1=1}
+  Table Compression: null
+  Table Compaction Strategy: null
+  Table Compaction Strategy Options: {}
+Transport:
+  Truststore: null
+  Truststore Password: null
+  Keystore: null
+  Keystore Password: null
+  SSL Protocol: TLS
+  SSL Algorithm: null
+  SSL Ciphers: null
+Port:
+  Native Port: 9042
+  JMX Port: 7199
+JMX:
+  Username: null
+  Password: *not set*
+Graph:
+  File: null
+  Revision: unknown
+  Title: null
+  Operation: WRITE
+TokenRange:
+  Wrap: false
+  Split Factor: 1
+Credentials file:
+  File: *not set*
+  CQL username: *not set*
+  CQL password: *not set*
+  JMX username: *not set*
+  JMX password: *not set*
+  Transport truststore password: *not set*
+  Transport keystore password: *not set*
+Reporting:
+  Output frequency: 1s
+  Header frequency: *not set*
+
+Connected to cluster: helios, max pending requests per connection 128, max connections per host 8
+Datacenter: dc1; Host: lb-srv/192.168.117.2:9042; Rack: rack1
+Created keyspaces. Sleeping 1s for propagation.
+Sleeping 2s...
+Running WRITE with 32 threads for 1000000 iteration
+Failed to connect over JMX; not collecting these stats
+type                                               total ops,    op/s,    pk/s,   row/s,    mean,     med,     .95,     .99,    .999,     max,   time,   stderr, errors,  gc: #,  max ms,  sum ms,  sdv ms,      mb
+total,                                                 12743,   12743,   12743,   12743,     1.6,     0.7,     3.3,    37.0,    54.3,    56.4,    1.0,  0.00000,      0,      0,       0,       0,       0,       0
+total,                                                 50159,   37416,   37416,   37416,     0.8,     0.5,     1.1,     5.0,    38.4,    41.3,    2.0,  0.34355,      0,      0,       0,       0,       0,       0
+total,                                                123845,   73686,   73686,   73686,     0.4,     0.3,     0.7,     1.3,    21.5,    31.9,    3.0,  0.34609,      0,      0,       0,       0,       0,       0
+total,                                                216412,   92567,   92567,   92567,     0.3,     0.3,     0.6,     0.9,     5.0,    48.1,    4.0,  0.28686,      0,      0,       0,       0,       0,       0
+total,                                                296926,   80514,   80514,   80514,     0.4,     0.3,     0.7,     1.2,    21.5,    34.2,    5.0,  0.22350,      0,      0,       0,       0,       0,       0
+total,                                                382985,   86059,   86059,   86059,     0.4,     0.3,     0.7,     1.0,     8.5,    22.1,    6.0,  0.18408,      0,      0,       0,       0,       0,       0
+total,                                                481434,   98449,   98449,   98449,     0.3,     0.3,     0.6,     0.8,     4.2,    12.2,    7.0,  0.15982,      0,      0,       0,       0,       0,       0
+total,                                                580802,   99368,   99368,   99368,     0.3,     0.3,     0.6,     0.8,     3.8,     9.6,    8.0,  0.14068,      0,      0,       0,       0,       0,       0
+total,                                                651993,   71191,   71191,   71191,     0.4,     0.3,     0.8,     1.6,    32.0,    39.1,    9.0,  0.12516,      0,      0,       0,       0,       0,       0
+total,                                                734940,   82947,   82947,   82947,     0.4,     0.3,     0.7,     1.1,     6.0,    52.9,   10.0,  0.11190,      0,      0,       0,       0,       0,       0
+total,                                                811986,   77046,   77046,   77046,     0.4,     0.3,     0.7,     1.1,     8.8,    40.0,   11.0,  0.10132,      0,      0,       0,       0,       0,       0
+total,                                                899557,   87571,   87571,   87571,     0.4,     0.3,     0.6,     0.9,     6.6,    33.2,   12.0,  0.09263,      0,      0,       0,       0,       0,       0
+total,                                               1000000,  101835,  101835,  101835,     0.3,     0.3,     0.5,     0.8,     4.5,    22.0,   13.0,  0.08691,      0,      0,       0,       0,       0,       0
+
+
+Results:
+Op rate                   :   77,004 op/s  [WRITE: 77,004 op/s]
+Partition rate            :   77,004 pk/s  [WRITE: 77,004 pk/s]
+Row rate                  :   77,004 row/s [WRITE: 77,004 row/s]
+Latency mean              :    0.4 ms [WRITE: 0.4 ms]
+Latency median            :    0.3 ms [WRITE: 0.3 ms]
+Latency 95th percentile   :    0.7 ms [WRITE: 0.7 ms]
+Latency 99th percentile   :    1.2 ms [WRITE: 1.2 ms]
+Latency 99.9th percentile :   19.7 ms [WRITE: 19.7 ms]
+Latency max               :   56.4 ms [WRITE: 56.4 ms]
+Total partitions          :  1,000,000 [WRITE: 1,000,000]
+Total errors              :          0 [WRITE: 0]
+Total GC count            : 0
+Total GC memory           : 0 B
+Total GC time             :    0.0 seconds
+Avg GC time               :    NaN ms
+StdDev GC time            :    0.0 ms
+Total operation time      : 00:00:12
+
+END

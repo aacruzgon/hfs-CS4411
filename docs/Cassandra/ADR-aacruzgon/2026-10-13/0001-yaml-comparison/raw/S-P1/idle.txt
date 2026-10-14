@@ -1,0 +1,1 @@
+S-P1 idle_mem=1.558GiB / 3GiB

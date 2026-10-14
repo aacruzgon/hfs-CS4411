@@ -29,3 +29,7 @@ docs/mongodb/*.mongosh.js text eol=lf
 # generated SQL in crates/persistence/src/sof/golden_tests.rs; a CRLF Windows
 # checkout would fail every case on line endings alone.
 crates/persistence/tests/golden/** text eol=lf
+
+# Shell scripts under docker/ run under sh, some of them bind-mounted into
+# Linux containers; a CRLF Windows checkout breaks them ("set: Illegal option -").
+docker/**/*.sh text eol=lf
