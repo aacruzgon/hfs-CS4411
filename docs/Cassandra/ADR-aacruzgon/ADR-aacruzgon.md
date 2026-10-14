@@ -63,3 +63,4 @@ A choice between two or more workable designs; a change to a trait surface, tabl
 | [0016](2026-10-14/0016-write-ts-from-last-updated.md) | 2026-10-14 | `write_ts` is derived from `last_updated` | accepted |
 | [0017](2026-10-14/0017-repair-on-read-rule.md) | 2026-10-14 | Repair on read deletes only keys the current version does not produce | accepted |
 | [0018](2026-10-14/0018-ci-on-self-hosted-runner.md) | 2026-10-14 | CI runs on the team's self-hosted runner | accepted |
+| [0019](2026-10-14/0019-required-check-no-skip-ci.md) | 2026-10-14 | The R4B compile check is required on `main`, and commits no longer use `[skip ci]` | accepted |
