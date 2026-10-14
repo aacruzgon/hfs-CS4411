@@ -51,8 +51,23 @@ jobs:
       # The cargo registry already persists in the runner user's ~/.cargo, and
       # the target directory lives next to the checkout, not in it, so the
       # checkout's git clean leaves it alone and cargo reuses every unchanged
-      # crate, the generated FHIR models included.
-      - name: cargo check -p helios-persistence --no-default-features --features cassandra,R4B
+      # crate, the generated FHIR models included. Cargo never deletes stale
+      # artifacts, so the directory is wiped when the toolchain or Cargo.lock
+      # changes, or when it passes its size cap. CARGO_TARGET_DIR is exported
+      # here because the runner context is not available in a job-level env.
+      - name: Reset the target dir if it is stale or over its cap
         env:
-          CARGO_TARGET_DIR: ${{ runner.workspace }}/target/r4b-compile-check
+          TARGET_DIR: ${{ runner.workspace }}/target/r4b-compile-check
+          CAP_GB: 10
+        run: |
+          stamp="$(rustc -V) $(sha256sum Cargo.lock | cut -c1-16)"
+          size_gb=$(du -s --block-size=1G "$TARGET_DIR" 2>/dev/null | cut -f1)
+          if [ "$(cat "$TARGET_DIR/.stamp" 2>/dev/null)" != "$stamp" ] || [ "${size_gb:-0}" -gt "$CAP_GB" ]; then
+            echo "Resetting $TARGET_DIR (size ${size_gb:-0} GB, cap $CAP_GB GB, stamp: $stamp)"
+            rm -rf "$TARGET_DIR"
+          fi
+          mkdir -p "$TARGET_DIR" && echo "$stamp" > "$TARGET_DIR/.stamp"
+          echo "CARGO_TARGET_DIR=$TARGET_DIR" >> "$GITHUB_ENV"
+
+      - name: cargo check -p helios-persistence --no-default-features --features cassandra,R4B
         run: cargo check -p helios-persistence --no-default-features --features cassandra,R4B
