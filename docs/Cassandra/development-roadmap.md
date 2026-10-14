@@ -63,7 +63,7 @@ One row per checkable item, grouped by step; the milestone column says which gat
 | 0.3 | Three-node Compose cluster: RF 3, `GossipingPropertyFileSnitch`, DC name matching the keyspace | B | E | ☐ | | |
 | 0.4 | CI: `cargo check -p helios-persistence --no-default-features --features cassandra,R4B` | A | E | ☐ | | |
 | 0.5 | CI: fmt check, the `CONTRIBUTING.md` clippy job with `-D warnings`, `rust-cache`, and the Cassandra test job against the single-node container | B | E | ☐ | | |
-| 0.6 | Benchmark harness: open-loop load, warm-up, three runs, CSV output, 409 separated from 5xx | C | E | ☐ | | |
+| 0.6 | Benchmark harness: open-loop load, warm-up, three runs, CSV output, 409 separated from 5xx; LWT throughput measured at steady state and peak container memory logged on long runs (ADR-aacruzgon-0001, 0002) | C | E | ☐ | | |
 | 0.7 | Synthea datasets (fixed seed, Patient and Observation) for 10,000 and 100,000 resources; version, seed, modules and checksums recorded; generation script committed | C | E | ☐ | | |
 | 0.8 | PostgreSQL baseline CSVs for both dataset sizes | C | E | ☐ | | |
 | 0.9 | Demonstration script written and passing against PostgreSQL | C | E | ☐ | | |
@@ -74,7 +74,7 @@ One row per checkable item, grouped by step; the milestone column says which gat
 | 1.3 | Query coverage table in the repo | A | all | ☐ | | |
 | 1.4 | Every member's sign-off on `schema.cql` recorded in their ADR log | A | all | ☐ | | |
 | 2.0 | Cassandra `GenericImage` test container in `tests/common/` with CQL readiness wait and cleanup hook | A | A | ☐ | | |
-| 2.1 | `backends/cassandra/` skeleton compiles; stubs for the 12 bound traits; listed defaults overridden | A | A | ☐ | | |
+| 2.1 | `backends/cassandra/` skeleton compiles; stubs for the 12 bound traits; listed defaults overridden; first `cdrs-tokio` connection from the host to `docker/cassandra` confirmed (the node advertises its container IP; fix in that README) | A | A | ☐ | | |
 | 2.2 | `cassandra` feature threaded through rest and hfs; `StorageBackendMode::Cassandra`; `start_cassandra`; `patient_name_search_support` arm; feature fallback | A | W | ☐ | | |
 | 2.3 | `TenantSearchRegistries` plumbing and `search_param_registry` | A | A | ☐ | | |
 | 2.4 | Cassandra module in `backend_capability_contract.rs`; stale table in `tests/common/capabilities.rs` fixed or removed | A | A | ☐ | | |
