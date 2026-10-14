@@ -1,0 +1,72 @@
+# Single-node Apache Cassandra for the Cassandra persistence backend
+# (docs/Cassandra/development-roadmap.md, item 0.1). Local development, the
+# Cassandra test job and benchmarks. See README.md in this directory.
+#
+#     docker compose -f docker/cassandra/docker-compose.yml up -d --wait
+#
+# On a 32 GB machine, and for every benchmark that goes in the report, add the
+# 2G-heap override:
+#
+#     docker compose -f docker/cassandra/docker-compose.yml \
+#                    -f docker/cassandra/docker-compose.heap2g.yml up -d --wait
+#
+# Recorded configuration (keep in step with README.md and the PostgreSQL file):
+#
+#   Image            cassandra:5.0.9-bookworm, pinned by index digest
+#                    (Cassandra 5.0.9, Temurin JDK 17, Debian bookworm;
+#                    pushed 2026-08-11; amd64 and arm64)
+#   Config file      stock /etc/cassandra/cassandra.yaml, not cassandra_latest.yaml
+#   paxos_variant    v2 (set by entrypoint.sh; 5.0 default is v1)
+#   paxos_state_purging  legacy (5.0 default, not in the yaml; safe for our
+#                    LOCAL_QUORUM commit consistency; never switched here)
+#   Snitch / DC      GossipingPropertyFileSnitch, DC "dc1", rack "rack1";
+#                    the keyspace's NetworkTopologyStrategy map uses 'dc1'
+#   Heap             MAX_HEAP_SIZE=1G (G1, so -Xms = -Xmx, HEAP_NEWSIZE unset)
+#   Direct memory    MAX_DIRECT_MEMORY_SIZE=512M (half the heap; otherwise
+#                    cassandra-env.sh sizes it from the host's RAM)
+#   GC threads       4 parallel / 4 concurrent, matching the CPU limit
+#                    (otherwise cassandra-env.sh uses the host's core count)
+#   CPU limit        4 CPUs
+#   Memory limit     3 GiB, swap disabled (measured steady-state RSS with a
+#                    1G heap at idle: about 1.65 GiB; 1.5 GiB OOM-kills on boot)
+#   Left at defaults commitlog_sync: periodic, 10000ms; batch_size_warn 5KiB,
+#                    batch_size_fail 50KiB; tombstone warn 1000, fail 100000;
+#                    num_tokens 16; memtable_allocation_type heap_buffers
+#
+# OrbStack or Docker Desktop must be allowed more memory than the limit above.
+
+name: hfs-cassandra
+
+services:
+  cassandra:
+    image: cassandra:5.0.9-bookworm@sha256:7ee3eda0f01d80fa4cf93cefb2b1b993bd356a98b7200827d2af5113475534d1
+    # Run through sh so a checkout without the executable bit (Windows) works.
+    entrypoint: ["sh", "/usr/local/bin/hfs-entrypoint.sh"]
+    command: ["cassandra", "-f"]
+    environment:
+      CASSANDRA_CLUSTER_NAME: helios
+      CASSANDRA_ENDPOINT_SNITCH: GossipingPropertyFileSnitch
+      CASSANDRA_DC: dc1
+      CASSANDRA_RACK: rack1
+      MAX_HEAP_SIZE: 1G
+      MAX_DIRECT_MEMORY_SIZE: 512M
+      JVM_EXTRA_OPTS: -XX:ParallelGCThreads=4 -XX:ConcGCThreads=4
+    cpus: 4
+    mem_limit: 3g
+    memswap_limit: 3g
+    ports:
+      - "127.0.0.1:9042:9042"
+    volumes:
+      - ./entrypoint.sh:/usr/local/bin/hfs-entrypoint.sh:ro
+      - cassandra-data:/var/lib/cassandra
+    healthcheck:
+      # Ready means CQL answers, not merely that the JVM is up. First boot
+      # takes about 60 s on an Apple-silicon laptop.
+      test: ["CMD-SHELL", "cqlsh -e 'SELECT release_version FROM system.local' > /dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 90s
+
+volumes:
+  cassandra-data:
