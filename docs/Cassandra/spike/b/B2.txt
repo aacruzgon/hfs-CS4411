@@ -1,0 +1,64 @@
+# B2
+inserted 500 rows into P2 (tenant t, type P2)
+Consistency level set to LOCAL_QUORUM.
+deleted 300 rows
+$ nodetool tablestats spike.resources_by_type
+		SSTable count: 2
+		Old SSTable count: 0
+		Space used (live): 23003
+		Number of partitions (estimate): 2
+		Average live cells per slice (last five minutes): 60.0
+		Maximum live cells per slice (last five minutes): 60
+		Average tombstones per slice (last five minutes): 1.0
+		Maximum tombstones per slice (last five minutes): 1
+		Droppable tombstone ratio: 0.00000
+$ cqlsh -f b2_read.cql (TRACING ON; SELECT * ... P2) -- trace
+(200 rows)
+# note: trace fetch failed at LOCAL_QUORUM because system_traces defaults to RF=2 in a 1-node DC; ran: ALTER KEYSPACE system_traces WITH replication={'class':'NetworkTopologyStrategy','helios-dc1':1}
+### P2 traced full-partition SELECT * (500 inserted, 300 deleted)
+(200 rows)
+ activity                                                                                                                 | timestamp                  | source        | source_elapsed | client
+                                                     Executing single-partition query on resources_by_type [ReadStage-14] | 2026-10-14 02:55:03.520002 | 192.168.117.2 |           1007 | 127.0.0.1
+                                 Skipped 0/2 non-slice-intersecting sstables, included 0 due to tombstones [ReadStage-14] | 2026-10-14 02:55:03.520004 | 192.168.117.2 |           1082 | 127.0.0.1
+                                  Partition index found for sstable 3h4n_083c_1dap61zjekiygtn8o5, size = 4 [ReadStage-14] | 2026-10-14 02:55:03.521000 | 192.168.117.2 |           1169 | 127.0.0.1
+                                                                 Merged data from memtables and 1 sstables [ReadStage-14] | 2026-10-14 02:55:03.521001 | 192.168.117.2 |           1385 | 127.0.0.1
+                                                                  Read 100 live rows and 0 tombstone cells [ReadStage-14] | 2026-10-14 02:55:03.521002 | 192.168.117.2 |           1422 | 127.0.0.1
+                                                                                                         Request complete | 2026-10-14 02:55:03.520635 | 192.168.117.2 |           1635 | 127.0.0.1
+ activity                                                                                                                | timestamp                  | source        | source_elapsed | client
+                                                    Executing single-partition query on resources_by_type [ReadStage-11] | 2026-10-14 02:55:03.526000 | 192.168.117.2 |           2006 | 127.0.0.1
+                                Skipped 0/2 non-slice-intersecting sstables, included 0 due to tombstones [ReadStage-11] | 2026-10-14 02:55:03.526002 | 192.168.117.2 |           2094 | 127.0.0.1
+                                 Partition index found for sstable 3h4n_083c_1dap61zjekiygtn8o5, size = 4 [ReadStage-11] | 2026-10-14 02:55:03.526003 | 192.168.117.2 |           2159 | 127.0.0.1
+                                                                Merged data from memtables and 1 sstables [ReadStage-11] | 2026-10-14 02:55:03.526004 | 192.168.117.2 |           2434 | 127.0.0.1
+                                                                 Read 100 live rows and 0 tombstone cells [ReadStage-11] | 2026-10-14 02:55:03.526005 | 192.168.117.2 |           2472 | 127.0.0.1
+                                                                                                        Request complete | 2026-10-14 02:55:03.526664 | 192.168.117.2 |           2664 | 127.0.0.1
+ activity                                                                                                                 | timestamp                  | source        | source_elapsed | client
+                                                     Executing single-partition query on resources_by_type [ReadStage-11] | 2026-10-14 02:55:03.529003 | 192.168.117.2 |            425 | 127.0.0.1
+                                 Skipped 0/2 non-slice-intersecting sstables, included 0 due to tombstones [ReadStage-11] | 2026-10-14 02:55:03.529005 | 192.168.117.2 |            497 | 127.0.0.1
+                                  Partition index found for sstable 3h4n_083c_1dap61zjekiygtn8o5, size = 4 [ReadStage-11] | 2026-10-14 02:55:03.529006 | 192.168.117.2 |            553 | 127.0.0.1
+                                  Partition index found for sstable 3h4n_083d_59wfe1zjekiygtn8o5, size = 2 [ReadStage-11] | 2026-10-14 02:55:03.529007 | 192.168.117.2 |            678 | 127.0.0.1
+                                                                 Merged data from memtables and 2 sstables [ReadStage-11] | 2026-10-14 02:55:03.530000 | 192.168.117.2 |           1165 | 127.0.0.1
+                                                                  Read 0 live rows and 300 tombstone cells [ReadStage-11] | 2026-10-14 02:55:03.530001 | 192.168.117.2 |           1199 | 127.0.0.1
+                                                                                                         Request complete | 2026-10-14 02:55:03.530408 | 192.168.117.2 |           1408 | 127.0.0.1
+### P2 with PAGING OFF (single read)
+(200 rows)
+                                                                  Merged data from memtables and 2 sstables [ReadStage-7] | 2026-10-14 02:55:11.343001 | 192.168.117.2 |           1879 | 127.0.0.1
+                                                                 Read 200 live rows and 300 tombstone cells [ReadStage-7] | 2026-10-14 02:55:11.343002 | 192.168.117.2 |           1911 | 127.0.0.1
+### P3: insert 1500, flush, delete 1200, flush, read
+(1 rows)
+Warnings :
+Read 0 live rows and 1200 tombstone cells for query SELECT * FROM spike.resources_by_type WHERE tenant_id = 't' AND resource_type = 'P3' AND last_updated < '1970-01-01T00:16:41.200Z' AND id < 'id1200' LIMIT 100 ALLOW FILTERING; token 4850332651812183306 (see tombstone_warn_threshold)
+(300 rows)
+Warnings :
+Read 300 live rows and 1200 tombstone cells for query SELECT * FROM spike.resources_by_type WHERE tenant_id = 't' AND resource_type = 'P3' ALLOW FILTERING; token 4850332651812183306 (see tombstone_warn_threshold)
+                                 Skipped 0/3 non-slice-intersecting sstables, included 0 due to tombstones [ReadStage-4] | 2026-10-14 02:55:21.966004 | 192.168.117.2 |            992 | 127.0.0.1
+                                                                 Merged data from memtables and 2 sstables [ReadStage-4] | 2026-10-14 02:55:21.969000 | 192.168.117.2 |           3928 | 127.0.0.1
+                                Read 300 live rows and 1200 tombstone cells (see tombstone_warn_threshold) [ReadStage-4] | 2026-10-14 02:55:21.970000 | 192.168.117.2 |           4337 | 127.0.0.1
+### server log
+WARN  [ReadStage-14] 2026-10-14T02:55:21,962 ReadCommand.java:644 - Read 0 live rows and 1200 tombstone cells for query SELECT * FROM spike.resources_by_type WHERE tenant_id = 't' AND resource_type = 'P3' AND last_updated < '1970-01-01T00:16:41.200Z' AND id < 'id1200' LIMIT 100 ALLOW FILTERING; token 4850332651812183306 (see tombstone_warn_threshold)
+WARN  [ReadStage-4] 2026-10-14T02:55:21,970 ReadCommand.java:644 - Read 300 live rows and 1200 tombstone cells for query SELECT * FROM spike.resources_by_type WHERE tenant_id = 't' AND resource_type = 'P3' ALLOW FILTERING; token 4850332651812183306 (see tombstone_warn_threshold)
+### tablestats after
+		SSTable count: 4
+		Old SSTable count: 0
+		Average tombstones per slice (last five minutes): 244.5
+		Maximum tombstones per slice (last five minutes): 1331
+		Droppable tombstone ratio: 0.00000

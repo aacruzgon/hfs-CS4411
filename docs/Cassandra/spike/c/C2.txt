@@ -1,0 +1,19 @@
+== C2 start 2026-10-14T03:02:00
+KILLED at 2026-10-14T03:02:31 epoch_ms=1791946951385
+ERROR at n=2979: ('Unable to complete the operation against any hosts', {<Host: 192.168.117.2:9042 helios-dc1>: ConnectionShutdown('Connection to 192.168.117.2:9042 was closed')})
+acks: inserts 2978 updates 297
+last lines:
+n 2976 1791946951170
+n 2977 1791946951175
+n 2978 1791946951186
+ Container spike-c-cassandra-1 Started 
+ Container spike-c-cassandra-1 Waiting 
+ Container spike-c-cassandra-1 Healthy 
+INFO  [main] 2026-10-14T03:02:36,805 CommitLog.java:210 - Log replay complete, 11193 replayed mutations in 615 ms
+rows saved
+acked inserts 2978 last 2978 | acked updates 297 last 2965
+rows present 2525 max n 2525 gaps below max []
+acked inserts lost 453 (min lost n 2526 )
+acked updates present with v2 252 lost 45
+unacked-but-present []
+seconds lost: first lost ack to last ack = 4.66 s ; last present ack vs last ack = 4.67 s

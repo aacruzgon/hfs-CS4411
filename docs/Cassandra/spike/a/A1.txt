@@ -1,0 +1,98 @@
+-- transcript of A1.cql
+CONSISTENCY LOCAL_QUORUM;
+SERIAL CONSISTENCY LOCAL_SERIAL;
+-- a
+INSERT INTO spike.resources (tenant_id,resource_type,id,version_id,write_id,data) VALUES ('t1','Patient','p1',1,11111111-1111-1111-1111-111111111111,'v1') IF NOT EXISTS;
+INSERT INTO spike.resources (tenant_id,resource_type,id,version_id,write_id,data) VALUES ('t1','Patient','p1',1,11111111-1111-1111-1111-111111111111,'v1') IF NOT EXISTS;
+-- b
+UPDATE spike.resources SET version_id=2, write_id=22222222-2222-2222-2222-222222222222 WHERE tenant_id='t1' AND resource_type='Patient' AND id='p1' IF version_id = 1 AND deleted_at = null;
+UPDATE spike.resources SET version_id=2, write_id=22222222-2222-2222-2222-222222222222 WHERE tenant_id='t1' AND resource_type='Patient' AND id='p1' IF version_id = 1 AND deleted_at = null;
+-- c
+UPDATE spike.resources SET deleted_at = toTimestamp(now()), version_id = 3 WHERE tenant_id='t1' AND resource_type='Patient' AND id='p1' IF version_id = 2 AND deleted_at = null;
+UPDATE spike.resources SET version_id=4 WHERE tenant_id='t1' AND resource_type='Patient' AND id='p1' IF version_id = 3 AND deleted_at = null;
+-- d
+UPDATE spike.resources SET version_id=2 WHERE tenant_id='t1' AND resource_type='Patient' AND id='missing1' IF version_id = 1;
+UPDATE spike.resources SET version_id=2 WHERE tenant_id='t1' AND resource_type='Patient' AND id='missing2' IF deleted_at = null;
+SELECT * FROM spike.resources WHERE tenant_id='t1' AND resource_type='Patient' AND id='missing1';
+SELECT * FROM spike.resources WHERE tenant_id='t1' AND resource_type='Patient' AND id='missing2';
+-- e
+UPDATE spike.resources USING TIMESTAMP 1234567890 SET version_id=9 WHERE tenant_id='t1' AND resource_type='Patient' AND id='p1' IF version_id = 3;
+INSERT INTO spike.resources (tenant_id,resource_type,id,version_id) VALUES ('t1','Patient','p9',1) IF NOT EXISTS USING TIMESTAMP 1234567890;
+-- f
+CONSISTENCY LOCAL_SERIAL;
+SELECT * FROM spike.resources WHERE tenant_id='t1' AND resource_type='Patient' AND id='p1';
+CONSISTENCY LOCAL_QUORUM;
+-- g
+TRACING ON;
+INSERT INTO spike.resources (tenant_id,resource_type,id,version_id,write_id,data) VALUES ('t1','Patient','p2',1,33333333-3333-3333-3333-333333333333,'v1') IF NOT EXISTS;
+UPDATE spike.resources SET version_id=2 WHERE tenant_id='t1' AND resource_type='Patient' AND id='p2' IF version_id = 1 AND deleted_at = null;
+TRACING OFF;
+-- OUTPUT
+Consistency level set to LOCAL_QUORUM.
+Serial consistency level set to LOCAL_SERIAL.
+
+ [applied]
+-----------
+      True
+
+ [applied] | tenant_id | resource_type | id | data | deleted_at | version_id | write_id                             | write_ts
+-----------+-----------+---------------+----+------+------------+------------+--------------------------------------+----------
+     False |        t1 |       Patient | p1 |   v1 |       null |          1 | 11111111-1111-1111-1111-111111111111 |     null
+
+ [applied]
+-----------
+      True
+
+ [applied] | version_id | deleted_at
+-----------+------------+------------
+     False |          2 |       null
+
+ [applied]
+-----------
+      True
+
+ [applied] | version_id | deleted_at
+-----------+------------+---------------------------------
+     False |          3 | 2026-10-14 02:54:22.511000+0000
+
+ [applied]
+-----------
+     False
+
+ [applied]
+-----------
+      True
+
+ tenant_id | resource_type | id | data | deleted_at | version_id | write_id | write_ts
+-----------+---------------+----+------+------------+------------+----------+----------
+
+
+(0 rows)
+
+ tenant_id | resource_type | id       | data | deleted_at | version_id | write_id | write_ts
+-----------+---------------+----------+------+------------+------------+----------+----------
+        t1 |       Patient | missing2 | null |       null |          2 |     null |     null
+
+(1 rows)
+<stdin>:19:InvalidRequest: Error from server: code=2200 [Invalid query] message="Cannot provide custom timestamp for conditional updates"
+<stdin>:20:InvalidRequest: Error from server: code=2200 [Invalid query] message="Cannot provide custom timestamp for conditional updates"
+Consistency level set to LOCAL_SERIAL.
+
+ tenant_id | resource_type | id | data | deleted_at                      | version_id | write_id                             | write_ts
+-----------+---------------+----+------+---------------------------------+------------+--------------------------------------+----------
+        t1 |       Patient | p1 |   v1 | 2026-10-14 02:54:22.511000+0000 |          3 | 22222222-2222-2222-2222-222222222222 |     null
+
+(1 rows)
+Consistency level set to LOCAL_QUORUM.
+TRACING set to ON
+
+ [applied]
+-----------
+      True
+<stdin>:27:Unable to fetch query trace: ('Unable to complete the operation against any hosts', {<Host: 127.0.0.1:9042 helios-dc1>: Unavailable('Error from server: code=1000 [Unavailable exception] message="Cannot achieve consistency level LOCAL_QUORUM" info={\'consistency\': \'LOCAL_QUORUM\', \'required_replicas\': 2, \'alive_replicas\': 1}')})
+
+ [applied]
+-----------
+      True
+<stdin>:28:Unable to fetch query trace: ('Unable to complete the operation against any hosts', {<Host: 127.0.0.1:9042 helios-dc1>: Unavailable('Error from server: code=1000 [Unavailable exception] message="Cannot achieve consistency level LOCAL_QUORUM" info={\'consistency\': \'LOCAL_QUORUM\', \'required_replicas\': 2, \'alive_replicas\': 1}')})
+TRACING set to OFF

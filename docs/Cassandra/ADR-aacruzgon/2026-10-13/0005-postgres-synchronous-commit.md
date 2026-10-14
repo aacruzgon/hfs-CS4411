@@ -30,6 +30,7 @@
     - **Verified:**
         - The default profile reports `synchronous_commit = on` with `source = command line`.
         - The async override reports `off`, and also does so combined with the 5 GiB override.
+- **Update, 2026-10-13 (roadmap item 0.10, spike experiment C):** the open question is answered. Acknowledged LWT writes are lost like plain writes when the node is killed under `commitlog_sync: periodic`. Two runs lost 313 and 453 acknowledged conditional inserts (about 3.5 and 4.7 s), and 32 and 45 acknowledged conditional updates, each as a clean prefix cut. The durability table above therefore holds for our write path, and the decision stands. Evidence: `docs/Cassandra/spike-findings.md` and `docs/Cassandra/spike/c/`.
 - **Links:**
     - **Files:** `docker/postgres/docker-compose.yml`, `docker/postgres/docker-compose.async.yml` and `docker/postgres/README.md` ("Durability").
     - **Docs:** roadmap items 0.2 and 0.8; ADR-aacruzgon-0001.

@@ -1,0 +1,49 @@
+CONSISTENCY LOCAL_QUORUM;
+CREATE TABLE spike.tok (tenant_id text, system text, code text, id text, PRIMARY KEY ((tenant_id, system, code), id));
+INSERT INTO spike.tok (tenant_id,system,code,id) VALUES ('t1','','8480-6','obs1');
+INSERT INTO spike.tok (tenant_id,system,code,id) VALUES ('t1','http://loinc.org','8480-6','obs2');
+SELECT * FROM spike.tok WHERE tenant_id='t1' AND system='' AND code='8480-6';
+SELECT * FROM spike.tok;
+-- composite key with empty code too
+INSERT INTO spike.tok (tenant_id,system,code,id) VALUES ('t1','','','obs3');
+SELECT * FROM spike.tok WHERE tenant_id='t1' AND system='' AND code='';
+-- single-column text partition key = ''
+CREATE TABLE spike.single (k text PRIMARY KEY, v text);
+INSERT INTO spike.single (k,v) VALUES ('', 'x');
+SELECT * FROM spike.single WHERE k='';
+INSERT INTO spike.single (k,v) VALUES ('a', 'x');
+-- single-column partition key with empty clustering part for comparison
+CREATE TABLE spike.single2 (k text, c text, v text, PRIMARY KEY (k, c));
+INSERT INTO spike.single2 (k,c,v) VALUES ('', 'c', 'x');
+INSERT INTO spike.single2 (k,c,v) VALUES ('k', '', 'x');
+SELECT * FROM spike.single2 WHERE k='k' AND c='';
+-- OUTPUT
+Consistency level set to LOCAL_QUORUM.
+
+ tenant_id | system | code   | id
+-----------+--------+--------+------
+        t1 |        | 8480-6 | obs1
+
+(1 rows)
+
+ tenant_id | system           | code   | id
+-----------+------------------+--------+------
+        t1 | http://loinc.org | 8480-6 | obs2
+        t1 |                  | 8480-6 | obs1
+
+(2 rows)
+
+ tenant_id | system | code | id
+-----------+--------+------+------
+        t1 |        |      | obs3
+
+(1 rows)
+<stdin>:13:InvalidRequest: Error from server: code=2200 [Invalid query] message="Key may not be empty"
+<stdin>:14:InvalidRequest: Error from server: code=2200 [Invalid query] message="Key may not be empty"
+<stdin>:18:InvalidRequest: Error from server: code=2200 [Invalid query] message="Key may not be empty"
+
+ k | c | v
+---+---+---
+ k |   | x
+
+(1 rows)

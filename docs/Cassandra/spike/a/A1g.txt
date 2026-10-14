@@ -1,0 +1,85 @@
+-- A1g (rerun of step g after: ALTER KEYSPACE system_traces to NTS helios-dc1:1, because default SimpleStrategy RF2 made trace fetch fail on a 1-node cluster; first attempt's error is in A1.txt)
+ALTER KEYSPACE system_traces WITH replication = {'class':'NetworkTopologyStrategy','helios-dc1':1};
+CONSISTENCY LOCAL_QUORUM;
+SERIAL CONSISTENCY LOCAL_SERIAL;
+TRACING ON;
+INSERT INTO spike.resources (tenant_id,resource_type,id,version_id,write_id,data) VALUES ('t1','Patient','p3',1,33333333-3333-3333-3333-333333333333,'v1') IF NOT EXISTS;
+UPDATE spike.resources SET version_id=2 WHERE tenant_id='t1' AND resource_type='Patient' AND id='p3' IF version_id = 1 AND deleted_at = null;
+TRACING OFF;
+-- OUTPUT
+Consistency level set to LOCAL_QUORUM.
+Serial consistency level set to LOCAL_SERIAL.
+TRACING set to ON
+
+ [applied]
+-----------
+      True
+
+Tracing session: 948137f0-c77a-11f1-9b9e-8f64a7bf1cce
+
+ activity                                                                                                                                                                                                                            | timestamp                  | source        | source_elapsed | client
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+----------------------------+---------------+----------------+-----------
+                                                                                                                                                                                                                  Execute CQL3 query | 2026-10-14 02:54:31.663000 | 192.168.147.2 |              0 | 127.0.0.1
+                     Parsing INSERT INTO spike.resources (tenant_id,resource_type,id,version_id,write_id,data) VALUES ('t1','Patient','p3',1,33333333-3333-3333-3333-333333333333,'v1') IF NOT EXISTS; [Native-Transport-Requests-6] | 2026-10-14 02:54:31.663001 | 192.168.147.2 |            183 | 127.0.0.1
+                                                                                                                                                                                   Preparing statement [Native-Transport-Requests-6] | 2026-10-14 02:54:31.663002 | 192.168.147.2 |            359 | 127.0.0.1
+                                                                                                                                                          Reading existing values for CAS precondition [Native-Transport-Requests-6] | 2026-10-14 02:54:31.664000 | 192.168.147.2 |            623 | 127.0.0.1
+                                                                                                                                              Preparing 94815f01-c77a-11f1-8625-840111b5cfdc with read [Native-Transport-Requests-6] | 2026-10-14 02:54:31.664001 | 192.168.147.2 |            750 | 127.0.0.1
+                                                                                                                                                                         Executing single-partition query on paxos [MutationStage-1] | 2026-10-14 02:54:31.664002 | 192.168.147.2 |           1004 | 127.0.0.1
+                                                                                                                                                                                      Acquiring sstable references [MutationStage-1] | 2026-10-14 02:54:31.664003 | 192.168.147.2 |           1058 | 127.0.0.1
+                                                                                                                                                                                         Merging memtable contents [MutationStage-1] | 2026-10-14 02:54:31.664004 | 192.168.147.2 |           1094 | 127.0.0.1
+                                                                                                                                                                            Read 0 live rows and 0 tombstone cells [MutationStage-1] | 2026-10-14 02:54:31.664005 | 192.168.147.2 |           1186 | 127.0.0.1
+                                                                                                                                                  Promising read/write ballot 94815f01-c77a-11f1-8625-840111b5cfdc [MutationStage-1] | 2026-10-14 02:54:31.664006 | 192.168.147.2 |           1232 | 127.0.0.1
+                                                                                                                                                                                            Appending to commitlog [MutationStage-1] | 2026-10-14 02:54:31.664007 | 192.168.147.2 |           1386 | 127.0.0.1
+                                                                                                                                                                                          Adding to paxos memtable [MutationStage-1] | 2026-10-14 02:54:31.664008 | 192.168.147.2 |           1431 | 127.0.0.1
+                                                                                                                                                                     Executing single-partition query on resources [MutationStage-1] | 2026-10-14 02:54:31.665000 | 192.168.147.2 |           1557 | 127.0.0.1
+                                                                                                                                                                                      Acquiring sstable references [MutationStage-1] | 2026-10-14 02:54:31.665001 | 192.168.147.2 |           1602 | 127.0.0.1
+                                                                                                                                                                                         Merging memtable contents [MutationStage-1] | 2026-10-14 02:54:31.665002 | 192.168.147.2 |           1635 | 127.0.0.1
+                                                                                                                                                                            Read 0 live rows and 0 tombstone cells [MutationStage-1] | 2026-10-14 02:54:31.665003 | 192.168.147.2 |           2446 | 127.0.0.1
+                                                                                                  CAS precondition is met; proposing client-requested updates for 94815f01-c77a-11f1-8625-840111b5cfdc [Native-Transport-Requests-6] | 2026-10-14 02:54:31.666000 | 192.168.147.2 |           2815 | 127.0.0.1
+   Accepting proposal Accepted(140112392716640001:94815f01-c77a-11f1-8625-840111b5cfdc, 1791946471664000:key=t1:Patient:p3\n    Row: EMPTY | data=v1, version_id=1, write_id=33333333-3333-3333-3333-333333333333) [MutationStage-2] | 2026-10-14 02:54:31.666001 | 192.168.147.2 |           2990 | 127.0.0.1
+                                                                                                                                                                                            Appending to commitlog [MutationStage-2] | 2026-10-14 02:54:31.666002 | 192.168.147.2 |           3155 | 127.0.0.1
+                                                                                                                                                                                          Adding to paxos memtable [MutationStage-2] | 2026-10-14 02:54:31.666003 | 192.168.147.2 |           3202 | 127.0.0.1
+ Committing proposal Committed(140112392716640001:94815f01-c77a-11f1-8625-840111b5cfdc, 1791946471664000:key=t1:Patient:p3\n    Row: EMPTY | data=v1, version_id=1, write_id=33333333-3333-3333-3333-333333333333) [MutationStage-2] | 2026-10-14 02:54:31.667000 | 192.168.147.2 |           4096 | 127.0.0.1
+                                                                                                                                                                                            Appending to commitlog [MutationStage-2] | 2026-10-14 02:54:31.667001 | 192.168.147.2 |           4153 | 127.0.0.1
+                                                                                                                                                                                      Adding to resources memtable [MutationStage-2] | 2026-10-14 02:54:31.667002 | 192.168.147.2 |           4228 | 127.0.0.1
+                                                                                                                                                                                            Appending to commitlog [MutationStage-2] | 2026-10-14 02:54:31.667003 | 192.168.147.2 |           4408 | 127.0.0.1
+                                                                                                                                                                                          Adding to paxos memtable [MutationStage-2] | 2026-10-14 02:54:31.667004 | 192.168.147.2 |           4453 | 127.0.0.1
+                                                                                                                                                                      Enqueuing acknowledge to /192.168.147.2:7000 [MutationStage-2] | 2026-10-14 02:54:31.668000 | 192.168.147.2 |           4590 | 127.0.0.1
+                                                                                                                                                                                        CAS successful [Native-Transport-Requests-6] | 2026-10-14 02:54:31.668001 | 192.168.147.2 |           4722 | 127.0.0.1
+                                                                                                                                                                                                                    Request complete | 2026-10-14 02:54:31.667849 | 192.168.147.2 |           4849 | 127.0.0.1
+
+
+ [applied]
+-----------
+      True
+
+Tracing session: 94841e20-c77a-11f1-9b9e-8f64a7bf1cce
+
+ activity                                                                                                                                                                            | timestamp                  | source        | source_elapsed | client
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+----------------------------+---------------+----------------+-----------
+                                                                                                                                                                  Execute CQL3 query | 2026-10-14 02:54:31.682000 | 192.168.147.2 |              0 | 127.0.0.1
+ Parsing UPDATE spike.resources SET version_id=2 WHERE tenant_id='t1' AND resource_type='Patient' AND id='p3' IF version_id = 1 AND deleted_at = null; [Native-Transport-Requests-2] | 2026-10-14 02:54:31.682001 | 192.168.147.2 |            339 | 127.0.0.1
+                                                                                                                                   Preparing statement [Native-Transport-Requests-2] | 2026-10-14 02:54:31.683000 | 192.168.147.2 |            520 | 127.0.0.1
+                                                                                                          Reading existing values for CAS precondition [Native-Transport-Requests-2] | 2026-10-14 02:54:31.683001 | 192.168.147.2 |            812 | 127.0.0.1
+                                                                                              Preparing 94844531-c77a-11f1-8fab-d2f9a4ff516d with read [Native-Transport-Requests-2] | 2026-10-14 02:54:31.683002 | 192.168.147.2 |            905 | 127.0.0.1
+                                                                                                  Promising read/write ballot 94844531-c77a-11f1-8fab-d2f9a4ff516d [MutationStage-3] | 2026-10-14 02:54:31.685000 | 192.168.147.2 |           2882 | 127.0.0.1
+                                                                                                                                            Appending to commitlog [MutationStage-3] | 2026-10-14 02:54:31.685001 | 192.168.147.2 |           3082 | 127.0.0.1
+                                                                                                                                          Adding to paxos memtable [MutationStage-3] | 2026-10-14 02:54:31.685002 | 192.168.147.2 |           3135 | 127.0.0.1
+                                                                                                                     Executing single-partition query on resources [MutationStage-3] | 2026-10-14 02:54:31.685003 | 192.168.147.2 |           3291 | 127.0.0.1
+                                                                                                                                      Acquiring sstable references [MutationStage-3] | 2026-10-14 02:54:31.685004 | 192.168.147.2 |           3335 | 127.0.0.1
+                                                                                                                                         Merging memtable contents [MutationStage-3] | 2026-10-14 02:54:31.685005 | 192.168.147.2 |           3376 | 127.0.0.1
+                                                                                                                            Read 1 live rows and 0 tombstone cells [MutationStage-3] | 2026-10-14 02:54:31.686000 | 192.168.147.2 |           3518 | 127.0.0.1
+                                                  CAS precondition is met; proposing client-requested updates for 94844531-c77a-11f1-8fab-d2f9a4ff516d [Native-Transport-Requests-2] | 2026-10-14 02:54:31.686001 | 192.168.147.2 |           3788 | 127.0.0.1
+           Accepting proposal Accepted(140112392716830001:94844531-c77a-11f1-8fab-d2f9a4ff516d, 1791946471683000:key=t1:Patient:p3\n    Row: EMPTY | version_id=2) [MutationStage-3] | 2026-10-14 02:54:31.686002 | 192.168.147.2 |           3932 | 127.0.0.1
+                                                                                                                                            Appending to commitlog [MutationStage-3] | 2026-10-14 02:54:31.686003 | 192.168.147.2 |           4062 | 127.0.0.1
+                                                                                                                                          Adding to paxos memtable [MutationStage-3] | 2026-10-14 02:54:31.686004 | 192.168.147.2 |           4100 | 127.0.0.1
+         Committing proposal Committed(140112392716830001:94844531-c77a-11f1-8fab-d2f9a4ff516d, 1791946471683000:key=t1:Patient:p3\n    Row: EMPTY | version_id=2) [MutationStage-3] | 2026-10-14 02:54:31.687000 | 192.168.147.2 |           4668 | 127.0.0.1
+                                                                                                                                            Appending to commitlog [MutationStage-3] | 2026-10-14 02:54:31.687001 | 192.168.147.2 |           4708 | 127.0.0.1
+                                                                                                                                      Adding to resources memtable [MutationStage-3] | 2026-10-14 02:54:31.687002 | 192.168.147.2 |           4754 | 127.0.0.1
+                                                                                                                                            Appending to commitlog [MutationStage-3] | 2026-10-14 02:54:31.687003 | 192.168.147.2 |           4905 | 127.0.0.1
+                                                                                                                                          Adding to paxos memtable [MutationStage-3] | 2026-10-14 02:54:31.687004 | 192.168.147.2 |           4949 | 127.0.0.1
+                                                                                                                      Enqueuing acknowledge to /192.168.147.2:7000 [MutationStage-3] | 2026-10-14 02:54:31.687005 | 192.168.147.2 |           5079 | 127.0.0.1
+                                                                                                                                        CAS successful [Native-Transport-Requests-2] | 2026-10-14 02:54:31.687006 | 192.168.147.2 |           5126 | 127.0.0.1
+                                                                                                                                                                    Request complete | 2026-10-14 02:54:31.687245 | 192.168.147.2 |           5245 | 127.0.0.1
+
+TRACING set to OFF
