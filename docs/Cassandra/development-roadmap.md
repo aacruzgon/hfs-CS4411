@@ -58,7 +58,7 @@ One row per checkable item, grouped by step; the milestone column says which gat
 
 | # | Item | Milestone | Owner | Status | Date | Evidence |
 | --- | --- | --- | --- | --- | --- | --- |
-| 0.1 | Single-node Compose file: Cassandra 5.0.x pinned, `paxos_variant: v2`, explicit heap, CPU/memory limits recorded | A | E | ✅ | 2026-10-13 | `docker/cassandra/` (`cassandra:5.0.9-bookworm` by digest; 4 CPUs; 1G heap / 3 GiB, or 2G / 5 GiB via `docker-compose.heap2g.yml`); `system_views.settings` shows `paxos_variant = v2`; ADR-aacruzgon-0001 to 0003 |
+| 0.1 | Single-node Compose file: Cassandra 5.0.x pinned, `paxos_variant: v2`, explicit heap, CPU/memory limits recorded | A | E | ✅ | 2026-10-13 | `docker/cassandra/` (`cassandra:5.0.9-trixie` by digest, `cassandra_latest.yaml`; 4 CPUs; 1G heap / 3 GiB, or 2G / 5 GiB via `docker-compose.heap2g.yml`); `system_views.settings` shows `paxos_variant = v2`; ADR-aacruzgon-0001 to 0003; first version in `1a0bb61bd` |
 | 0.2 | PostgreSQL Compose file with the same limits, `synchronous_commit` recorded | A | E | ☐ | | |
 | 0.3 | Three-node Compose cluster: RF 3, `GossipingPropertyFileSnitch`, DC name matching the keyspace | B | E | ☐ | | |
 | 0.4 | CI: `cargo check -p helios-persistence --no-default-features --features cassandra,R4B` | A | E | ☐ | | |

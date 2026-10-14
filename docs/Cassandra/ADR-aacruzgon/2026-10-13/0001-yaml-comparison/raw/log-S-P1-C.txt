@@ -1,0 +1,3 @@
+S-P1 ready_secs=57.7
+S-P1 idle_mem=1.558GiB / 3GiB
+S-P1 FINISHED

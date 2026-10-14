@@ -1,0 +1,24 @@
+== S-P2 verification
+
+ name                       | value
+----------------------------+-----------------------------
+      concurrent_compactors |                           2
+            endpoint_snitch | GossipingPropertyFileSnitch
+   memtable_allocation_type |                heap_buffers
+              paxos_variant |                          v2
+ storage_compatibility_mode |                 CASSANDRA_4
+
+(5 rows)
+
+ data_center
+-------------
+         dc1
+
+(1 rows)
+
+ name           | value
+----------------+----------
+ commitlog_sync | periodic
+ key_cache_size |   100MiB
+
+(2 rows)

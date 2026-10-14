@@ -1,0 +1,55 @@
+# ADR-aacruzgon-0001: Cassandra image, configuration file and `paxos_variant: v2`
+
+- **Date:** 2026-10-13
+- **Status:** accepted
+- **Context:** Roadmap item 0.1 requires a pinned Cassandra 5.0.x and `paxos_variant: v2`, and three questions follow from that.
+    - **Which image to pin.** The plain `5.0.9` tag and the floating `5.0` tag were rebuilt on Debian 13 (trixie) on 2026-10-06, so a tag alone is not a stable pin.
+    - **Which configuration file to start from.** The image ships two:
+        - the stock `cassandra.yaml`;
+        - `cassandra_latest.yaml`, which turns on the newer 5.0 features, `paxos_variant: v2` among them.
+    - **How to set the Paxos variant.** The 5.0 default is v1. The official entrypoint rewrites only a fixed list of `cassandra.yaml` keys from `CASSANDRA_*` variables, and `paxos_variant` is not on that list.
+- **Decision:**
+    - **Image:** pin `cassandra:5.0.9-trixie@sha256:618a493bcf1f817ea2f07288a46fa76fb2d9c4dfd5a04c28227336405782889c` (Cassandra 5.0.9, Debian 13, OpenJDK 17.0.20.1, amd64 and arm64).
+    - **Configuration:** run `cassandra_latest.yaml` as shipped. `docker/cassandra/entrypoint.sh` copies it over `cassandra.yaml` on every boot, so the stock entrypoint's cluster, snitch and DC edits still land in the file Cassandra reads.
+    - **Paxos assertion:** the wrapper then asserts `paxos_variant: v2` and fails the boot if the key is missing or changed.
+    - **Purging:** `paxos_state_purging` stays at its default, `legacy`.
+- **Alternatives considered:**
+    - **`5.0.9-bookworm`, the AI's first pin:** lost. The Docker official-images library no longer lists any 5.0 bookworm tag, so that build gets no further rebuilds. It also carries OpenJDK 17.0.19, which lacks the July 2026 security fixes.
+        - It had been preferred only because the trixie build was under 14 days old. That age rule was the AI's own caution, not a project requirement.
+    - **`5.0.8`:** lost. It is an older Cassandra release.
+    - **The stock `cassandra.yaml` with a one-line Paxos change, the AI's first recommendation:** lost on measurement. An indicative laptop comparison ran both files on the same image, heap, limits and Paxos variant (`0001-yaml-comparison/`):
+        - `cassandra_latest.yaml` gave about 25% more plain-write and 67% more read throughput, with run ranges that did not overlap.
+        - Startup time was the same, and peak memory stayed within both limits.
+        - LWT throughput differences were within the run-to-run spread, so the comparison neither favours nor rules out either file for our write path.
+        - The AI's other argument, that a stock Cassandra config keeps the PostgreSQL comparison even, was withdrawn: stock PostgreSQL is also conservatively tuned, and item 0.2 sets its tuning separately.
+    - **Pointing `-Dcassandra.config` at `cassandra_latest.yaml`:** lost. The entrypoint's `CASSANDRA_*` edits only touch `cassandra.yaml`, so the cluster name, snitch and DC would be silently lost.
+    - **A JVM system property for `paxos_variant`:** lost. Four spellings were tested, `-Dcassandra.settings.paxos_variant=v2` among them, and none took effect without an extra, undocumented `cassandra.config.allow_system_properties=true`.
+    - **Mounting a full yaml:** lost. The stock entrypoint's edits fail on a read-only mount, and a 2,000-line file hides what changed.
+    - **`paxos_state_purging: repaired`:** lost. It needs scheduled Paxos repair and can never be switched back to `legacy`. `legacy` is safe for our `LOCAL_QUORUM` commit consistency.
+- **Consequences:**
+    - **Upstream's status for the file.** Its header provides it "for new users of Cassandra who want to get the most out of their cluster, and for users evaluating the technology". The 5.0 `NEWS.txt` says it "is intended to be used in a development environment and is only recommended for production use after careful evaluation". This project is such an evaluation; a production deployment would have to repeat it.
+    - **What the file changes.** Everything `cassandra_latest.yaml` changes against stock now applies:
+        - trie memtables, allocated off-heap (`offheap_objects`);
+        - the `bti` SSTable format;
+        - UCS as the default compaction;
+        - `concurrent_compactors: 8`, kept as shipped although it exceeds the 4-CPU limit;
+        - no key cache, `column_index_size` 4 KiB, `commitlog_disk_access_mode: auto` and `trickle_fsync: true`;
+        - UUID SSTable identifiers, SAI as the default secondary index, and `batchlog_endpoint_strategy: dynamic_remote`;
+        - `storage_compatibility_mode: NONE`.
+    - **Formats are 5.0-only.** The on-disk files cannot be read by Cassandra 4.x, which does not matter for a fresh project cluster.
+    - **Benchmark reports** state the configuration file, and the README in `docker/cassandra/` lists every changed setting.
+    - **The item 0.6 harness must measure LWT at steady state.** In this comparison both configs lost 55–60% of their LWT throughput across three runs, so LWT is not settled.
+    - **Compaction:** `schema.cql` (Step 1) may still set compaction per table; UCS is now also the default.
+    - **Verifying Paxos:** check the effective value with `SELECT value FROM system_views.settings WHERE name = 'paxos_variant'`. There is no `nodetool` command for it.
+    - **Item 0.3:** the three-node cluster reuses the same wrapper.
+- **AI involvement:**
+    - **Tools:** Claude Code (Opus 5.5), with Haiku 5.5 and Sonnet 5.5 subagents.
+    - **Research:** the AI listed the Docker Hub tags and digests and checked which 5.0 tags the official-images library still lists. It compared the OS, JDK, Python and glibc of the bookworm and trixie builds. It read the image's yaml files, `cassandra-env.sh` and `docker-entrypoint.sh`, as well as 5.0's `NEWS.txt` and `Config.java`, and diffed the active settings of the two yaml files.
+    - **Tests:** it tested the system-property route and the wrapper, and ran the stock-versus-latest comparison.
+    - **What the AI proposed:** `5.0.9-bookworm` and the stock yaml.
+    - **What the human changed:** Alan chose trixie once the AI showed that the bookworm line is no longer maintained. Before locking the image or the configuration, he asked to discuss what `cassandra_latest.yaml` would change and whether that affected the other decisions. He then asked for a measured comparison of the two files rather than accepting the AI's argument. On the results, he adopted `cassandra_latest.yaml`, overturning the AI's first recommendation.
+    - **Verification:** the comparison's raw outputs and scripts are in `0001-yaml-comparison/`. Final settings were verified on a cold boot from an empty volume with `system_views.settings`.
+- **Links:**
+    - **Commits:** first version in commit `1a0bb61bd` (stock yaml, bookworm); revised on branch `chore/cassandra-single-node`.
+    - **Files:** `docker/cassandra/`; evidence in `0001-yaml-comparison/README.md`.
+    - **Docs:** roadmap item 0.1 and the Step 1 checklist "Compaction" row; design document "Consistency levels" paragraph.

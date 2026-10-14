@@ -1,0 +1,12 @@
+S-P2 ready_secs=57.2
+S-P2 idle_mem=2.584GiB / 5GiB
+S-P2 lwt run1 done
+S-P2 lwt run2 done
+S-P2 lwt run3 done
+S-P2 write run1 done
+S-P2 write run2 done
+S-P2 write run3 done
+S-P2 read run1 done
+S-P2 read run2 done
+S-P2 read run3 done
+S-P2 FINISHED

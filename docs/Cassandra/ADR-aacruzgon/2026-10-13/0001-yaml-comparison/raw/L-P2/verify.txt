@@ -1,0 +1,24 @@
+== L-P2 verification
+
+ name                       | value
+----------------------------+-----------------------------
+      concurrent_compactors |                           8
+            endpoint_snitch | GossipingPropertyFileSnitch
+   memtable_allocation_type |             offheap_objects
+              paxos_variant |                          v2
+ storage_compatibility_mode |                        NONE
+
+(5 rows)
+
+ data_center
+-------------
+         dc1
+
+(1 rows)
+
+ name           | value
+----------------+----------
+ commitlog_sync | periodic
+ key_cache_size |     0MiB
+
+(2 rows)

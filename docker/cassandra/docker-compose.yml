@@ -12,26 +12,48 @@
 #
 # Recorded configuration (keep in step with README.md and the PostgreSQL file):
 #
-#   Image            cassandra:5.0.9-bookworm, pinned by index digest
-#                    (Cassandra 5.0.9, Temurin JDK 17, Debian bookworm;
-#                    pushed 2026-08-11; amd64 and arm64)
-#   Config file      stock /etc/cassandra/cassandra.yaml, not cassandra_latest.yaml
-#   paxos_variant    v2 (set by entrypoint.sh; 5.0 default is v1)
-#   paxos_state_purging  legacy (5.0 default, not in the yaml; safe for our
+#   Image            cassandra:5.0.9-trixie, pinned by index digest
+#                    (Cassandra 5.0.9, OpenJDK 17.0.20.1 of 2026-08-18,
+#                    Debian 13 trixie; pushed 2026-10-06; amd64 and arm64).
+#                    Trixie, not bookworm: the Docker official-images library
+#                    lists no 5.0 bookworm tag any more, so that build gets no
+#                    further rebuilds; `5.0`, `5` and `latest` point to trixie.
+#   Config file      /etc/cassandra/cassandra_latest.yaml as shipped, copied
+#                    over cassandra.yaml by entrypoint.sh (the stock
+#                    entrypoint edits cassandra.yaml only). Versus the stock
+#                    file it sets: paxos_variant v2; trie memtables with
+#                    memtable_allocation_type offheap_objects; sstable format
+#                    bti; default compaction UnifiedCompactionStrategy (T4);
+#                    concurrent_compactors 8 (above the 4-CPU limit, kept as
+#                    shipped: changing it is unmeasured); key_cache_size 0MiB;
+#                    column_index_size 4KiB; commitlog_disk_access_mode auto;
+#                    trickle_fsync true; uuid_sstable_identifiers_enabled true;
+#                    stream_entire_sstables true (also the default when
+#                    unset); default_secondary_index sai;
+#                    batchlog_endpoint_strategy dynamic_remote;
+#                    storage_compatibility_mode NONE (5.0-only on-disk
+#                    formats, not readable by 4.x).
+#   paxos_variant    v2 (in cassandra_latest.yaml; entrypoint.sh asserts it)
+#   paxos_state_purging  legacy (5.0 default, in neither yaml; safe for our
 #                    LOCAL_QUORUM commit consistency; never switched here)
-#   Snitch / DC      GossipingPropertyFileSnitch, DC "dc1", rack "rack1";
-#                    the keyspace's NetworkTopologyStrategy map uses 'dc1'
+#   Snitch / DC      GossipingPropertyFileSnitch, DC "helios-dc1", rack
+#                    "helios-rack1";
+#                    the keyspace's NetworkTopologyStrategy map uses
+#                    'helios-dc1'. A node refuses to start if its DC, rack
+#                    or cluster name changes, so renaming means down -v.
 #   Heap             MAX_HEAP_SIZE=1G (G1, so -Xms = -Xmx, HEAP_NEWSIZE unset)
 #   Direct memory    MAX_DIRECT_MEMORY_SIZE=512M (half the heap; otherwise
 #                    cassandra-env.sh sizes it from the host's RAM)
 #   GC threads       4 parallel / 4 concurrent, matching the CPU limit
 #                    (otherwise cassandra-env.sh uses the host's core count)
 #   CPU limit        4 CPUs
-#   Memory limit     3 GiB, swap disabled (measured steady-state RSS with a
-#                    1G heap at idle: about 1.65 GiB; 1.5 GiB OOM-kills on boot)
-#   Left at defaults commitlog_sync: periodic, 10000ms; batch_size_warn 5KiB,
+#   Memory limit     3 GiB, swap disabled (indicative, Apple-silicon 18 GB
+#                    laptop under OrbStack: 1.61 GiB at idle, peak 1.91 GiB
+#                    under a 32-thread write load, no OOM kill; with the stock
+#                    yaml a 1.5 GiB limit OOM-killed on boot)
+#   Unchanged        commitlog_sync: periodic, 10000ms; batch_size_warn 5KiB,
 #                    batch_size_fail 50KiB; tombstone warn 1000, fail 100000;
-#                    num_tokens 16; memtable_allocation_type heap_buffers
+#                    num_tokens 16 (same in the stock and the latest file)
 #
 # OrbStack or Docker Desktop must be allowed more memory than the limit above.
 
@@ -39,15 +61,15 @@ name: hfs-cassandra
 
 services:
   cassandra:
-    image: cassandra:5.0.9-bookworm@sha256:7ee3eda0f01d80fa4cf93cefb2b1b993bd356a98b7200827d2af5113475534d1
+    image: cassandra:5.0.9-trixie@sha256:618a493bcf1f817ea2f07288a46fa76fb2d9c4dfd5a04c28227336405782889c
     # Run through sh so a checkout without the executable bit (Windows) works.
     entrypoint: ["sh", "/usr/local/bin/hfs-entrypoint.sh"]
     command: ["cassandra", "-f"]
     environment:
       CASSANDRA_CLUSTER_NAME: helios
       CASSANDRA_ENDPOINT_SNITCH: GossipingPropertyFileSnitch
-      CASSANDRA_DC: dc1
-      CASSANDRA_RACK: rack1
+      CASSANDRA_DC: helios-dc1
+      CASSANDRA_RACK: helios-rack1
       MAX_HEAP_SIZE: 1G
       MAX_DIRECT_MEMORY_SIZE: 512M
       JVM_EXTRA_OPTS: -XX:ParallelGCThreads=4 -XX:ConcGCThreads=4
@@ -61,7 +83,7 @@ services:
       - cassandra-data:/var/lib/cassandra
     healthcheck:
       # Ready means CQL answers, not merely that the JVM is up. First boot
-      # takes about 60 s on an Apple-silicon laptop.
+      # takes about 59 s on an Apple-silicon laptop.
       test: ["CMD-SHELL", "cqlsh -e 'SELECT release_version FROM system.local' > /dev/null 2>&1"]
       interval: 10s
       timeout: 10s

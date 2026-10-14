@@ -1,12 +1,24 @@
 #!/bin/sh
 # Wrapper around the official image's docker-entrypoint.sh.
 #
-# The official entrypoint only rewrites a fixed list of cassandra.yaml keys
-# from CASSANDRA_* variables, and Cassandra 5.0 ignores JVM system properties
-# for yaml settings unless an undocumented flag is set. So the settings the
-# design document requires and the image cannot set are written here, into the
-# image's own copy of cassandra.yaml, before the stock entrypoint runs. The
-# file is never bind-mounted, so the stock entrypoint's own edits still work.
+# Two steps run before the stock entrypoint:
+#
+# 1. cassandra_latest.yaml, which 5.0 provides "for new users ... and for users
+#    evaluating the technology" (its header; trie memtables, BTI SSTables, UCS
+#    compaction, SAI, Paxos v2; see README.md), is copied over cassandra.yaml. It is copied rather than
+#    selected with -Dcassandra.config because the stock entrypoint writes
+#    CASSANDRA_CLUSTER_NAME, CASSANDRA_ENDPOINT_SNITCH, CASSANDRA_DC and the
+#    rest into cassandra.yaml only. The copy runs on every boot, so a restart
+#    starts from a fresh file and the stock entrypoint re-applies its edits.
+#
+# 2. paxos_variant is set explicitly. cassandra_latest.yaml already says v2, so
+#    this is an assertion: set_yaml fails the boot if the key is ever missing
+#    or changed. The stock entrypoint only rewrites a fixed list of keys, and
+#    5.0 ignores JVM system properties for yaml settings unless an
+#    undocumented flag is set, so there is no other way to set it.
+#
+# The files are never bind-mounted, so the stock entrypoint's own edits still
+# work.
 set -eu
 
 yaml=/etc/cassandra/cassandra.yaml
@@ -25,8 +37,10 @@ set_yaml() {
     fi
 }
 
+cp /etc/cassandra/cassandra_latest.yaml "$yaml"
+
 # Paxos v2: two round trips per LWT write instead of four (cassandra.yaml
-# comment, 5.0). The 5.0 default is v1. Verify at runtime with
+# comment, 5.0). The stock cassandra.yaml leaves it at v1. Verify at runtime with
 #   SELECT value FROM system_views.settings WHERE name = 'paxos_variant';
 set_yaml paxos_variant v2
 

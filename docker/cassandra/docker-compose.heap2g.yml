@@ -5,8 +5,10 @@
 #   Heap             MAX_HEAP_SIZE=2G
 #   Direct memory    MAX_DIRECT_MEMORY_SIZE=1G (half the heap)
 #   CPU limit        4 CPUs (unchanged)
-#   Memory limit     5 GiB, swap disabled (measured steady-state RSS with a
-#                    2G heap at idle: about 2.6 GiB)
+#   Memory limit     5 GiB, swap disabled (indicative, Apple-silicon 18 GB
+#                    laptop under OrbStack, cassandra_latest.yaml: 2.65 GiB at
+#                    idle, peak 3.31 GiB under a 32-thread write load, no OOM
+#                    kill)
 #
 # The PostgreSQL benchmark container uses the same CPU and memory limits.
 

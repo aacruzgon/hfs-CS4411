@@ -1,0 +1,47 @@
+# ADR-aacruzgon-0002: Resource limits for the single-node container
+
+- **Date:** 2026-10-13
+- **Status:** accepted
+- **Context:**
+    - **Requirement.** Item 0.1 requires an explicit heap and recorded CPU and memory limits.
+    - **Why it matters.** Item 0.2 must give PostgreSQL the same limits, so these numbers become the benchmark envelope for both databases.
+    - **Heap per machine.** Section 1 of the roadmap fixes it: 1G on the 16 and 18 GB laptops, 2G on the 32 GB machines.
+    - **The startup script ignores the container's limits.** `cassandra-env.sh` sizes GC threads from the host's `/proc/cpuinfo` and direct memory from the host's RAM.
+- **Decision:**
+    - **Default profile:** 4 CPUs, `MAX_HEAP_SIZE=1G`, `MAX_DIRECT_MEMORY_SIZE=512M`, a 3 GiB memory limit with swap disabled, and `-XX:ParallelGCThreads=4 -XX:ConcGCThreads=4`.
+    - **`docker-compose.heap2g.yml`**, for the 32 GB machines and every reported benchmark, changes only three things: the heap to 2G, direct memory to 1G and the limit to 5 GiB.
+    - **Only the 2G profile's numbers go in the report.**
+    - **PostgreSQL (item 0.2)** gets the same 4 CPUs and 3 or 5 GiB.
+- **Alternatives considered:**
+    - **Limits of 2 GiB and 3 GiB:** lost. These are about the smallest that boot with the stock yaml, where a 1.5 GiB limit was OOM-killed at boot. With `cassandra_latest.yaml` (ADR-aacruzgon-0001) idle memory is 1.73 GiB at a 1G heap and 2.67 GiB at a 2G heap. Peak under a 32-thread write load is 1.91 GiB and 3.31 GiB, which would leave almost no room at the smaller limits.
+    - **2 CPUs:** lost. LWT benchmarks at concurrency 32 would be CPU-bound on the database before anything else.
+    - **More than 4 CPUs:** lost. On the laptops, 4 for Cassandra and 4 for the load client already leave only the rest for Helios and builds.
+    - **Leaving GC threads and direct memory to `cassandra-env.sh`:** lost. Both would then vary with the host machine: 11 GC threads on this laptop against a 4-CPU limit.
+    - **Setting limits through environment variables instead of a second file:** lost. The roadmap asks for the limits to be recorded in the file.
+- **Consequences:**
+    - **Expected headroom at peak:** about 1.1 GiB at 3 GiB and 1.7 GiB at 5 GiB.
+    - **Expected worst case, by arithmetic and not measured:**
+        - Inputs: the heap, plus direct memory pinned at half the heap.
+        - Off-heap memtables and the file cache each default to about a quarter of the heap.
+        - About 0.4 GiB of JVM overhead on top.
+        - Result: about 2.2 GiB at 1G and 3.9 GiB at 2G, both under the limits.
+        - The page cache also counts against the cgroup limit, but it is reclaimable.
+    - **Item 0.6:** the harness logs peak memory on long runs to confirm this. If memory pressure appears under benchmark load, revisit the 5 GiB figure before changing the heap.
+    - **Compaction threads:** `cassandra_latest.yaml` runs 8 compaction threads on these 4 CPUs (kept as shipped in ADR-aacruzgon-0001). Any CPU contention from that shows up here first.
+    - **VM memory:** OrbStack or Docker Desktop must allow its VM more than 5 GiB on the benchmark machine.
+    - **Laptop profile:** a 1G heap is below the 2 GB minimum in the Cassandra hardware docs. That is acceptable for development, and it is why only the 2G profile is reported. Laptop numbers never go in the report.
+    - **PostgreSQL:** item 0.2 still decides how PostgreSQL uses its envelope, for example `shared_buffers`. This entry fixes only the container limits.
+- **AI involvement:**
+    - **Tools:** Claude Code (Opus 5.5), with Sonnet 5.5 and Haiku 5.5 subagents.
+    - **What the AI proposed:** a subagent proposed 3 GiB and 5 GiB from the source defaults (file cache, networking cache, direct memory). The AI found the host-sized GC-thread and direct-memory logic in `cassandra-env.sh`, then proposed pinning both, the 4-CPU limit, and the worst-case arithmetic above.
+    - **Measurements:** resident memory was measured at both heaps, first with the stock yaml and again with `cassandra_latest.yaml`, at idle and under load.
+    - **What the human changed:** Alan's decision in ADR-aacruzgon-0001 to use `cassandra_latest.yaml` moved this entry's numbers. Off-heap memtables raised idle memory by about 0.05 GiB and peak memory under load by about 0.3–0.5 GiB. The limits were re-checked against the new numbers and kept. Alan reviewed and agreed with the 4-CPU limit despite the 8 compaction threads, and with reporting only the 2G profile. He also agreed that PostgreSQL inherits only the container envelope, with its tuning left to item 0.2.
+    - **Verified:**
+        - On a cold boot of each profile, `docker inspect` and the container cgroup show `cpu.max 400000 100000`, a `memory.max` of 3 or 5 GiB, and `memory.swap.max 0`.
+        - The JVM ran 4 `GC Thread` and 4 `G1 Conc` threads.
+        - `-Xms`/`-Xmx` and `MaxDirectMemorySize` matched each profile.
+        - There was no OOM kill under load at either limit (`0001-yaml-comparison/README.md`).
+- **Links:**
+    - **Commits:** first version in commit `1a0bb61bd`; revised on branch `chore/cassandra-single-node`.
+    - **Files:** `docker/cassandra/docker-compose.yml` and `docker/cassandra/docker-compose.heap2g.yml`.
+    - **Docs:** roadmap items 0.1, 0.2 and 0.6, and section 1 "Machines"; ADR-aacruzgon-0001.
