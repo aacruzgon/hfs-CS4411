@@ -1,0 +1,43 @@
+# B1 transcript. Each: docker exec -i spike-b-cassandra-1 cqlsh -f /tmp/w/<file>
+### b1a (    6693 bytes script)
+Consistency level set to LOCAL_QUORUM.
+
+Warnings :
+Batch for [spike.resources] is of size 6564, exceeding specified threshold of 5120 by 1444.
+
+
+### b1b (   66521 bytes script)
+/tmp/w/b1b.cql:64:InvalidRequest: Error from server: code=2200 [Invalid query] message="Batch too large"
+Consistency level set to LOCAL_QUORUM.
+
+### b1c (   67431 bytes script)
+Consistency level set to LOCAL_QUORUM.
+
+### b1d (   66600 bytes script)
+/tmp/w/b1d.cql:64:InvalidRequest: Error from server: code=2200 [Invalid query] message="Batch too large"
+Consistency level set to LOCAL_QUORUM.
+
+### server log
+INFO  [main] 2026-10-14T02:53:07,893 ColumnFamilyStore.java:502 - Initializing system.batches
+WARN  [Native-Transport-Requests-1] 2026-10-14T02:54:22,127 BatchStatement.java:362 - Batch for [spike.resources] is of size 6.410KiB, exceeding specified threshold of 5.000KiB by 1.410KiB.
+ERROR [Native-Transport-Requests-1] 2026-10-14T02:54:22,593 BatchStatement.java:356 - Batch for [spike.resources] is of size 64.102KiB, exceeding specified threshold of 50.000KiB by 14.102KiB. (see batch_size_fail_threshold)
+ERROR [Native-Transport-Requests-1] 2026-10-14T02:54:23,505 BatchStatement.java:356 - Batch for [spike.resources] is of size 64.102KiB, exceeding specified threshold of 50.000KiB by 14.102KiB. (see batch_size_fail_threshold)
+### B1c verification: rows written by single-partition 60KiB batch
+Consistency level set to LOCAL_QUORUM.
+
+ count
+-------
+    60
+
+(1 rows)
+
+ count
+-------
+     6
+
+(1 rows)
+
+Warnings :
+Aggregation query used without partition key
+
+(b1c server log lines: none for it; only 3 BatchStatement lines above)

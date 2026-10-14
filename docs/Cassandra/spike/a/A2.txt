@@ -1,0 +1,376 @@
+-- A2 (5000 rows, 1 partition, flushed to 1 sstable; load via A2load.cql / rows.csv)
+CONSISTENCY LOCAL_QUORUM;
+COPY spike.resources_by_type (tenant_id,resource_type,last_updated,id,version_id) FROM '/tmp/rows.csv';
+SELECT count(*) FROM spike.resources_by_type WHERE tenant_id='t1' AND resource_type='Observation';
+CONSISTENCY LOCAL_QUORUM;
+SERIAL CONSISTENCY LOCAL_SERIAL;
+TRACING ON;
+SELECT last_updated,id,version_id FROM spike.resources_by_type WHERE tenant_id='t1' AND resource_type='Observation' AND (last_updated, id) < ('2026-01-01 00:41:40+0000', 'obs03501') LIMIT 20;
+SELECT count(*) FROM spike.resources_by_type WHERE tenant_id='t1' AND resource_type='Observation';
+TRACING OFF;
+-- OUTPUT
+Consistency level set to LOCAL_QUORUM.
+Serial consistency level set to LOCAL_SERIAL.
+TRACING set to ON
+
+ last_updated                    | id       | version_id
+---------------------------------+----------+------------
+ 2026-01-01 00:41:40.000000+0000 | obs03500 |          1
+ 2026-01-01 00:41:39.000000+0000 | obs03499 |          1
+ 2026-01-01 00:41:38.000000+0000 | obs03498 |          1
+ 2026-01-01 00:41:37.000000+0000 | obs03497 |          1
+ 2026-01-01 00:41:36.000000+0000 | obs03496 |          1
+ 2026-01-01 00:41:35.000000+0000 | obs03495 |          1
+ 2026-01-01 00:41:35.000000+0000 | obs03494 |          1
+ 2026-01-01 00:41:35.000000+0000 | obs03493 |          1
+ 2026-01-01 00:41:34.000000+0000 | obs03492 |          1
+ 2026-01-01 00:41:33.000000+0000 | obs03491 |          1
+ 2026-01-01 00:41:32.000000+0000 | obs03490 |          1
+ 2026-01-01 00:41:31.000000+0000 | obs03489 |          1
+ 2026-01-01 00:41:30.000000+0000 | obs03488 |          1
+ 2026-01-01 00:41:30.000000+0000 | obs03487 |          1
+ 2026-01-01 00:41:30.000000+0000 | obs03486 |          1
+ 2026-01-01 00:41:29.000000+0000 | obs03485 |          1
+ 2026-01-01 00:41:28.000000+0000 | obs03484 |          1
+ 2026-01-01 00:41:27.000000+0000 | obs03483 |          1
+ 2026-01-01 00:41:26.000000+0000 | obs03482 |          1
+ 2026-01-01 00:41:25.000000+0000 | obs03481 |          1
+
+(20 rows)
+
+Tracing session: 9fdca0d0-c77a-11f1-9b9e-8f64a7bf1cce
+
+ activity                                                                                                                                                                                                                               | timestamp                  | source        | source_elapsed | client
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+----------------------------+---------------+----------------+-----------
+                                                                                                                                                                                                                     Execute CQL3 query | 2026-10-14 02:54:50.717000 | 192.168.147.2 |              0 | 127.0.0.1
+ Parsing SELECT last_updated,id,version_id FROM spike.resources_by_type WHERE tenant_id='t1' AND resource_type='Observation' AND (last_updated, id) < ('2026-01-01 00:41:40+0000', 'obs03501') LIMIT 20; [Native-Transport-Requests-10] | 2026-10-14 02:54:50.717001 | 192.168.147.2 |            241 | 127.0.0.1
+                                                                                                                                                                                     Preparing statement [Native-Transport-Requests-10] | 2026-10-14 02:54:50.719000 | 192.168.147.2 |           2190 | 127.0.0.1
+                                                                                                                                                                    Executing single-partition query on resources_by_type [ReadStage-6] | 2026-10-14 02:54:50.725000 | 192.168.147.2 |           8321 | 127.0.0.1
+                                                                                                                                                                                             Acquiring sstable references [ReadStage-6] | 2026-10-14 02:54:50.725001 | 192.168.147.2 |           8454 | 127.0.0.1
+                                                                                                                                                Skipped 0/1 non-slice-intersecting sstables, included 0 due to tombstones [ReadStage-6] | 2026-10-14 02:54:50.725002 | 192.168.147.2 |           8537 | 127.0.0.1
+                                                                                                                                                Partition index found for sstable 3h4n_0835_49oey2d716hdvc2b4e, size = 35 [ReadStage-6] | 2026-10-14 02:54:50.725003 | 192.168.147.2 |           8605 | 127.0.0.1
+                                                                                                                                                                                Merged data from memtables and 1 sstables [ReadStage-6] | 2026-10-14 02:54:50.726000 | 192.168.147.2 |           8894 | 127.0.0.1
+                                                                                                                                                                                  Read 20 live rows and 0 tombstone cells [ReadStage-6] | 2026-10-14 02:54:50.726001 | 192.168.147.2 |           8963 | 127.0.0.1
+                                                                                                                                                                                                                       Request complete | 2026-10-14 02:54:50.726487 | 192.168.147.2 |           9487 | 127.0.0.1
+
+
+ count
+-------
+  5000
+
+(1 rows)
+
+Tracing session: 9fe0bf80-c77a-11f1-9b9e-8f64a7bf1cce
+
+ activity                                                                                                                                 | timestamp                  | source        | source_elapsed | client
+------------------------------------------------------------------------------------------------------------------------------------------+----------------------------+---------------+----------------+-----------
+                                                                                                                       Execute CQL3 query | 2026-10-14 02:54:50.744000 | 192.168.147.2 |              0 | 127.0.0.1
+ Parsing SELECT count(*) FROM spike.resources_by_type WHERE tenant_id='t1' AND resource_type='Observation'; [Native-Transport-Requests-8] | 2026-10-14 02:54:50.744001 | 192.168.147.2 |            201 | 127.0.0.1
+                                                                                        Preparing statement [Native-Transport-Requests-8] | 2026-10-14 02:54:50.744002 | 192.168.147.2 |            391 | 127.0.0.1
+                                                                     Executing single-partition query on resources_by_type [ReadStage-10] | 2026-10-14 02:54:50.745000 | 192.168.147.2 |           1058 | 127.0.0.1
+                                                                                              Acquiring sstable references [ReadStage-10] | 2026-10-14 02:54:50.745001 | 192.168.147.2 |           1101 | 127.0.0.1
+                                                 Skipped 0/1 non-slice-intersecting sstables, included 0 due to tombstones [ReadStage-10] | 2026-10-14 02:54:50.745002 | 192.168.147.2 |           1151 | 127.0.0.1
+                                                 Partition index found for sstable 3h4n_0835_49oey2d716hdvc2b4e, size = 35 [ReadStage-10] | 2026-10-14 02:54:50.745003 | 192.168.147.2 |           1214 | 127.0.0.1
+                                                                                 Merged data from memtables and 1 sstables [ReadStage-10] | 2026-10-14 02:54:50.745004 | 192.168.147.2 |           1450 | 127.0.0.1
+                                                                                  Read 100 live rows and 0 tombstone cells [ReadStage-10] | 2026-10-14 02:54:50.745005 | 192.168.147.2 |           1497 | 127.0.0.1
+                                                                     Executing single-partition query on resources_by_type [ReadStage-10] | 2026-10-14 02:54:50.747000 | 192.168.147.2 |           2920 | 127.0.0.1
+                                                                                              Acquiring sstable references [ReadStage-10] | 2026-10-14 02:54:50.747001 | 192.168.147.2 |           2984 | 127.0.0.1
+                                                 Skipped 0/1 non-slice-intersecting sstables, included 0 due to tombstones [ReadStage-10] | 2026-10-14 02:54:50.747002 | 192.168.147.2 |           3046 | 127.0.0.1
+                                                 Partition index found for sstable 3h4n_0835_49oey2d716hdvc2b4e, size = 35 [ReadStage-10] | 2026-10-14 02:54:50.747003 | 192.168.147.2 |           3098 | 127.0.0.1
+                                                                                 Merged data from memtables and 1 sstables [ReadStage-10] | 2026-10-14 02:54:50.747004 | 192.168.147.2 |           3279 | 127.0.0.1
+                                                                                  Read 100 live rows and 0 tombstone cells [ReadStage-10] | 2026-10-14 02:54:50.747005 | 192.168.147.2 |           3314 | 127.0.0.1
+                                                                     Executing single-partition query on resources_by_type [ReadStage-10] | 2026-10-14 02:54:50.748000 | 192.168.147.2 |           4396 | 127.0.0.1
+                                                                                              Acquiring sstable references [ReadStage-10] | 2026-10-14 02:54:50.748001 | 192.168.147.2 |           4535 | 127.0.0.1
+                                                 Skipped 0/1 non-slice-intersecting sstables, included 0 due to tombstones [ReadStage-10] | 2026-10-14 02:54:50.749000 | 192.168.147.2 |           4676 | 127.0.0.1
+                                                 Partition index found for sstable 3h4n_0835_49oey2d716hdvc2b4e, size = 35 [ReadStage-10] | 2026-10-14 02:54:50.749001 | 192.168.147.2 |           4877 | 127.0.0.1
+                                                                                 Merged data from memtables and 1 sstables [ReadStage-10] | 2026-10-14 02:54:50.749002 | 192.168.147.2 |           5201 | 127.0.0.1
+                                                                                  Read 100 live rows and 0 tombstone cells [ReadStage-10] | 2026-10-14 02:54:50.749003 | 192.168.147.2 |           5275 | 127.0.0.1
+                                                                     Executing single-partition query on resources_by_type [ReadStage-10] | 2026-10-14 02:54:50.749004 | 192.168.147.2 |           5561 | 127.0.0.1
+                                                                                              Acquiring sstable references [ReadStage-10] | 2026-10-14 02:54:50.750000 | 192.168.147.2 |           5603 | 127.0.0.1
+                                                 Skipped 0/1 non-slice-intersecting sstables, included 0 due to tombstones [ReadStage-10] | 2026-10-14 02:54:50.750001 | 192.168.147.2 |           5658 | 127.0.0.1
+                                                 Partition index found for sstable 3h4n_0835_49oey2d716hdvc2b4e, size = 35 [ReadStage-10] | 2026-10-14 02:54:50.750002 | 192.168.147.2 |           5710 | 127.0.0.1
+                                                                                 Merged data from memtables and 1 sstables [ReadStage-10] | 2026-10-14 02:54:50.750003 | 192.168.147.2 |           5844 | 127.0.0.1
+                                                                                  Read 100 live rows and 0 tombstone cells [ReadStage-10] | 2026-10-14 02:54:50.750004 | 192.168.147.2 |           5878 | 127.0.0.1
+                                                                     Executing single-partition query on resources_by_type [ReadStage-10] | 2026-10-14 02:54:50.750005 | 192.168.147.2 |           6033 | 127.0.0.1
+                                                                                              Acquiring sstable references [ReadStage-10] | 2026-10-14 02:54:50.750006 | 192.168.147.2 |           6057 | 127.0.0.1
+                                                 Skipped 0/1 non-slice-intersecting sstables, included 0 due to tombstones [ReadStage-10] | 2026-10-14 02:54:50.750007 | 192.168.147.2 |           6087 | 127.0.0.1
+                                                 Partition index found for sstable 3h4n_0835_49oey2d716hdvc2b4e, size = 35 [ReadStage-10] | 2026-10-14 02:54:50.750008 | 192.168.147.2 |           6122 | 127.0.0.1
+                                                                                 Merged data from memtables and 1 sstables [ReadStage-10] | 2026-10-14 02:54:50.750009 | 192.168.147.2 |           6265 | 127.0.0.1
+                                                                                  Read 100 live rows and 0 tombstone cells [ReadStage-10] | 2026-10-14 02:54:50.750010 | 192.168.147.2 |           6312 | 127.0.0.1
+                                                                     Executing single-partition query on resources_by_type [ReadStage-10] | 2026-10-14 02:54:50.750011 | 192.168.147.2 |           6449 | 127.0.0.1
+                                                                                              Acquiring sstable references [ReadStage-10] | 2026-10-14 02:54:50.750012 | 192.168.147.2 |           6480 | 127.0.0.1
+                                                 Skipped 0/1 non-slice-intersecting sstables, included 0 due to tombstones [ReadStage-10] | 2026-10-14 02:54:50.750013 | 192.168.147.2 |           6556 | 127.0.0.1
+                                                 Partition index found for sstable 3h4n_0835_49oey2d716hdvc2b4e, size = 35 [ReadStage-10] | 2026-10-14 02:54:50.751000 | 192.168.147.2 |           6594 | 127.0.0.1
+                                                                                 Merged data from memtables and 1 sstables [ReadStage-10] | 2026-10-14 02:54:50.751001 | 192.168.147.2 |           6785 | 127.0.0.1
+                                                                                  Read 100 live rows and 0 tombstone cells [ReadStage-10] | 2026-10-14 02:54:50.751002 | 192.168.147.2 |           6825 | 127.0.0.1
+                                                                     Executing single-partition query on resources_by_type [ReadStage-10] | 2026-10-14 02:54:50.751003 | 192.168.147.2 |           6960 | 127.0.0.1
+                                                                                              Acquiring sstable references [ReadStage-10] | 2026-10-14 02:54:50.751004 | 192.168.147.2 |           6989 | 127.0.0.1
+                                                 Skipped 0/1 non-slice-intersecting sstables, included 0 due to tombstones [ReadStage-10] | 2026-10-14 02:54:50.751005 | 192.168.147.2 |           7018 | 127.0.0.1
+                                                 Partition index found for sstable 3h4n_0835_49oey2d716hdvc2b4e, size = 35 [ReadStage-10] | 2026-10-14 02:54:50.751006 | 192.168.147.2 |           7046 | 127.0.0.1
+                                                                                 Merged data from memtables and 1 sstables [ReadStage-10] | 2026-10-14 02:54:50.751007 | 192.168.147.2 |           7166 | 127.0.0.1
+                                                                                  Read 100 live rows and 0 tombstone cells [ReadStage-10] | 2026-10-14 02:54:50.751008 | 192.168.147.2 |           7189 | 127.0.0.1
+                                                                     Executing single-partition query on resources_by_type [ReadStage-10] | 2026-10-14 02:54:50.752000 | 192.168.147.2 |           7659 | 127.0.0.1
+                                                                                              Acquiring sstable references [ReadStage-10] | 2026-10-14 02:54:50.752001 | 192.168.147.2 |           7694 | 127.0.0.1
+                                                 Skipped 0/1 non-slice-intersecting sstables, included 0 due to tombstones [ReadStage-10] | 2026-10-14 02:54:50.752002 | 192.168.147.2 |           7737 | 127.0.0.1
+                                                 Partition index found for sstable 3h4n_0835_49oey2d716hdvc2b4e, size = 35 [ReadStage-10] | 2026-10-14 02:54:50.752003 | 192.168.147.2 |           7778 | 127.0.0.1
+                                                                                 Merged data from memtables and 1 sstables [ReadStage-10] | 2026-10-14 02:54:50.752004 | 192.168.147.2 |           7929 | 127.0.0.1
+                                                                                  Read 100 live rows and 0 tombstone cells [ReadStage-10] | 2026-10-14 02:54:50.752005 | 192.168.147.2 |           7954 | 127.0.0.1
+                                                                     Executing single-partition query on resources_by_type [ReadStage-10] | 2026-10-14 02:54:50.752006 | 192.168.147.2 |           8292 | 127.0.0.1
+                                                                                              Acquiring sstable references [ReadStage-10] | 2026-10-14 02:54:50.752007 | 192.168.147.2 |           8325 | 127.0.0.1
+                                                 Skipped 0/1 non-slice-intersecting sstables, included 0 due to tombstones [ReadStage-10] | 2026-10-14 02:54:50.752008 | 192.168.147.2 |           8362 | 127.0.0.1
+                                                 Partition index found for sstable 3h4n_0835_49oey2d716hdvc2b4e, size = 35 [ReadStage-10] | 2026-10-14 02:54:50.752009 | 192.168.147.2 |           8398 | 127.0.0.1
+                                                                                 Merged data from memtables and 1 sstables [ReadStage-10] | 2026-10-14 02:54:50.752010 | 192.168.147.2 |           8545 | 127.0.0.1
+                                                                                  Read 100 live rows and 0 tombstone cells [ReadStage-10] | 2026-10-14 02:54:50.752011 | 192.168.147.2 |           8579 | 127.0.0.1
+                                                                      Executing single-partition query on resources_by_type [ReadStage-1] | 2026-10-14 02:54:50.756000 | 192.168.147.2 |          11620 | 127.0.0.1
+                                                                                               Acquiring sstable references [ReadStage-1] | 2026-10-14 02:54:50.756001 | 192.168.147.2 |          11712 | 127.0.0.1
+                                                  Skipped 0/1 non-slice-intersecting sstables, included 0 due to tombstones [ReadStage-1] | 2026-10-14 02:54:50.756002 | 192.168.147.2 |          11768 | 127.0.0.1
+                                                  Partition index found for sstable 3h4n_0835_49oey2d716hdvc2b4e, size = 35 [ReadStage-1] | 2026-10-14 02:54:50.756003 | 192.168.147.2 |          11814 | 127.0.0.1
+                                                                                  Merged data from memtables and 1 sstables [ReadStage-1] | 2026-10-14 02:54:50.756004 | 192.168.147.2 |          12008 | 127.0.0.1
+                                                                                   Read 100 live rows and 0 tombstone cells [ReadStage-1] | 2026-10-14 02:54:50.756005 | 192.168.147.2 |          12051 | 127.0.0.1
+                                                                      Executing single-partition query on resources_by_type [ReadStage-1] | 2026-10-14 02:54:50.756006 | 192.168.147.2 |          12339 | 127.0.0.1
+                                                                                               Acquiring sstable references [ReadStage-1] | 2026-10-14 02:54:50.756007 | 192.168.147.2 |          12365 | 127.0.0.1
+                                                  Skipped 0/1 non-slice-intersecting sstables, included 0 due to tombstones [ReadStage-1] | 2026-10-14 02:54:50.756008 | 192.168.147.2 |          12398 | 127.0.0.1
+                                                  Partition index found for sstable 3h4n_0835_49oey2d716hdvc2b4e, size = 35 [ReadStage-1] | 2026-10-14 02:54:50.756009 | 192.168.147.2 |          12431 | 127.0.0.1
+                                                                                  Merged data from memtables and 1 sstables [ReadStage-1] | 2026-10-14 02:54:50.756010 | 192.168.147.2 |          12561 | 127.0.0.1
+                                                                                   Read 100 live rows and 0 tombstone cells [ReadStage-1] | 2026-10-14 02:54:50.757000 | 192.168.147.2 |          12595 | 127.0.0.1
+                                                                      Executing single-partition query on resources_by_type [ReadStage-1] | 2026-10-14 02:54:50.757001 | 192.168.147.2 |          12775 | 127.0.0.1
+                                                                                               Acquiring sstable references [ReadStage-1] | 2026-10-14 02:54:50.757002 | 192.168.147.2 |          12806 | 127.0.0.1
+                                                  Skipped 0/1 non-slice-intersecting sstables, included 0 due to tombstones [ReadStage-1] | 2026-10-14 02:54:50.757003 | 192.168.147.2 |          12845 | 127.0.0.1
+                                                  Partition index found for sstable 3h4n_0835_49oey2d716hdvc2b4e, size = 35 [ReadStage-1] | 2026-10-14 02:54:50.757004 | 192.168.147.2 |          12883 | 127.0.0.1
+                                                                                  Merged data from memtables and 1 sstables [ReadStage-1] | 2026-10-14 02:54:50.757005 | 192.168.147.2 |          13044 | 127.0.0.1
+                                                                                   Read 100 live rows and 0 tombstone cells [ReadStage-1] | 2026-10-14 02:54:50.757006 | 192.168.147.2 |          13089 | 127.0.0.1
+                                                                      Executing single-partition query on resources_by_type [ReadStage-1] | 2026-10-14 02:54:50.757007 | 192.168.147.2 |          13251 | 127.0.0.1
+                                                                                               Acquiring sstable references [ReadStage-1] | 2026-10-14 02:54:50.757008 | 192.168.147.2 |          13279 | 127.0.0.1
+                                                  Skipped 0/1 non-slice-intersecting sstables, included 0 due to tombstones [ReadStage-1] | 2026-10-14 02:54:50.757009 | 192.168.147.2 |          13315 | 127.0.0.1
+                                                  Partition index found for sstable 3h4n_0835_49oey2d716hdvc2b4e, size = 35 [ReadStage-1] | 2026-10-14 02:54:50.757010 | 192.168.147.2 |          13351 | 127.0.0.1
+                                                                                  Merged data from memtables and 1 sstables [ReadStage-1] | 2026-10-14 02:54:50.757011 | 192.168.147.2 |          13482 | 127.0.0.1
+                                                                                   Read 100 live rows and 0 tombstone cells [ReadStage-1] | 2026-10-14 02:54:50.757012 | 192.168.147.2 |          13511 | 127.0.0.1
+                                                                      Executing single-partition query on resources_by_type [ReadStage-1] | 2026-10-14 02:54:50.758000 | 192.168.147.2 |          13680 | 127.0.0.1
+                                                                                               Acquiring sstable references [ReadStage-1] | 2026-10-14 02:54:50.758001 | 192.168.147.2 |          13713 | 127.0.0.1
+                                                  Skipped 0/1 non-slice-intersecting sstables, included 0 due to tombstones [ReadStage-1] | 2026-10-14 02:54:50.758002 | 192.168.147.2 |          13752 | 127.0.0.1
+                                                  Partition index found for sstable 3h4n_0835_49oey2d716hdvc2b4e, size = 35 [ReadStage-1] | 2026-10-14 02:54:50.758003 | 192.168.147.2 |          13795 | 127.0.0.1
+                                                                                  Merged data from memtables and 1 sstables [ReadStage-1] | 2026-10-14 02:54:50.758004 | 192.168.147.2 |          13911 | 127.0.0.1
+                                                                                   Read 100 live rows and 0 tombstone cells [ReadStage-1] | 2026-10-14 02:54:50.758005 | 192.168.147.2 |          13936 | 127.0.0.1
+                                                                      Executing single-partition query on resources_by_type [ReadStage-1] | 2026-10-14 02:54:50.758006 | 192.168.147.2 |          14076 | 127.0.0.1
+                                                                                               Acquiring sstable references [ReadStage-1] | 2026-10-14 02:54:50.758007 | 192.168.147.2 |          14104 | 127.0.0.1
+                                                  Skipped 0/1 non-slice-intersecting sstables, included 0 due to tombstones [ReadStage-1] | 2026-10-14 02:54:50.758008 | 192.168.147.2 |          14138 | 127.0.0.1
+                                                  Partition index found for sstable 3h4n_0835_49oey2d716hdvc2b4e, size = 35 [ReadStage-1] | 2026-10-14 02:54:50.758009 | 192.168.147.2 |          14171 | 127.0.0.1
+                                                                                  Merged data from memtables and 1 sstables [ReadStage-1] | 2026-10-14 02:54:50.758010 | 192.168.147.2 |          14314 | 127.0.0.1
+                                                                                   Read 100 live rows and 0 tombstone cells [ReadStage-1] | 2026-10-14 02:54:50.758011 | 192.168.147.2 |          14348 | 127.0.0.1
+                                                                      Executing single-partition query on resources_by_type [ReadStage-1] | 2026-10-14 02:54:50.758012 | 192.168.147.2 |          14498 | 127.0.0.1
+                                                                                               Acquiring sstable references [ReadStage-1] | 2026-10-14 02:54:50.758013 | 192.168.147.2 |          14520 | 127.0.0.1
+                                                  Skipped 0/1 non-slice-intersecting sstables, included 0 due to tombstones [ReadStage-1] | 2026-10-14 02:54:50.758014 | 192.168.147.2 |          14547 | 127.0.0.1
+                                                  Partition index found for sstable 3h4n_0835_49oey2d716hdvc2b4e, size = 35 [ReadStage-1] | 2026-10-14 02:54:50.758015 | 192.168.147.2 |          14582 | 127.0.0.1
+                                                                                  Merged data from memtables and 1 sstables [ReadStage-1] | 2026-10-14 02:54:50.759000 | 192.168.147.2 |          14722 | 127.0.0.1
+                                                                                   Read 100 live rows and 0 tombstone cells [ReadStage-1] | 2026-10-14 02:54:50.759001 | 192.168.147.2 |          14754 | 127.0.0.1
+                                                                      Executing single-partition query on resources_by_type [ReadStage-1] | 2026-10-14 02:54:50.759002 | 192.168.147.2 |          14913 | 127.0.0.1
+                                                                                               Acquiring sstable references [ReadStage-1] | 2026-10-14 02:54:50.759003 | 192.168.147.2 |          14941 | 127.0.0.1
+                                                  Skipped 0/1 non-slice-intersecting sstables, included 0 due to tombstones [ReadStage-1] | 2026-10-14 02:54:50.759004 | 192.168.147.2 |          14977 | 127.0.0.1
+                                                  Partition index found for sstable 3h4n_0835_49oey2d716hdvc2b4e, size = 35 [ReadStage-1] | 2026-10-14 02:54:50.759005 | 192.168.147.2 |          15016 | 127.0.0.1
+                                                                                  Merged data from memtables and 1 sstables [ReadStage-1] | 2026-10-14 02:54:50.759006 | 192.168.147.2 |          15174 | 127.0.0.1
+                                                                                   Read 100 live rows and 0 tombstone cells [ReadStage-1] | 2026-10-14 02:54:50.759007 | 192.168.147.2 |          15206 | 127.0.0.1
+                                                                      Executing single-partition query on resources_by_type [ReadStage-1] | 2026-10-14 02:54:50.759008 | 192.168.147.2 |          15350 | 127.0.0.1
+                                                                                               Acquiring sstable references [ReadStage-1] | 2026-10-14 02:54:50.759009 | 192.168.147.2 |          15374 | 127.0.0.1
+                                                  Skipped 0/1 non-slice-intersecting sstables, included 0 due to tombstones [ReadStage-1] | 2026-10-14 02:54:50.759010 | 192.168.147.2 |          15401 | 127.0.0.1
+                                                  Partition index found for sstable 3h4n_0835_49oey2d716hdvc2b4e, size = 35 [ReadStage-1] | 2026-10-14 02:54:50.759011 | 192.168.147.2 |          15430 | 127.0.0.1
+                                                                                  Merged data from memtables and 1 sstables [ReadStage-1] | 2026-10-14 02:54:50.760000 | 192.168.147.2 |          15605 | 127.0.0.1
+                                                                                   Read 100 live rows and 0 tombstone cells [ReadStage-1] | 2026-10-14 02:54:50.760001 | 192.168.147.2 |          15647 | 127.0.0.1
+                                                                      Executing single-partition query on resources_by_type [ReadStage-1] | 2026-10-14 02:54:50.760002 | 192.168.147.2 |          15792 | 127.0.0.1
+                                                                                               Acquiring sstable references [ReadStage-1] | 2026-10-14 02:54:50.760003 | 192.168.147.2 |          15817 | 127.0.0.1
+                                                  Skipped 0/1 non-slice-intersecting sstables, included 0 due to tombstones [ReadStage-1] | 2026-10-14 02:54:50.760004 | 192.168.147.2 |          15853 | 127.0.0.1
+                                                  Partition index found for sstable 3h4n_0835_49oey2d716hdvc2b4e, size = 35 [ReadStage-1] | 2026-10-14 02:54:50.760005 | 192.168.147.2 |          15897 | 127.0.0.1
+                                                                                  Merged data from memtables and 1 sstables [ReadStage-1] | 2026-10-14 02:54:50.760006 | 192.168.147.2 |          16021 | 127.0.0.1
+                                                                                   Read 100 live rows and 0 tombstone cells [ReadStage-1] | 2026-10-14 02:54:50.760007 | 192.168.147.2 |          16049 | 127.0.0.1
+                                                                      Executing single-partition query on resources_by_type [ReadStage-1] | 2026-10-14 02:54:50.760008 | 192.168.147.2 |          16195 | 127.0.0.1
+                                                                                               Acquiring sstable references [ReadStage-1] | 2026-10-14 02:54:50.760009 | 192.168.147.2 |          16226 | 127.0.0.1
+                                                  Skipped 0/1 non-slice-intersecting sstables, included 0 due to tombstones [ReadStage-1] | 2026-10-14 02:54:50.760010 | 192.168.147.2 |          16264 | 127.0.0.1
+                                                  Partition index found for sstable 3h4n_0835_49oey2d716hdvc2b4e, size = 35 [ReadStage-1] | 2026-10-14 02:54:50.760011 | 192.168.147.2 |          16305 | 127.0.0.1
+                                                                                  Merged data from memtables and 1 sstables [ReadStage-1] | 2026-10-14 02:54:50.760012 | 192.168.147.2 |          16426 | 127.0.0.1
+                                                                                   Read 100 live rows and 0 tombstone cells [ReadStage-1] | 2026-10-14 02:54:50.760013 | 192.168.147.2 |          16453 | 127.0.0.1
+                                                                      Executing single-partition query on resources_by_type [ReadStage-1] | 2026-10-14 02:54:50.761000 | 192.168.147.2 |          16648 | 127.0.0.1
+                                                                                               Acquiring sstable references [ReadStage-1] | 2026-10-14 02:54:50.761001 | 192.168.147.2 |          16671 | 127.0.0.1
+                                                  Skipped 0/1 non-slice-intersecting sstables, included 0 due to tombstones [ReadStage-1] | 2026-10-14 02:54:50.761002 | 192.168.147.2 |          16700 | 127.0.0.1
+                                                  Partition index found for sstable 3h4n_0835_49oey2d716hdvc2b4e, size = 35 [ReadStage-1] | 2026-10-14 02:54:50.761003 | 192.168.147.2 |          16735 | 127.0.0.1
+                                                                                  Merged data from memtables and 1 sstables [ReadStage-1] | 2026-10-14 02:54:50.761004 | 192.168.147.2 |          16843 | 127.0.0.1
+                                                                                   Read 100 live rows and 0 tombstone cells [ReadStage-1] | 2026-10-14 02:54:50.761005 | 192.168.147.2 |          16867 | 127.0.0.1
+                                                                      Executing single-partition query on resources_by_type [ReadStage-1] | 2026-10-14 02:54:50.761006 | 192.168.147.2 |          17038 | 127.0.0.1
+                                                                                               Acquiring sstable references [ReadStage-1] | 2026-10-14 02:54:50.761007 | 192.168.147.2 |          17058 | 127.0.0.1
+                                                  Skipped 0/1 non-slice-intersecting sstables, included 0 due to tombstones [ReadStage-1] | 2026-10-14 02:54:50.761008 | 192.168.147.2 |          17083 | 127.0.0.1
+                                                  Partition index found for sstable 3h4n_0835_49oey2d716hdvc2b4e, size = 35 [ReadStage-1] | 2026-10-14 02:54:50.761009 | 192.168.147.2 |          17110 | 127.0.0.1
+                                                                                  Merged data from memtables and 1 sstables [ReadStage-1] | 2026-10-14 02:54:50.761010 | 192.168.147.2 |          17223 | 127.0.0.1
+                                                                                   Read 100 live rows and 0 tombstone cells [ReadStage-1] | 2026-10-14 02:54:50.761011 | 192.168.147.2 |          17249 | 127.0.0.1
+                                                                      Executing single-partition query on resources_by_type [ReadStage-1] | 2026-10-14 02:54:50.761012 | 192.168.147.2 |          17403 | 127.0.0.1
+                                                                                               Acquiring sstable references [ReadStage-1] | 2026-10-14 02:54:50.761013 | 192.168.147.2 |          17423 | 127.0.0.1
+                                                  Skipped 0/1 non-slice-intersecting sstables, included 0 due to tombstones [ReadStage-1] | 2026-10-14 02:54:50.761014 | 192.168.147.2 |          17474 | 127.0.0.1
+                                                  Partition index found for sstable 3h4n_0835_49oey2d716hdvc2b4e, size = 35 [ReadStage-1] | 2026-10-14 02:54:50.761015 | 192.168.147.2 |          17501 | 127.0.0.1
+                                                                                  Merged data from memtables and 1 sstables [ReadStage-1] | 2026-10-14 02:54:50.762000 | 192.168.147.2 |          17631 | 127.0.0.1
+                                                                                   Read 100 live rows and 0 tombstone cells [ReadStage-1] | 2026-10-14 02:54:50.762001 | 192.168.147.2 |          17660 | 127.0.0.1
+                                                                      Executing single-partition query on resources_by_type [ReadStage-1] | 2026-10-14 02:54:50.762002 | 192.168.147.2 |          17814 | 127.0.0.1
+                                                                                               Acquiring sstable references [ReadStage-1] | 2026-10-14 02:54:50.762003 | 192.168.147.2 |          17838 | 127.0.0.1
+                                                  Skipped 0/1 non-slice-intersecting sstables, included 0 due to tombstones [ReadStage-1] | 2026-10-14 02:54:50.762004 | 192.168.147.2 |          17864 | 127.0.0.1
+                                                  Partition index found for sstable 3h4n_0835_49oey2d716hdvc2b4e, size = 35 [ReadStage-1] | 2026-10-14 02:54:50.762005 | 192.168.147.2 |          17892 | 127.0.0.1
+                                                                                  Merged data from memtables and 1 sstables [ReadStage-1] | 2026-10-14 02:54:50.762006 | 192.168.147.2 |          17997 | 127.0.0.1
+                                                                                   Read 100 live rows and 0 tombstone cells [ReadStage-1] | 2026-10-14 02:54:50.762007 | 192.168.147.2 |          18026 | 127.0.0.1
+                                                                      Executing single-partition query on resources_by_type [ReadStage-1] | 2026-10-14 02:54:50.762008 | 192.168.147.2 |          18206 | 127.0.0.1
+                                                                                               Acquiring sstable references [ReadStage-1] | 2026-10-14 02:54:50.762009 | 192.168.147.2 |          18236 | 127.0.0.1
+                                                  Skipped 0/1 non-slice-intersecting sstables, included 0 due to tombstones [ReadStage-1] | 2026-10-14 02:54:50.762010 | 192.168.147.2 |          18271 | 127.0.0.1
+                                                  Partition index found for sstable 3h4n_0835_49oey2d716hdvc2b4e, size = 35 [ReadStage-1] | 2026-10-14 02:54:50.762011 | 192.168.147.2 |          18310 | 127.0.0.1
+                                                                                  Merged data from memtables and 1 sstables [ReadStage-1] | 2026-10-14 02:54:50.762012 | 192.168.147.2 |          18437 | 127.0.0.1
+                                                                                   Read 100 live rows and 0 tombstone cells [ReadStage-1] | 2026-10-14 02:54:50.762013 | 192.168.147.2 |          18464 | 127.0.0.1
+                                                                      Executing single-partition query on resources_by_type [ReadStage-1] | 2026-10-14 02:54:50.763000 | 192.168.147.2 |          18725 | 127.0.0.1
+                                                                                               Acquiring sstable references [ReadStage-1] | 2026-10-14 02:54:50.763001 | 192.168.147.2 |          18753 | 127.0.0.1
+                                                  Skipped 0/1 non-slice-intersecting sstables, included 0 due to tombstones [ReadStage-1] | 2026-10-14 02:54:50.763002 | 192.168.147.2 |          18782 | 127.0.0.1
+                                                  Partition index found for sstable 3h4n_0835_49oey2d716hdvc2b4e, size = 35 [ReadStage-1] | 2026-10-14 02:54:50.763003 | 192.168.147.2 |          18813 | 127.0.0.1
+                                                                                  Merged data from memtables and 1 sstables [ReadStage-1] | 2026-10-14 02:54:50.763004 | 192.168.147.2 |          18929 | 127.0.0.1
+                                                                                   Read 100 live rows and 0 tombstone cells [ReadStage-1] | 2026-10-14 02:54:50.763005 | 192.168.147.2 |          18953 | 127.0.0.1
+                                                                      Executing single-partition query on resources_by_type [ReadStage-1] | 2026-10-14 02:54:50.763006 | 192.168.147.2 |          19132 | 127.0.0.1
+                                                                                               Acquiring sstable references [ReadStage-1] | 2026-10-14 02:54:50.763007 | 192.168.147.2 |          19156 | 127.0.0.1
+                                                  Skipped 0/1 non-slice-intersecting sstables, included 0 due to tombstones [ReadStage-1] | 2026-10-14 02:54:50.763008 | 192.168.147.2 |          19182 | 127.0.0.1
+                                                  Partition index found for sstable 3h4n_0835_49oey2d716hdvc2b4e, size = 35 [ReadStage-1] | 2026-10-14 02:54:50.763009 | 192.168.147.2 |          19208 | 127.0.0.1
+                                                                                  Merged data from memtables and 1 sstables [ReadStage-1] | 2026-10-14 02:54:50.763010 | 192.168.147.2 |          19322 | 127.0.0.1
+                                                                                   Read 100 live rows and 0 tombstone cells [ReadStage-1] | 2026-10-14 02:54:50.763011 | 192.168.147.2 |          19346 | 127.0.0.1
+                                                                      Executing single-partition query on resources_by_type [ReadStage-1] | 2026-10-14 02:54:50.763012 | 192.168.147.2 |          19564 | 127.0.0.1
+                                                                                               Acquiring sstable references [ReadStage-1] | 2026-10-14 02:54:50.764000 | 192.168.147.2 |          19593 | 127.0.0.1
+                                                  Skipped 0/1 non-slice-intersecting sstables, included 0 due to tombstones [ReadStage-1] | 2026-10-14 02:54:50.764001 | 192.168.147.2 |          19638 | 127.0.0.1
+                                                  Partition index found for sstable 3h4n_0835_49oey2d716hdvc2b4e, size = 35 [ReadStage-1] | 2026-10-14 02:54:50.764002 | 192.168.147.2 |          19680 | 127.0.0.1
+                                                                                  Merged data from memtables and 1 sstables [ReadStage-1] | 2026-10-14 02:54:50.764003 | 192.168.147.2 |          19843 | 127.0.0.1
+                                                                                   Read 100 live rows and 0 tombstone cells [ReadStage-1] | 2026-10-14 02:54:50.764004 | 192.168.147.2 |          19874 | 127.0.0.1
+                                                                      Executing single-partition query on resources_by_type [ReadStage-3] | 2026-10-14 02:54:50.764005 | 192.168.147.2 |          20103 | 127.0.0.1
+                                                                                               Acquiring sstable references [ReadStage-3] | 2026-10-14 02:54:50.764006 | 192.168.147.2 |          20309 | 127.0.0.1
+                                                  Skipped 0/1 non-slice-intersecting sstables, included 0 due to tombstones [ReadStage-3] | 2026-10-14 02:54:50.764007 | 192.168.147.2 |          20424 | 127.0.0.1
+                                                  Partition index found for sstable 3h4n_0835_49oey2d716hdvc2b4e, size = 35 [ReadStage-3] | 2026-10-14 02:54:50.764008 | 192.168.147.2 |          20519 | 127.0.0.1
+                                                                                  Merged data from memtables and 1 sstables [ReadStage-3] | 2026-10-14 02:54:50.765000 | 192.168.147.2 |          20933 | 127.0.0.1
+                                                                                   Read 100 live rows and 0 tombstone cells [ReadStage-3] | 2026-10-14 02:54:50.765001 | 192.168.147.2 |          21024 | 127.0.0.1
+                                                                      Executing single-partition query on resources_by_type [ReadStage-2] | 2026-10-14 02:54:50.766000 | 192.168.147.2 |          21670 | 127.0.0.1
+                                                                                               Acquiring sstable references [ReadStage-2] | 2026-10-14 02:54:50.766001 | 192.168.147.2 |          21783 | 127.0.0.1
+                                                  Skipped 0/1 non-slice-intersecting sstables, included 0 due to tombstones [ReadStage-2] | 2026-10-14 02:54:50.766002 | 192.168.147.2 |          21863 | 127.0.0.1
+                                                  Partition index found for sstable 3h4n_0835_49oey2d716hdvc2b4e, size = 35 [ReadStage-2] | 2026-10-14 02:54:50.766003 | 192.168.147.2 |          21946 | 127.0.0.1
+                                                                                  Merged data from memtables and 1 sstables [ReadStage-2] | 2026-10-14 02:54:50.766004 | 192.168.147.2 |          22259 | 127.0.0.1
+                                                                                   Read 100 live rows and 0 tombstone cells [ReadStage-2] | 2026-10-14 02:54:50.766005 | 192.168.147.2 |          22338 | 127.0.0.1
+                                                                      Executing single-partition query on resources_by_type [ReadStage-3] | 2026-10-14 02:54:50.767000 | 192.168.147.2 |          22748 | 127.0.0.1
+                                                                                               Acquiring sstable references [ReadStage-3] | 2026-10-14 02:54:50.767001 | 192.168.147.2 |          22847 | 127.0.0.1
+                                                  Skipped 0/1 non-slice-intersecting sstables, included 0 due to tombstones [ReadStage-3] | 2026-10-14 02:54:50.767002 | 192.168.147.2 |          22928 | 127.0.0.1
+                                                  Partition index found for sstable 3h4n_0835_49oey2d716hdvc2b4e, size = 35 [ReadStage-3] | 2026-10-14 02:54:50.767003 | 192.168.147.2 |          23029 | 127.0.0.1
+                                                                                  Merged data from memtables and 1 sstables [ReadStage-3] | 2026-10-14 02:54:50.767004 | 192.168.147.2 |          23546 | 127.0.0.1
+                                                                                   Read 100 live rows and 0 tombstone cells [ReadStage-3] | 2026-10-14 02:54:50.768000 | 192.168.147.2 |          23695 | 127.0.0.1
+                                                                      Executing single-partition query on resources_by_type [ReadStage-3] | 2026-10-14 02:54:50.768001 | 192.168.147.2 |          24388 | 127.0.0.1
+                                                                                               Acquiring sstable references [ReadStage-3] | 2026-10-14 02:54:50.768002 | 192.168.147.2 |          24468 | 127.0.0.1
+                                                  Skipped 0/1 non-slice-intersecting sstables, included 0 due to tombstones [ReadStage-3] | 2026-10-14 02:54:50.768003 | 192.168.147.2 |          24536 | 127.0.0.1
+                                                  Partition index found for sstable 3h4n_0835_49oey2d716hdvc2b4e, size = 35 [ReadStage-3] | 2026-10-14 02:54:50.769000 | 192.168.147.2 |          24659 | 127.0.0.1
+                                                                                  Merged data from memtables and 1 sstables [ReadStage-3] | 2026-10-14 02:54:50.769001 | 192.168.147.2 |          24988 | 127.0.0.1
+                                                                                   Read 100 live rows and 0 tombstone cells [ReadStage-3] | 2026-10-14 02:54:50.769002 | 192.168.147.2 |          25126 | 127.0.0.1
+                                                                      Executing single-partition query on resources_by_type [ReadStage-3] | 2026-10-14 02:54:50.770000 | 192.168.147.2 |          26224 | 127.0.0.1
+                                                                                               Acquiring sstable references [ReadStage-3] | 2026-10-14 02:54:50.770001 | 192.168.147.2 |          26355 | 127.0.0.1
+                                                  Skipped 0/1 non-slice-intersecting sstables, included 0 due to tombstones [ReadStage-3] | 2026-10-14 02:54:50.770002 | 192.168.147.2 |          26440 | 127.0.0.1
+                                                  Partition index found for sstable 3h4n_0835_49oey2d716hdvc2b4e, size = 35 [ReadStage-3] | 2026-10-14 02:54:50.770003 | 192.168.147.2 |          26532 | 127.0.0.1
+                                                                                  Merged data from memtables and 1 sstables [ReadStage-3] | 2026-10-14 02:54:50.771000 | 192.168.147.2 |          26900 | 127.0.0.1
+                                                                                   Read 100 live rows and 0 tombstone cells [ReadStage-3] | 2026-10-14 02:54:50.771001 | 192.168.147.2 |          26996 | 127.0.0.1
+                                                                      Executing single-partition query on resources_by_type [ReadStage-3] | 2026-10-14 02:54:50.772000 | 192.168.147.2 |          27705 | 127.0.0.1
+                                                                                               Acquiring sstable references [ReadStage-3] | 2026-10-14 02:54:50.772001 | 192.168.147.2 |          27795 | 127.0.0.1
+                                                  Skipped 0/1 non-slice-intersecting sstables, included 0 due to tombstones [ReadStage-3] | 2026-10-14 02:54:50.772002 | 192.168.147.2 |          27865 | 127.0.0.1
+                                                  Partition index found for sstable 3h4n_0835_49oey2d716hdvc2b4e, size = 35 [ReadStage-3] | 2026-10-14 02:54:50.772003 | 192.168.147.2 |          27942 | 127.0.0.1
+                                                                                  Merged data from memtables and 1 sstables [ReadStage-3] | 2026-10-14 02:54:50.772004 | 192.168.147.2 |          28290 | 127.0.0.1
+                                                                                   Read 100 live rows and 0 tombstone cells [ReadStage-3] | 2026-10-14 02:54:50.772005 | 192.168.147.2 |          28380 | 127.0.0.1
+                                                                      Executing single-partition query on resources_by_type [ReadStage-3] | 2026-10-14 02:54:50.773000 | 192.168.147.2 |          28748 | 127.0.0.1
+                                                                                               Acquiring sstable references [ReadStage-3] | 2026-10-14 02:54:50.773001 | 192.168.147.2 |          28778 | 127.0.0.1
+                                                  Skipped 0/1 non-slice-intersecting sstables, included 0 due to tombstones [ReadStage-3] | 2026-10-14 02:54:50.773002 | 192.168.147.2 |          28817 | 127.0.0.1
+                                                  Partition index found for sstable 3h4n_0835_49oey2d716hdvc2b4e, size = 35 [ReadStage-3] | 2026-10-14 02:54:50.773003 | 192.168.147.2 |          28858 | 127.0.0.1
+                                                                                  Merged data from memtables and 1 sstables [ReadStage-3] | 2026-10-14 02:54:50.773004 | 192.168.147.2 |          29055 | 127.0.0.1
+                                                                                   Read 100 live rows and 0 tombstone cells [ReadStage-3] | 2026-10-14 02:54:50.773005 | 192.168.147.2 |          29081 | 127.0.0.1
+                                                                      Executing single-partition query on resources_by_type [ReadStage-1] | 2026-10-14 02:54:50.774000 | 192.168.147.2 |          29833 | 127.0.0.1
+                                                                                               Acquiring sstable references [ReadStage-1] | 2026-10-14 02:54:50.774001 | 192.168.147.2 |          29961 | 127.0.0.1
+                                                  Skipped 0/1 non-slice-intersecting sstables, included 0 due to tombstones [ReadStage-1] | 2026-10-14 02:54:50.774002 | 192.168.147.2 |          30035 | 127.0.0.1
+                                                  Partition index found for sstable 3h4n_0835_49oey2d716hdvc2b4e, size = 35 [ReadStage-1] | 2026-10-14 02:54:50.774003 | 192.168.147.2 |          30102 | 127.0.0.1
+                                                                                  Merged data from memtables and 1 sstables [ReadStage-1] | 2026-10-14 02:54:50.774004 | 192.168.147.2 |          30392 | 127.0.0.1
+                                                                                   Read 100 live rows and 0 tombstone cells [ReadStage-1] | 2026-10-14 02:54:50.774005 | 192.168.147.2 |          30476 | 127.0.0.1
+                                                                      Executing single-partition query on resources_by_type [ReadStage-3] | 2026-10-14 02:54:50.775000 | 192.168.147.2 |          30831 | 127.0.0.1
+                                                                                               Acquiring sstable references [ReadStage-3] | 2026-10-14 02:54:50.775001 | 192.168.147.2 |          30912 | 127.0.0.1
+                                                  Skipped 0/1 non-slice-intersecting sstables, included 0 due to tombstones [ReadStage-3] | 2026-10-14 02:54:50.775002 | 192.168.147.2 |          30976 | 127.0.0.1
+                                                  Partition index found for sstable 3h4n_0835_49oey2d716hdvc2b4e, size = 35 [ReadStage-3] | 2026-10-14 02:54:50.775003 | 192.168.147.2 |          31054 | 127.0.0.1
+                                                                                  Merged data from memtables and 1 sstables [ReadStage-3] | 2026-10-14 02:54:50.775004 | 192.168.147.2 |          31413 | 127.0.0.1
+                                                                                   Read 100 live rows and 0 tombstone cells [ReadStage-3] | 2026-10-14 02:54:50.775005 | 192.168.147.2 |          31519 | 127.0.0.1
+                                                                      Executing single-partition query on resources_by_type [ReadStage-3] | 2026-10-14 02:54:50.776000 | 192.168.147.2 |          32077 | 127.0.0.1
+                                                                                               Acquiring sstable references [ReadStage-3] | 2026-10-14 02:54:50.776001 | 192.168.147.2 |          32161 | 127.0.0.1
+                                                  Skipped 0/1 non-slice-intersecting sstables, included 0 due to tombstones [ReadStage-3] | 2026-10-14 02:54:50.776002 | 192.168.147.2 |          32241 | 127.0.0.1
+                                                  Partition index found for sstable 3h4n_0835_49oey2d716hdvc2b4e, size = 35 [ReadStage-3] | 2026-10-14 02:54:50.776003 | 192.168.147.2 |          32321 | 127.0.0.1
+                                                                                  Merged data from memtables and 1 sstables [ReadStage-3] | 2026-10-14 02:54:50.777000 | 192.168.147.2 |          32607 | 127.0.0.1
+                                                                                   Read 100 live rows and 0 tombstone cells [ReadStage-3] | 2026-10-14 02:54:50.777001 | 192.168.147.2 |          32715 | 127.0.0.1
+                                                                      Executing single-partition query on resources_by_type [ReadStage-3] | 2026-10-14 02:54:50.777002 | 192.168.147.2 |          33200 | 127.0.0.1
+                                                                                               Acquiring sstable references [ReadStage-3] | 2026-10-14 02:54:50.777003 | 192.168.147.2 |          33286 | 127.0.0.1
+                                                  Skipped 0/1 non-slice-intersecting sstables, included 0 due to tombstones [ReadStage-3] | 2026-10-14 02:54:50.777004 | 192.168.147.2 |          33355 | 127.0.0.1
+                                                  Partition index found for sstable 3h4n_0835_49oey2d716hdvc2b4e, size = 35 [ReadStage-3] | 2026-10-14 02:54:50.777005 | 192.168.147.2 |          33425 | 127.0.0.1
+                                                                                  Merged data from memtables and 1 sstables [ReadStage-3] | 2026-10-14 02:54:50.778000 | 192.168.147.2 |          33698 | 127.0.0.1
+                                                                                   Read 100 live rows and 0 tombstone cells [ReadStage-3] | 2026-10-14 02:54:50.778001 | 192.168.147.2 |          33764 | 127.0.0.1
+                                                                      Executing single-partition query on resources_by_type [ReadStage-3] | 2026-10-14 02:54:50.778002 | 192.168.147.2 |          34039 | 127.0.0.1
+                                                                                               Acquiring sstable references [ReadStage-3] | 2026-10-14 02:54:50.778003 | 192.168.147.2 |          34079 | 127.0.0.1
+                                                  Skipped 0/1 non-slice-intersecting sstables, included 0 due to tombstones [ReadStage-3] | 2026-10-14 02:54:50.778004 | 192.168.147.2 |          34132 | 127.0.0.1
+                                                  Partition index found for sstable 3h4n_0835_49oey2d716hdvc2b4e, size = 35 [ReadStage-3] | 2026-10-14 02:54:50.778005 | 192.168.147.2 |          34244 | 127.0.0.1
+                                                                                  Merged data from memtables and 1 sstables [ReadStage-3] | 2026-10-14 02:54:50.778006 | 192.168.147.2 |          34522 | 127.0.0.1
+                                                                                   Read 100 live rows and 0 tombstone cells [ReadStage-3] | 2026-10-14 02:54:50.779000 | 192.168.147.2 |          34593 | 127.0.0.1
+                                                                      Executing single-partition query on resources_by_type [ReadStage-3] | 2026-10-14 02:54:50.779001 | 192.168.147.2 |          34890 | 127.0.0.1
+                                                                                               Acquiring sstable references [ReadStage-3] | 2026-10-14 02:54:50.779002 | 192.168.147.2 |          34958 | 127.0.0.1
+                                                  Skipped 0/1 non-slice-intersecting sstables, included 0 due to tombstones [ReadStage-3] | 2026-10-14 02:54:50.779003 | 192.168.147.2 |          35022 | 127.0.0.1
+                                                  Partition index found for sstable 3h4n_0835_49oey2d716hdvc2b4e, size = 35 [ReadStage-3] | 2026-10-14 02:54:50.779004 | 192.168.147.2 |          35108 | 127.0.0.1
+                                                                                  Merged data from memtables and 1 sstables [ReadStage-3] | 2026-10-14 02:54:50.779005 | 192.168.147.2 |          35389 | 127.0.0.1
+                                                                                   Read 100 live rows and 0 tombstone cells [ReadStage-3] | 2026-10-14 02:54:50.779006 | 192.168.147.2 |          35462 | 127.0.0.1
+                                                                      Executing single-partition query on resources_by_type [ReadStage-2] | 2026-10-14 02:54:50.780000 | 192.168.147.2 |          35763 | 127.0.0.1
+                                                                                               Acquiring sstable references [ReadStage-2] | 2026-10-14 02:54:50.780001 | 192.168.147.2 |          35923 | 127.0.0.1
+                                                  Skipped 0/1 non-slice-intersecting sstables, included 0 due to tombstones [ReadStage-2] | 2026-10-14 02:54:50.780002 | 192.168.147.2 |          36005 | 127.0.0.1
+                                                  Partition index found for sstable 3h4n_0835_49oey2d716hdvc2b4e, size = 35 [ReadStage-2] | 2026-10-14 02:54:50.780003 | 192.168.147.2 |          36077 | 127.0.0.1
+                                                                                  Merged data from memtables and 1 sstables [ReadStage-2] | 2026-10-14 02:54:50.780004 | 192.168.147.2 |          36366 | 127.0.0.1
+                                                                                   Read 100 live rows and 0 tombstone cells [ReadStage-2] | 2026-10-14 02:54:50.780005 | 192.168.147.2 |          36447 | 127.0.0.1
+                                                                      Executing single-partition query on resources_by_type [ReadStage-3] | 2026-10-14 02:54:50.781000 | 192.168.147.2 |          36836 | 127.0.0.1
+                                                                                               Acquiring sstable references [ReadStage-3] | 2026-10-14 02:54:50.781001 | 192.168.147.2 |          36908 | 127.0.0.1
+                                                  Skipped 0/1 non-slice-intersecting sstables, included 0 due to tombstones [ReadStage-3] | 2026-10-14 02:54:50.781002 | 192.168.147.2 |          36955 | 127.0.0.1
+                                                  Partition index found for sstable 3h4n_0835_49oey2d716hdvc2b4e, size = 35 [ReadStage-3] | 2026-10-14 02:54:50.781003 | 192.168.147.2 |          37000 | 127.0.0.1
+                                                                                  Merged data from memtables and 1 sstables [ReadStage-3] | 2026-10-14 02:54:50.781004 | 192.168.147.2 |          37186 | 127.0.0.1
+                                                                                   Read 100 live rows and 0 tombstone cells [ReadStage-3] | 2026-10-14 02:54:50.781005 | 192.168.147.2 |          37220 | 127.0.0.1
+                                                                      Executing single-partition query on resources_by_type [ReadStage-3] | 2026-10-14 02:54:50.781006 | 192.168.147.2 |          37406 | 127.0.0.1
+                                                                                               Acquiring sstable references [ReadStage-3] | 2026-10-14 02:54:50.781007 | 192.168.147.2 |          37428 | 127.0.0.1
+                                                  Skipped 0/1 non-slice-intersecting sstables, included 0 due to tombstones [ReadStage-3] | 2026-10-14 02:54:50.781008 | 192.168.147.2 |          37461 | 127.0.0.1
+                                                  Partition index found for sstable 3h4n_0835_49oey2d716hdvc2b4e, size = 35 [ReadStage-3] | 2026-10-14 02:54:50.781009 | 192.168.147.2 |          37490 | 127.0.0.1
+                                                                                  Merged data from memtables and 1 sstables [ReadStage-3] | 2026-10-14 02:54:50.782000 | 192.168.147.2 |          37616 | 127.0.0.1
+                                                                                   Read 100 live rows and 0 tombstone cells [ReadStage-3] | 2026-10-14 02:54:50.782001 | 192.168.147.2 |          37651 | 127.0.0.1
+                                                                      Executing single-partition query on resources_by_type [ReadStage-3] | 2026-10-14 02:54:50.782002 | 192.168.147.2 |          37807 | 127.0.0.1
+                                                                                               Acquiring sstable references [ReadStage-3] | 2026-10-14 02:54:50.782003 | 192.168.147.2 |          37833 | 127.0.0.1
+                                                  Skipped 0/1 non-slice-intersecting sstables, included 0 due to tombstones [ReadStage-3] | 2026-10-14 02:54:50.782004 | 192.168.147.2 |          37864 | 127.0.0.1
+                                                  Partition index found for sstable 3h4n_0835_49oey2d716hdvc2b4e, size = 35 [ReadStage-3] | 2026-10-14 02:54:50.782005 | 192.168.147.2 |          37892 | 127.0.0.1
+                                                                                  Merged data from memtables and 1 sstables [ReadStage-3] | 2026-10-14 02:54:50.782006 | 192.168.147.2 |          38001 | 127.0.0.1
+                                                                                   Read 100 live rows and 0 tombstone cells [ReadStage-3] | 2026-10-14 02:54:50.782007 | 192.168.147.2 |          38020 | 127.0.0.1
+                                                                      Executing single-partition query on resources_by_type [ReadStage-3] | 2026-10-14 02:54:50.782008 | 192.168.147.2 |          38144 | 127.0.0.1
+                                                                                               Acquiring sstable references [ReadStage-3] | 2026-10-14 02:54:50.782009 | 192.168.147.2 |          38160 | 127.0.0.1
+                                                  Skipped 0/1 non-slice-intersecting sstables, included 0 due to tombstones [ReadStage-3] | 2026-10-14 02:54:50.782010 | 192.168.147.2 |          38184 | 127.0.0.1
+                                                  Partition index found for sstable 3h4n_0835_49oey2d716hdvc2b4e, size = 35 [ReadStage-3] | 2026-10-14 02:54:50.782011 | 192.168.147.2 |          38206 | 127.0.0.1
+                                                                                  Merged data from memtables and 1 sstables [ReadStage-3] | 2026-10-14 02:54:50.782012 | 192.168.147.2 |          38305 | 127.0.0.1
+                                                                                   Read 100 live rows and 0 tombstone cells [ReadStage-3] | 2026-10-14 02:54:50.791000 | 192.168.147.2 |          47294 | 127.0.0.1
+                                                                      Executing single-partition query on resources_by_type [ReadStage-3] | 2026-10-14 02:54:50.792000 | 192.168.147.2 |          47765 | 127.0.0.1
+                                                                                               Acquiring sstable references [ReadStage-3] | 2026-10-14 02:54:50.792001 | 192.168.147.2 |          47803 | 127.0.0.1
+                                                  Skipped 0/1 non-slice-intersecting sstables, included 0 due to tombstones [ReadStage-3] | 2026-10-14 02:54:50.792002 | 192.168.147.2 |          47852 | 127.0.0.1
+                                                  Partition index found for sstable 3h4n_0835_49oey2d716hdvc2b4e, size = 35 [ReadStage-3] | 2026-10-14 02:54:50.792003 | 192.168.147.2 |          47908 | 127.0.0.1
+                                                                                  Merged data from memtables and 1 sstables [ReadStage-3] | 2026-10-14 02:54:50.792004 | 192.168.147.2 |          48121 | 127.0.0.1
+                                                                                   Read 100 live rows and 0 tombstone cells [ReadStage-3] | 2026-10-14 02:54:50.792005 | 192.168.147.2 |          48154 | 127.0.0.1
+                                                                      Executing single-partition query on resources_by_type [ReadStage-3] | 2026-10-14 02:54:50.792006 | 192.168.147.2 |          48395 | 127.0.0.1
+                                                                                               Acquiring sstable references [ReadStage-3] | 2026-10-14 02:54:50.792007 | 192.168.147.2 |          48429 | 127.0.0.1
+                                                  Skipped 0/1 non-slice-intersecting sstables, included 0 due to tombstones [ReadStage-3] | 2026-10-14 02:54:50.792008 | 192.168.147.2 |          48462 | 127.0.0.1
+                                                  Partition index found for sstable 3h4n_0835_49oey2d716hdvc2b4e, size = 35 [ReadStage-3] | 2026-10-14 02:54:50.792009 | 192.168.147.2 |          48492 | 127.0.0.1
+                                                                                  Merged data from memtables and 1 sstables [ReadStage-3] | 2026-10-14 02:54:50.793000 | 192.168.147.2 |          48627 | 127.0.0.1
+                                                                                   Read 100 live rows and 0 tombstone cells [ReadStage-3] | 2026-10-14 02:54:50.793001 | 192.168.147.2 |          48648 | 127.0.0.1
+                                                                      Executing single-partition query on resources_by_type [ReadStage-3] | 2026-10-14 02:54:50.793002 | 192.168.147.2 |          48788 | 127.0.0.1
+                                                                                               Acquiring sstable references [ReadStage-3] | 2026-10-14 02:54:50.793003 | 192.168.147.2 |          48803 | 127.0.0.1
+                                                  Skipped 0/1 non-slice-intersecting sstables, included 0 due to tombstones [ReadStage-3] | 2026-10-14 02:54:50.793004 | 192.168.147.2 |          48825 | 127.0.0.1
+                                                  Partition index found for sstable 3h4n_0835_49oey2d716hdvc2b4e, size = 35 [ReadStage-3] | 2026-10-14 02:54:50.793005 | 192.168.147.2 |          48850 | 127.0.0.1
+                                                                                  Merged data from memtables and 1 sstables [ReadStage-3] | 2026-10-14 02:54:50.793006 | 192.168.147.2 |          49300 | 127.0.0.1
+                                                                                   Read 100 live rows and 0 tombstone cells [ReadStage-3] | 2026-10-14 02:54:50.793007 | 192.168.147.2 |          49406 | 127.0.0.1
+                                                                      Executing single-partition query on resources_by_type [ReadStage-3] | 2026-10-14 02:54:50.794000 | 192.168.147.2 |          49772 | 127.0.0.1
+                                                                                               Acquiring sstable references [ReadStage-3] | 2026-10-14 02:54:50.794001 | 192.168.147.2 |          49824 | 127.0.0.1
+                                                  Skipped 0/1 non-slice-intersecting sstables, included 0 due to tombstones [ReadStage-3] | 2026-10-14 02:54:50.794002 | 192.168.147.2 |          49925 | 127.0.0.1
+                                                  Partition index found for sstable 3h4n_0835_49oey2d716hdvc2b4e, size = 35 [ReadStage-3] | 2026-10-14 02:54:50.794003 | 192.168.147.2 |          50007 | 127.0.0.1
+                                                                                  Merged data from memtables and 1 sstables [ReadStage-3] | 2026-10-14 02:54:50.794004 | 192.168.147.2 |          50225 | 127.0.0.1
+                                                                                   Read 100 live rows and 0 tombstone cells [ReadStage-3] | 2026-10-14 02:54:50.794005 | 192.168.147.2 |          50322 | 127.0.0.1
+                                                                      Executing single-partition query on resources_by_type [ReadStage-3] | 2026-10-14 02:54:50.795000 | 192.168.147.2 |          50609 | 127.0.0.1
+                                                                                               Acquiring sstable references [ReadStage-3] | 2026-10-14 02:54:50.795001 | 192.168.147.2 |          50648 | 127.0.0.1
+                                                  Skipped 1/1 non-slice-intersecting sstables, included 0 due to tombstones [ReadStage-3] | 2026-10-14 02:54:50.795002 | 192.168.147.2 |          50704 | 127.0.0.1
+                                                                                     Read 0 live rows and 0 tombstone cells [ReadStage-3] | 2026-10-14 02:54:50.795003 | 192.168.147.2 |          50739 | 127.0.0.1
+                                                                                                                         Request complete | 2026-10-14 02:54:50.794915 | 192.168.147.2 |          50915 | 127.0.0.1
+
+TRACING set to OFF

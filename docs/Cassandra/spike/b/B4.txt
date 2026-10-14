@@ -1,0 +1,26 @@
+# B4
+client acked last n=5481 (count     5481); client error: n=5482 ConnectionShutdown
+### startup log (batch/replay/commitlog, post-restart, trimmed)
+INFO  [main] 2026-10-14T02:57:19,276 ColumnFamilyStore.java:502 - Initializing system.batches
+INFO  [main] 2026-10-14T02:57:19,701 CommitLog.java:206 - Replaying /opt/cassandra/data/commitlog/CommitLog-8-1791946387572.log, /opt/cassandra/data/commitlog/CommitLog-8-1791946387573.log
+INFO  [main] 2026-10-14T02:57:19,716 CommitLogReader.java:103 - Skipping playback of empty log: CommitLog-8-1791946387573.log
+INFO  [main] 2026-10-14T02:57:20,023 CommitLogReader.java:257 - Finished reading /opt/cassandra/data/commitlog/CommitLog-8-1791946387572.log
+INFO  [main] 2026-10-14T02:57:20,031 ColumnFamilyStore.java:1055 - Enqueuing flush of system.batches, Reason: STARTUP, Usage: 1.714MiB (1%) on-heap, 1.643MiB (1%) off-heap
+INFO  [PerDiskMemtableFlushWriter_0:2] 2026-10-14T02:57:20,211 Flushing.java:153 - Writing Memtable-batches@184963870(1.452MiB serialized bytes, 7303 ops, 1.714MiB (1%) on-heap, 1.643MiB (1%) off-heap), flushed range = [null, null
+INFO  [PerDiskMemtableFlushWriter_0:2] 2026-10-14T02:57:20,219 Flushing.java:179 - Completed flushing /var/lib/cassandra/data/system/batches-919a4bc57a333573b03e13fc3f68b465/da-3h4n_087k_17an42typl2z8mey9c-bti-Data.db (343B) for c
+INFO  [MemtableFlushWriter:2] 2026-10-14T02:57:20,237 LogTransaction.java:249 - Unfinished transaction log, deleting /var/lib/cassandra/data/system/batches-919a4bc57a333573b03e13fc3f68b465/bti-da_txn_flush_f8f52930-c77a-11f1-ba3f-
+INFO  [main] 2026-10-14T02:57:20,307 CommitLog.java:210 - Log replay complete, 18402 replayed mutations in 605 ms
+### system.batches
+
+ count
+-------
+     0
+
+(1 rows)
+
+Warnings :
+Aggregation query used without partition key
+
+ 10959
+distinct n present: 3651 max n present: 3651 partial batches: []
+missing n below max: []

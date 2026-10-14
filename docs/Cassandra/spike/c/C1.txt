@@ -1,0 +1,30 @@
+== C1 start 2026-10-14T03:01:00
+KILLED at 2026-10-14T03:01:32 epoch_ms=1791946892073
+ERROR at n=2942: ('Unable to complete the operation against any hosts', {<Host: 192.168.117.2:9042 helios-dc1>: ConnectionShutdown('Connection to 192.168.117.2:9042 was closed')})
+acks: inserts 2941 updates 294
+last lines:
+n 2940 1791946891842
+u 2935 1791946891847
+n 2941 1791946891857
+ Container spike-c-cassandra-1 Started 
+ Container spike-c-cassandra-1 Waiting 
+ Container spike-c-cassandra-1 Healthy 
+INFO  [main] 2026-10-14T03:01:37,271 CommitLogReader.java:257 - Finished reading /opt/cassandra/data/commitlog/CommitLog-8-1791946797901.log
+INFO  [PerDiskMemtableFlushWriter_0:2] 2026-10-14T03:01:37,308 Flushing.java:179 - Completed flushing /var/lib/cassandra/data/system_auth/roles-5bc52802de2535edaeab188eecebb090/da-3h4n_08ep_1nss02intw1c4om7o7-bti-Data.db (83B) for commitlog position CommitLogPosition(segmentId=1791946896237, position=480)
+INFO  [PerDiskMemtableFlushWriter_0:2] 2026-10-14T03:01:37,352 Flushing.java:179 - Completed flushing /var/lib/cassandra/data/system/compaction_history-b4dbb7b4dc493fb5b3bfce6e434832ca/da-3h4n_08ep_21qbk2intw1c4om7o7-bti-Data.db (127B) for commitlog position CommitLogPosition(segmentId=1791946896237, position=480)
+INFO  [PerDiskMemtableFlushWriter_0:1] 2026-10-14T03:01:37,375 Flushing.java:179 - Completed flushing /var/lib/cassandra/data/spike/resources-7cc22880c77b11f194115b17e3419c4d/da-3h4n_08ep_1pq802intw1c4om7o7-bti-Data.db (99.791KiB) for commitlog position CommitLogPosition(segmentId=1791946896237, position=480)
+INFO  [PerDiskMemtableFlushWriter_0:1] 2026-10-14T03:01:37,409 Flushing.java:179 - Completed flushing /var/lib/cassandra/data/system/sstable_activity_v2-62efe31f3be8310c8d298963439c1288/da-3h4n_08ep_2dy562intw1c4om7o7-bti-Data.db (441B) for commitlog position CommitLogPosition(segmentId=1791946896237, position=480)
+INFO  [PerDiskMemtableFlushWriter_0:2] 2026-10-14T03:01:37,412 Flushing.java:179 - Completed flushing /var/lib/cassandra/data/system/paxos-b7b7f0c2fd0a34108c053ef614bb7c2d/da-3h4n_08ep_27ink2intw1c4om7o7-bti-Data.db (538.521KiB) for commitlog position CommitLogPosition(segmentId=1791946896237, position=480)
+INFO  [PerDiskMemtableFlushWriter_0:1] 2026-10-14T03:01:37,441 Flushing.java:179 - Completed flushing /var/lib/cassandra/data/system/local-7ad54392bcdd35a684174e047860b377/da-3h4n_08ep_2jqh62intw1c4om7o7-bti-Data.db (215B) for commitlog position CommitLogPosition(segmentId=1791946896237, position=480)
+INFO  [PerDiskMemtableFlushWriter_0:2] 2026-10-14T03:01:37,481 Flushing.java:179 - Completed flushing /var/lib/cassandra/data/system/prepared_statements-18a9c2576a0c3841ba718cd529849fef/da-3h4n_08ep_2tdp62intw1c4om7o7-bti-Data.db (270B) for commitlog position CommitLogPosition(segmentId=1791946896237, position=480)
+INFO  [main] 2026-10-14T03:01:37,496 CommitLog.java:210 - Log replay complete, 11575 replayed mutations in 551 ms
+INFO  [PerDiskMemtableFlushWriter_0:1] 2026-10-14T03:01:37,516 Flushing.java:179 - Completed flushing /var/lib/cassandra/data/system/local-7ad54392bcdd35a684174e047860b377/da-3h4n_08ep_30vre2intw1c4om7o7-bti-Data.db (53B) for commitlog position CommitLogPosition(segmentId=1791946896237, position=583)
+INFO  [PerDiskMemtableFlushWriter_0:2] 2026-10-14T03:01:37,536 Flushing.java:179 - Completed flushing /var/lib/cassandra/data/system/local-7ad54392bcdd35a684174e047860b377/da-3h4n_08ep_35lii2intw1c4om7o7-bti-Data.db (53B) for commitlog position CommitLogPosition(segmentId=1791946896237, position=686)
+INFO  [PerDiskMemtableFlushWriter_0:1] 2026-10-14T03:01:37,651 Flushing.java:179 - Completed flushing /var/lib/cassandra/data/system/local-7ad54392bcdd35a684174e047860b377/da-3h4n_08ep_3sbey2intw1c4om7o7-bti-Data.db (18B) for commitlog position CommitLogPosition(segmentId=1791946896237, position=767)
+rows saved
+acked inserts 2941 last 2941 | acked updates 294 last 2935
+rows present 2628 max n 2628 gaps below max []
+acked inserts lost 313 (min lost n 2629 )
+acked updates present with v2 262 lost 32
+unacked-but-present []
+seconds lost: first lost ack to last ack = 3.48 s ; last present ack vs last ack = 3.49 s

@@ -1,0 +1,123 @@
+-- A3 keyset paging: 5 pages x LIMIT 10 starting after cursor (00:41:40, obs03501); cursor = last row of previous page
+
+-- page 1 : SELECT last_updated,id FROM spike.resources_by_type WHERE tenant_id='t1' AND resource_type='Observation' AND (last_updated,id) < ('2026-01-01 00:41:40+0000','obs03501') LIMIT 10;
+Consistency level set to LOCAL_QUORUM.
+
+ last_updated                    | id
+---------------------------------+----------
+ 2026-01-01 00:41:40.000000+0000 | obs03500
+ 2026-01-01 00:41:39.000000+0000 | obs03499
+ 2026-01-01 00:41:38.000000+0000 | obs03498
+ 2026-01-01 00:41:37.000000+0000 | obs03497
+ 2026-01-01 00:41:36.000000+0000 | obs03496
+ 2026-01-01 00:41:35.000000+0000 | obs03495
+ 2026-01-01 00:41:35.000000+0000 | obs03494
+ 2026-01-01 00:41:35.000000+0000 | obs03493
+ 2026-01-01 00:41:34.000000+0000 | obs03492
+ 2026-01-01 00:41:33.000000+0000 | obs03491
+
+(10 rows)
+
+-- page 2 : SELECT last_updated,id FROM spike.resources_by_type WHERE tenant_id='t1' AND resource_type='Observation' AND (last_updated,id) < ('2026-01-01 00:41:33+0000','obs03491') LIMIT 10;
+Consistency level set to LOCAL_QUORUM.
+
+ last_updated                    | id
+---------------------------------+----------
+ 2026-01-01 00:41:32.000000+0000 | obs03490
+ 2026-01-01 00:41:31.000000+0000 | obs03489
+ 2026-01-01 00:41:30.000000+0000 | obs03488
+ 2026-01-01 00:41:30.000000+0000 | obs03487
+ 2026-01-01 00:41:30.000000+0000 | obs03486
+ 2026-01-01 00:41:29.000000+0000 | obs03485
+ 2026-01-01 00:41:28.000000+0000 | obs03484
+ 2026-01-01 00:41:27.000000+0000 | obs03483
+ 2026-01-01 00:41:26.000000+0000 | obs03482
+ 2026-01-01 00:41:25.000000+0000 | obs03481
+
+(10 rows)
+
+-- page 3 : SELECT last_updated,id FROM spike.resources_by_type WHERE tenant_id='t1' AND resource_type='Observation' AND (last_updated,id) < ('2026-01-01 00:41:25+0000','obs03481') LIMIT 10;
+Consistency level set to LOCAL_QUORUM.
+
+ last_updated                    | id
+---------------------------------+----------
+ 2026-01-01 00:41:25.000000+0000 | obs03480
+ 2026-01-01 00:41:25.000000+0000 | obs03479
+ 2026-01-01 00:41:24.000000+0000 | obs03478
+ 2026-01-01 00:41:23.000000+0000 | obs03477
+ 2026-01-01 00:41:22.000000+0000 | obs03476
+ 2026-01-01 00:41:21.000000+0000 | obs03475
+ 2026-01-01 00:41:20.000000+0000 | obs03474
+ 2026-01-01 00:41:20.000000+0000 | obs03473
+ 2026-01-01 00:41:20.000000+0000 | obs03472
+ 2026-01-01 00:41:19.000000+0000 | obs03471
+
+(10 rows)
+
+-- page 4 : SELECT last_updated,id FROM spike.resources_by_type WHERE tenant_id='t1' AND resource_type='Observation' AND (last_updated,id) < ('2026-01-01 00:41:19+0000','obs03471') LIMIT 10;
+Consistency level set to LOCAL_QUORUM.
+
+ last_updated                    | id
+---------------------------------+----------
+ 2026-01-01 00:41:18.000000+0000 | obs03470
+ 2026-01-01 00:41:17.000000+0000 | obs03469
+ 2026-01-01 00:41:16.000000+0000 | obs03468
+ 2026-01-01 00:41:15.000000+0000 | obs03467
+ 2026-01-01 00:41:15.000000+0000 | obs03466
+ 2026-01-01 00:41:15.000000+0000 | obs03465
+ 2026-01-01 00:41:14.000000+0000 | obs03464
+ 2026-01-01 00:41:13.000000+0000 | obs03463
+ 2026-01-01 00:41:12.000000+0000 | obs03462
+ 2026-01-01 00:41:11.000000+0000 | obs03461
+
+(10 rows)
+
+-- page 5 : SELECT last_updated,id FROM spike.resources_by_type WHERE tenant_id='t1' AND resource_type='Observation' AND (last_updated,id) < ('2026-01-01 00:41:11+0000','obs03461') LIMIT 10;
+Consistency level set to LOCAL_QUORUM.
+
+ last_updated                    | id
+---------------------------------+----------
+ 2026-01-01 00:41:10.000000+0000 | obs03460
+ 2026-01-01 00:41:10.000000+0000 | obs03459
+ 2026-01-01 00:41:10.000000+0000 | obs03458
+ 2026-01-01 00:41:09.000000+0000 | obs03457
+ 2026-01-01 00:41:08.000000+0000 | obs03456
+ 2026-01-01 00:41:07.000000+0000 | obs03455
+ 2026-01-01 00:41:06.000000+0000 | obs03454
+ 2026-01-01 00:41:05.000000+0000 | obs03453
+ 2026-01-01 00:41:05.000000+0000 | obs03452
+ 2026-01-01 00:41:05.000000+0000 | obs03451
+
+(10 rows)
+
+-- ground truth LIMIT 50 equals concatenation of pages: True | rows: 50 | distinct: 50
+-- pages whose last row tied with next page's first row (split a tie group):
+   boundary after row 20 ('2026-01-01 00:41:25', 'obs03481') | next ('2026-01-01 00:41:25', 'obs03480')
+
+-- cursor-row exclusion / tie checks (from first A3 run):
+-- cursor-row exclusion + tie check at (00:41:35, obs03494) (middle of a 3-way tie 03493/03494/03495):
+Consistency level set to LOCAL_QUORUM.
+
+ last_updated                    | id
+---------------------------------+----------
+ 2026-01-01 00:41:35.000000+0000 | obs03495
+ 2026-01-01 00:41:35.000000+0000 | obs03494
+ 2026-01-01 00:41:35.000000+0000 | obs03493
+
+(3 rows)
+
+ last_updated                    | id
+---------------------------------+----------
+ 2026-01-01 00:41:35.000000+0000 | obs03493
+ 2026-01-01 00:41:34.000000+0000 | obs03492
+ 2026-01-01 00:41:33.000000+0000 | obs03491
+
+(3 rows)
+
+ last_updated                    | id
+---------------------------------+----------
+ 2026-01-01 00:41:35.000000+0000 | obs03495
+ 2026-01-01 00:41:36.000000+0000 | obs03496
+ 2026-01-01 00:41:37.000000+0000 | obs03497
+
+(3 rows)

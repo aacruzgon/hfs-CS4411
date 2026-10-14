@@ -1,0 +1,31 @@
+# B5: 20 IF NOT EXISTS + 20 IF version_id=1 (40 LWTs, 20 partitions)
+40
+$ nodetool tablestats system.paxos
+		Table: paxos
+		SSTable count: 0
+		Old SSTable count: 0
+		Space used (live): 0
+		Number of partitions (estimate): 19
+		Memtable cell count: 120
+		Memtable data size: 5510
+		Local read count: 20
+		Local write count: 120
+		Table: paxos_repair_history
+		Number of partitions (estimate): 0
+$ SELECT count(*) FROM system.paxos
+    20
+
+ row_key                        | cf_id                                | in_progress_ballot                   | in_progress_read_ballot | most_recent_commit                                                                                                             | most_recent_commit_at            
+--------------------------------+--------------------------------------+--------------------------------------+-------------------------+--------------------------------------------------------------------------------------------------------------------------------+----------------------------------
+ 0x0001740000024235000002703900 | 89b34200-c77a-11f1-82ac-a9e6f49ea8a5 | 1c2493a1-c77b-11f1-68c0-7a28c3e3bcd0 |                    null | 0x89b34200c77a11f182aca9e6f49ea8a50e000174000002423500000270390010fd3d796c9c3b900000010a76657273696f6e5f6964012000000000000201 | 1c2493a1-c77b-11f1-68c0-7a28c3e3b
+
+(1 rows)
+after flush:
+		SSTable count: 1
+		Old SSTable count: 0
+		Space used (live): 7096
+		Number of partitions (estimate): 20
+--------------------------+--------
+ paxos_purge_grace_period |    60s
+      paxos_state_purging | legacy
+            paxos_variant |     v2

@@ -1,0 +1,67 @@
+# B3
+Consistency level set to LOCAL_QUORUM.
+
+ tenant_id | resource_type | last_updated | id | version_id
+-----------+---------------+--------------+----+------------
+
+
+(0 rows)
+
+ tenant_id | resource_type | last_updated                    | id | version_id
+-----------+---------------+---------------------------------+----+------------
+         t |            B3 | 1970-01-01 00:00:05.000000+0000 | k1 |          9
+
+(1 rows)
+
+ last_updated                    | id | version_id | writetime(version_id)
+---------------------------------+----+------------+-----------------------
+ 1970-01-01 00:00:06.000000+0000 | k2 |          2 |                   500
+
+(1 rows)
+
+ last_updated                    | id | version_id | writetime(version_id)
+---------------------------------+----+------------+-----------------------
+ 1970-01-01 00:00:06.000000+0000 | k2 |          3 |                   600
+
+(1 rows)
+### null vs omitted
+Consistency level set to LOCAL_QUORUM.
+/var/lib/cassandra/data/spike/nulltest-b9b8f580c77a11f182aca9e6f49ea8a5/da-3h4n_084m_4elvu1zjekiygtn8o5-bti-Data.db
+[
+  {
+    "table kind" : "REGULAR",
+    "partition" : {
+      "key" : [ "explicit_null" ],
+      "position" : 16
+    },
+    "rows" : [
+      {
+        "type" : "row",
+        "position" : 16,
+        "liveness_info" : { "tstamp" : "2026-10-14T02:55:34.237419Z" },
+        "cells" : [
+          { "name" : "a", "value" : "x" },
+          { "name" : "b", "deletion_info" : { "local_delete_time" : "2026-10-14T02:55:34Z" }
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "table kind" : "REGULAR",
+    "partition" : {
+      "key" : [ "omitted" ],
+      "position" : 36
+    },
+    "rows" : [
+      {
+        "type" : "row",
+        "position" : 36,
+        "liveness_info" : { "tstamp" : "2026-10-14T02:55:34.241658Z" },
+        "cells" : [
+          { "name" : "a", "value" : "x" }
+        ]
+      }
+    ]
+  }
+]
