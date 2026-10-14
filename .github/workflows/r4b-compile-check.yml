@@ -1,0 +1,73 @@
+name: R4B compile check
+
+# Roadmap item 0.4: proves the Cassandra backend assumes nothing R4-specific
+# by compiling helios-persistence with R4B as the only FHIR version. Runs on
+# the team's self-hosted runner (ADR-aacruzgon-0018, ADR-sam-michaels-0001).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One run per ref; a newer push supersedes the run in flight.
+concurrency:
+  group: r4b-compile-check-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Pinned by environment, which rustup ranks above any directory override left
+  # on the runner (the inherited ci.yml hit exactly that). Cargo itself refuses
+  # a toolchain older than the workspace rust-version, 1.90.
+  RUSTUP_TOOLCHAIN: stable
+  CARGO_TERM_COLOR: always
+
+jobs:
+  r4b-check:
+    name: cargo check (cassandra, R4B)
+    # Fork guard (ADR-aacruzgon-0018). It only keeps this unmodified workflow
+    # from running a fork's code; approval is what keeps forks off the runner.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, hfs-cassandra]
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Keep the job token out of .git/config, where build scripts and
+          # proc-macros run by cargo could read it.
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master, 2026-10-09
+        with:
+          toolchain: stable
+
+      # No rust-cache: the runner is one fixed machine (ADR-sam-michaels-0002).
+      # The cargo registry already persists in the runner user's ~/.cargo, and
+      # the target directory lives next to the checkout, not in it, so the
+      # checkout's git clean leaves it alone and cargo reuses every unchanged
+      # crate, the generated FHIR models included. Cargo never deletes stale
+      # artifacts, so the directory is wiped when the toolchain or Cargo.lock
+      # changes, or when it passes its size cap. CARGO_TARGET_DIR is exported
+      # here because the runner context is not available in a job-level env.
+      - name: Reset the target dir if it is stale or over its cap
+        env:
+          TARGET_DIR: ${{ runner.workspace }}/target/r4b-compile-check
+          CAP_GB: 10
+        run: |
+          stamp="$(rustc -V) $(sha256sum Cargo.lock | cut -c1-16)"
+          size_gb=$(du -s --block-size=1G "$TARGET_DIR" 2>/dev/null | cut -f1)
+          if [ "$(cat "$TARGET_DIR/.stamp" 2>/dev/null)" != "$stamp" ] || [ "${size_gb:-0}" -gt "$CAP_GB" ]; then
+            echo "Resetting $TARGET_DIR (size ${size_gb:-0} GB, cap $CAP_GB GB, stamp: $stamp)"
+            rm -rf "$TARGET_DIR"
+          fi
+          mkdir -p "$TARGET_DIR" && echo "$stamp" > "$TARGET_DIR/.stamp"
+          echo "CARGO_TARGET_DIR=$TARGET_DIR" >> "$GITHUB_ENV"
+
+      - name: cargo check -p helios-persistence --no-default-features --features cassandra,R4B
+        run: cargo check -p helios-persistence --no-default-features --features cassandra,R4B

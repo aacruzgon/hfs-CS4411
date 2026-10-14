@@ -43,3 +43,4 @@ A choice between two or more workable designs; a change to a trait surface, tabl
 | ADR | Date | Title | Status |
 | --- | --- | --- | --- |
 | [0001](2026-10-14/0001-self-hosted-runner-registration.md) | 2026-10-14 | Self-hosted runner registered on the 7900X rig, run by a dedicated non-admin user with rootless Docker | accepted |
+| [0002](2026-10-14/0002-persistent-target-dir-instead-of-rust-cache.md) | 2026-10-14 | CI keeps a bounded cargo target directory on the runner instead of using rust-cache | accepted |
