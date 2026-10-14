@@ -1,0 +1,27 @@
+# ADR-aacruzgon-0010: Compaction stays at the node default for every table
+
+- **Date:** 2026-10-13
+- **Status:** accepted (team review at the schema session, roadmap item 1.4)
+- **Context:**
+    - **The checklist asks** for a compaction strategy per table, with the reason recorded. The 5.0 default in `cassandra_latest.yaml` (UnifiedCompactionStrategy) is the starting point, to be confirmed by the tombstone numbers in roadmap section 7.
+    - **The node's default** is UCS with `scaling_parameters: T4` (tiered, fan factor 4), plus four other UCS settings from the yaml.
+    - **What the Apache docs say.** UCS "is recommended for new workloads". Levelled (`L`) settings suit read-heavy workloads "especially if bloom filters are not effective"; tiered (`T`) settings suit write-heavy ones. "Setting any `compaction` sub-options will erase *ALL* previous `compaction` options."
+- **Decision:** no table sets `compaction`, so every table uses the node default (UCS `T4`). `docs/Cassandra/schema/README.md` records the reason per table and the measurement that would change it.
+- **Alternatives considered:**
+    - **`L4` on `resources` and the index tables,** the first draft: lost.
+        - An explicit map drops the yaml's other UCS settings; a node confirmed `DESCRIBE` then shows only `scaling_parameters`.
+        - `resources` has one row per partition, so its bloom filters work well, which is the case the docs give for staying tiered.
+    - **TimeWindowCompactionStrategy on `pending_index_writes`:** deferred. The docs recommend it for TTL data, but these rows are deleted explicitly within seconds, long before the TTL expires. Revisit once the sweeper reads by time slice (ADR-aacruzgon-0015) has been measured.
+- **Consequences:**
+    - **One less thing to tune** before the first measurements.
+    - **The section 7 tombstone trigger decides.** If tombstones per read pass 1,000 on an index table, `L4` is the first thing to try.
+- **AI involvement:**
+    - **Tools:** Claude Code (Opus 5.5), with Sonnet 5.5 subagents.
+    - **What the AI proposed:** first `L4`/`T4` per table. After a node showed that explicit maps drop the yaml settings, and after the docs were read, it proposed the default everywhere.
+    - **What the human changed:** nothing. Alan went through the choice and its alternatives with the AI and accepted it as proposed.
+    - **Verified:**
+        - On a node: an explicit `L4` map was accepted, and `DESCRIBE` lost the other UCS settings. With no `compaction` clause, all ten tables show the full default.
+        - The quotes were checked against the 5.0 documentation source (`ucs.adoc`, `overview.adoc`, `ddl.adoc`).
+- **Links:**
+    - **Files:** `docs/Cassandra/schema/schema.cql`, `docs/Cassandra/schema/README.md` ("Compaction").
+    - **Docs:** roadmap Step 1 checklist "Compaction" row and section 7.

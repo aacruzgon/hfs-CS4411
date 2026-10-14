@@ -1,0 +1,31 @@
+# ADR-aacruzgon-0009: `gc_grace_seconds` per table
+
+- **Date:** 2026-10-13
+- **Status:** accepted (team review at the schema session, roadmap item 1.4)
+- **Context:**
+    - **What the checklist says.** It asks for a lower `gc_grace_seconds` on the six index tables and `resources_by_type`, "never on `resources` or `resource_versions`". It gives no value and does not mention `pending_index_writes`.
+    - **Why the value matters.** Tombstones are kept until `gc_grace_seconds` has passed; the default is 10 days. The index tables gain a row tombstone on almost every update, and the outbox gains one on every write.
+    - **What the Apache docs say.** Repair must run "often enough that the gc grace period never expires on unrepaired data", and hints are kept for `max_hint_window` (3 h) and "are best effort". The docs do not discuss lowering `gc_grace_seconds` below the repair interval.
+- **Decision:**
+    - **10,800 s (3 h) on the six index tables, `resources_by_type` and `pending_index_writes`.**
+    - **The 10-day default on `resources` and `resource_versions`.**
+- **Alternatives considered:**
+    - **Leave the outbox at 10 days:** lost. Its rows are deleted within seconds, and a resurrected intent row is harmless: the sweeper either deletes it or replays writes identical to ones already applied (ADR-aacruzgon-0013).
+    - **0 on the index tables:** lost. On the three-node cluster, a replica that missed a delete would then have no hint window in which to receive it.
+    - **One day, a round number:** lost. Nothing ties it to a mechanism, whereas 3 h equals the hint window.
+- **Consequences:**
+    - **Resurrection becomes possible on the cluster.** If a replica is down for more than 3 h and is not repaired, a deleted index row can come back. Search hides it with the tag check, but `count` does not (walk-through gap G7), and the session must accept or fix that.
+    - **`resources` must keep 10 days for a second reason.** With the default `paxos_state_purging` (legacy), Paxos state for a table lives for `max(3 h, gc_grace_seconds)` (5.0 source, `SystemKeyspace.legacyPaxosTtlSec`).
+    - **Lower does not help the outbox's read cost.** Tombstones in a polled partition are scanned anyway until compaction removes them; ADR-aacruzgon-0015 fixes that by reading only a time slice.
+- **AI involvement:**
+    - **Tools:** Claude Code (Opus 5.5), with Sonnet 5.5 subagents for the Apache documentation.
+    - **What the AI proposed:** the 3 h value, extending it to the outbox, and the Paxos reason for keeping `resources` at 10 days.
+    - **What the human changed:** nothing. Alan went through the choice and its alternatives with the AI and accepted it as proposed.
+    - **Verified:**
+        - On a node: the values appear in `system_schema.tables`, and `max_hint_window` is `3h` in the node's yaml.
+        - The quotes were checked against the 5.0 documentation source (`repair.adoc`, `hints.adoc`, `tombstones.adoc`).
+        - The Paxos TTL was read in the 5.0 source.
+- **Links:**
+    - **Files:** `docs/Cassandra/schema/schema.cql`, `docs/Cassandra/schema/README.md`.
+    - **Roadmap:** the Step 1 checklist row "Index-table options" now lists `pending_index_writes` and the 3 h value, changed in the same commit.
+    - **Docs:** roadmap Step 1 checklist "Index-table options" row; walk-through gaps G5 and G7.

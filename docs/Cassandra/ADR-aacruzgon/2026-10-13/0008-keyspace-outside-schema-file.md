@@ -1,0 +1,32 @@
+# ADR-aacruzgon-0008: Keep the keyspace out of `schema.cql`
+
+- **Date:** 2026-10-13
+- **Status:** accepted (team review at the schema session, roadmap item 1.4)
+- **Context:**
+    - **The checklist asks for one keyspace statement** with replication factor 1 locally and 3 on the cluster. A single file cannot hold both.
+    - **Tests need their own keyspaces.** Integration tests that share one node are easiest to isolate with one keyspace per run, which a hard-coded keyspace name prevents.
+    - **Tracing on one node needs a system-keyspace change.** Spike finding 1: `system_traces` defaults to RF 2, so a trace fetch at `LOCAL_QUORUM` fails on a single node. The backend must never alter system keyspaces.
+- **Decision:**
+    - **`schema.cql` holds only the ten tables,** with unqualified names. It is applied with `cqlsh -k <keyspace> -f schema.cql`, or by the driver after selecting the keyspace.
+    - **`keyspace-single-node.cql` creates `helios`** with `{'class': 'NetworkTopologyStrategy', 'helios-dc1': 1}`. It also sets `system_traces` to RF 1 as a developer step.
+    - **The cluster uses the same `CREATE KEYSPACE` with `'helios-dc1': 3`** and skips the `system_traces` change.
+- **Alternatives considered:**
+    - **One file with a hard-coded keyspace and RF 1:** lost. The cluster and the tests would each need an edited copy.
+    - **Placeholders such as `${RF}` in `schema.cql`:** lost. The file would no longer apply with plain `cqlsh`, which the exit criterion checks.
+    - **`system_traces` in `schema.cql`:** lost. A backend schema must not change system keyspaces, and three nodes do not need the change.
+- **Consequences:**
+    - **The backend's config names the keyspace.** `initialize` must select it before applying the tables.
+    - **Two files to apply locally** instead of one; both READMEs show the commands.
+    - **Item 0.3 writes its own keyspace step** for the cluster.
+    - **Open, raised for the session:** whether every Helios process should apply the schema at startup (proposal P6 in `docs/Cassandra/schema/README.md`).
+- **AI involvement:**
+    - **Tools:** Claude Code (Opus 5.5), with Opus 5.5 and Sonnet 5.5 subagents.
+    - **What the AI proposed:** the split, the unqualified table names and where the `system_traces` step lives.
+    - **What the human changed:** nothing. Alan went through the choice and its alternatives with the AI and accepted it as proposed.
+    - **Verified on fresh Cassandra 5.0.9 nodes:**
+        - Both files apply with no errors, and re-applying them is silent.
+        - `cqlsh -k` accepts unqualified names. Without `-k` it fails with `No keyspace has been specified`.
+        - After the `ALTER`, `system_traces` shows `'helios-dc1': '1'`.
+- **Links:**
+    - **Files:** `docs/Cassandra/schema/keyspace-single-node.cql`, `docs/Cassandra/schema/schema.cql`, `docs/Cassandra/schema/README.md`.
+    - **Docs:** roadmap Step 1 checklist "Keyspace" row; `spike-findings.md` point 1; ADR-aacruzgon-0003.

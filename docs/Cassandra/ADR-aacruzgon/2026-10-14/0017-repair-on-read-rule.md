@@ -1,0 +1,31 @@
+# ADR-aacruzgon-0017: Repair on read deletes only keys the current version does not produce
+
+- **Date:** 2026-10-14
+- **Status:** accepted (team review at the schema session, roadmap item 1.4)
+- **Context:**
+    - **What the design said.** Repair on read "deletes the stale key it found".
+    - **The race.** During the normal window between a writer's CAS and its index writes, a key the new version keeps (for example an unchanged date) still carries the old tag.
+        - Repair would delete it at the current version's `write_ts`, the same timestamp as the writer's insert.
+        - A delete wins a timestamp tie, so the key would disappear for good.
+    - **Found by:** the schema walk-through (gap G10).
+- **Decision:**
+    - **Repair re-runs index maintenance for the current version** at its `write_ts`.
+    - **A stale key the current version does not produce** is deleted.
+    - **A key the current version does produce** is upserted with the current tag, never deleted.
+    - **Logging:** repair is a write made from a read request, and is logged as such.
+- **Alternatives considered:**
+    - **Repair only after the grace period has passed since `last_updated`:** lost. It is another clock comparison, and it would leave orphans visible to `count` for longer.
+    - **Drop repair on read** now that the sweeper replays superseded versions (ADR-aacruzgon-0013): lost. Repair still heals rows the sweeper cannot know about, such as a crash older than the intent TTL, or the double crash.
+- **Consequences:**
+    - **Repair writes exactly what the writer would,** so the two can run concurrently without harm.
+    - **Repair must extract the current version's keys,** which search already has: it loads the `resources` row for the tag check.
+- **AI involvement:**
+    - **Tools:** Claude Code (Opus 5.5), with Opus 5.5 and Sonnet 5.5 subagents.
+    - **What the AI proposed:** the walk-through agent found the tie. The AI wrote the rule.
+    - **What the human changed:** Alan decided to fix the design document.
+    - **Verified:**
+        - The tie-break rule is stated in the Apache Cassandra 4.1 FAQ: "deletes take precedence over inserts/updates". The 5.0 FAQ page is empty.
+        - The spike (B3) measured fixed timestamps with different values, not a tie.
+        - The rest is by reasoning.
+- **Links:**
+    - **Docs:** `cassandra-discussion.md` "Repair on read stays as the second line of defence"; roadmap Step 5; walk-through G10.

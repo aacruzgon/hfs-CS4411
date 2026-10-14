@@ -1,0 +1,36 @@
+# ADR-aacruzgon-0012: Every write also rewrites the previous version's history row
+
+- **Date:** 2026-10-14
+- **Status:** accepted (team review at the schema session, roadmap item 1.4)
+- **Context:**
+    - **The design wrote `resource_versions` for N+1 only, after the compare-and-swap** (write path step 4).
+    - **How that loses data.** Helios crashes between the CAS and step 4, and another update reaches the resource before the sweeper runs.
+        - That update overwrites `resources`, so version N+1's content is now in neither table.
+        - `vread` of N+1 returns 404 and `list_versions` has a gap, which `versioned_write_race_suite.rs` does not allow.
+        - The sweeper cannot help, because the content is gone.
+    - **Found by:** the schema walk-through (gap G2). A second, independent review agreed it is the most serious gap.
+- **Decision:**
+    - **For an update, delete or revive, step 4 also rewrites the `resource_versions` row for N** from `current`, `USING TIMESTAMP write_ts(N) − 1`.
+    - **Why one microsecond older.** If the row already exists, the original wins every cell, so the rewrite is a no-op even if the JSON re-serialises differently. At equal timestamps Cassandra would keep the larger value instead.
+    - **If N is a delete marker,** the rewrite sets `deleted_at` and leaves `data` unset, although `resources.data` still holds the old content.
+    - **`write_ts(N)` is recomputed from `current`'s `last_updated`** (ADR-aacruzgon-0016).
+- **Alternatives considered:**
+    - **Write the version row before the CAS:** lost. A CAS that then fails would leave a phantom version, and a later writer of the same version number would need to overwrite it.
+    - **Fold `resource_versions` into `resources`** (static columns, one conditional statement): lost. It is a much larger change to the data model, and every `read` would then fetch a partition holding the whole history.
+    - **Accept the loss as a double fault:** lost. It needs only one crash; the following update is normal traffic.
+- **Consequences:**
+    - **One extra write per update, delete and revive.** It goes to the same partition as the N+1 row, so the two can share a single-partition batch, which the batch size check does not apply to.
+    - **If the row already exists, the rewrite changes nothing,** because it is older than the original by one microsecond.
+    - **A double crash can still lose the version:** a crash at step 4 for N+1, then another at step 4 for N+2 before the sweep. The sweeper logs it (ADR-aacruzgon-0013).
+    - **New failure test** in roadmap section 6: "CAS then crash, then superseded".
+- **AI involvement:**
+    - **Tools:** Claude Code (Opus 5.5), with Opus 5.5 and Sonnet 5.5 subagents.
+    - **What the AI proposed:** the walk-through agent found the gap and proposed two options (this one, and folding the tables). The AI recommended this one.
+    - **What the human changed:** Alan decided to fix the design document rather than leave the gap as an open question for the session.
+    - **Verified:**
+        - By reasoning against the design text and `versioned_write_race_suite.rs`.
+        - On a node: a single-partition batch writing the rows for N+1 and N keeps each row's own `USING TIMESTAMP`.
+        - The behaviour itself can only be run once the backend exists; the new failure test covers it.
+    - **Revised the same day:** the walk-through agent showed that a rewrite at `write_ts(N)` is not a no-op when the bytes differ, and that a delete marker needs `data` left unset. The timestamp became `write_ts(N) − 1`.
+- **Links:**
+    - **Docs:** `cassandra-discussion.md` write path step 4; roadmap Step 3 and section 6; `docs/Cassandra/schema/walkthrough.md` G2.

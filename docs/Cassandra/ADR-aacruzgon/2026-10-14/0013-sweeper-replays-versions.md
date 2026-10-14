@@ -1,0 +1,37 @@
+# ADR-aacruzgon-0013: The sweeper replays the intent's version, even if superseded
+
+- **Date:** 2026-10-14
+- **Status:** accepted (team review at the schema session, roadmap item 1.4)
+- **Context:**
+    - **What the design said.** If the resource's `write_id` differs from the intent's, the sweeper deletes the intent, because "a later version has already superseded it, whose own intent row covers it".
+    - **Why that is wrong.** The later version's writer deletes only the keys of the version it read (N+1), and those were never written. The index rows of N are never deleted.
+        - Search hides them with the tag check, and repair on read removes them when a search reaches them.
+        - `count` counts them until then.
+    - **Found by:** the schema walk-through (gaps G1 and G3).
+- **Decision:**
+    - **The intent row carries `version_id`:** the version V its compare-and-swap will create.
+    - **For each intent, the sweeper reads `resources` at `LOCAL_SERIAL`.**
+        - If there is no row, or the row's version is below V, it deletes the intent.
+        - If V is current, it replays V's own version row and step 5 at `write_ts(V)`, with V's content from `resources`. If `deleted_at` is set, V is a delete marker: no `data`, and an empty key set.
+        - The previous keys come from V−1's row. They are empty for version 1, for a delete marker, and when V−1's row is missing too.
+        - The sweeper never does step 4's rewrite of V−1.
+        - If V has been superseded, it only deletes V−1's keys at `write_ts(V)`, with no inserts.
+        - It then deletes the intent.
+    - **If V's row is missing as well** (two crashes), V never reached step 5. The sweeper deletes V−1's keys at `write_ts(V−1) + 1`, logs it, and deletes the intent.
+- **Alternatives considered:**
+    - **Keep the `write_id` comparison and add `write_id` to `resource_versions`,** as the walk-through first suggested: lost. Whose compare-and-swap created V does not matter, because the replay is safe either way, so neither the comparison nor the column is needed.
+    - **Have each writer also delete the keys of every older version:** lost. It cannot know which older versions left rows behind without reading them all.
+- **Consequences:**
+    - **Why the replay is safe.** A delete at an older timestamp never removes a newer row, even after that row's own tombstones are purged. A superseded replay therefore writes deletes only. Inserts at `write_ts(V)` could bring back keys a later version deleted, once those tombstones are gone: `gc_grace_seconds` is 3 h on the index tables, and the startup scan reaches back 24 h.
+    - **`count` is right again after the sweep for a single crash.** It can stay wrong in the limits the design now states: a stall past the grace period followed by a crash, or an outage longer than the 24 h TTL.
+    - **The intent always names the version in play.** `create_or_update`'s retry loop rewrites the intent (same key) with each attempt's version, and a request whose compare-and-swap definitely missed (404 or 409) deletes its intent. A lost race then costs no sweeper work.
+    - **Schema change:** `version_id int` on `pending_index_writes`. The sweeper no longer reads the intent's `write_id`, which stays for diagnostics.
+- **AI involvement:**
+    - **Tools:** Claude Code (Opus 5.5), with Opus 5.5 and Sonnet 5.5 subagents.
+    - **What the AI proposed:** the walk-through agent found the gap and proposed replaying at `write_ts(V)`. The AI then dropped the `write_id` comparison, after showing that the replay is safe whoever created V.
+    - **Revised the same day, by an independent review:** without these rules, a stale intent version in the retry loop could hide a resource, and a replay for a delete could put content into a delete marker. Those findings added the retry-loop rule, the marker rule and the missing-V−1 rule.
+    - **Revised the same day, by a second walk-through pass:** it found that a late full replay could re-insert purged keys, and that the double crash left orphans. Hence the deletes-only rule for a superseded V, and the delete at `write_ts(V−1) + 1`.
+    - **What the human changed:** Alan decided to fix the design document.
+    - **Verified:** by reasoning against the design's last-write-wins rules, and `schema.cql` applies with the new column. The failure test "CAS then crash, then superseded" covers it once code exists.
+- **Links:**
+    - **Docs:** `cassandra-discussion.md` "Decision: an intent row and a sweeper close the window"; roadmap Step 1 checklist, Step 5 and section 6; walk-through G1 and G3.

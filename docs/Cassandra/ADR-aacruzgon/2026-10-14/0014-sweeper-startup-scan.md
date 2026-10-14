@@ -1,0 +1,27 @@
+# ADR-aacruzgon-0014: The sweeper scans every live bucket when it starts
+
+- **Date:** 2026-10-14
+- **Status:** accepted (team review at the schema session, roadmap item 1.4)
+- **Context:**
+    - **The mismatch.** The design polled only the current and previous hour bucket, but intent rows live for 24 h.
+    - **How it fails.** After a sweeper outage of more than about an hour, older intents are never processed.
+        - A crashed create then has no index rows at all, so repair on read can never find it, and the resource stays invisible to search for good.
+    - **Found by:** the schema walk-through (gap G6); the independent review found the crashed-create case.
+- **Decision:** at startup the sweeper first scans the 25 most recent hourly buckets: a 24 h TTL can span 25 hour buckets (a row written yesterday at 10:45 is still live at 10:30 today). It reads each one in one-minute time slices, so no single query reads more than a minute of finished intents. It then polls the current and previous buckets as before.
+- **Alternatives considered:**
+    - **Persist a checkpoint per shard:** lost. It adds a table and a write per poll, and the TTL already bounds how far back the scan must go.
+    - **Poll all 25 buckets every time:** lost. It costs many times the reads for work that only exists after an outage.
+- **Consequences:**
+    - **Startup reads up to 400 partitions** (25 buckets × 16 shards), sliced by time (ADR-aacruzgon-0015).
+        - At 200 writes/s, a one-minute slice holds about 750 finished intents per shard, under the 1,000 warning.
+        - Faster write rates need shorter slices.
+        - Buckets older than `gc_grace_seconds` (3 h) shrink as compaction purges their tombstones.
+    - **New failure test** in roadmap section 6: "Sweeper outage", run with a test clock or a short bucket length.
+- **AI involvement:**
+    - **Tools:** Claude Code (Opus 5.5), with Opus 5.5 and Sonnet 5.5 subagents.
+    - **What the AI proposed:** the startup scan; the walk-through also offered a persisted checkpoint as an option.
+    - **What the human changed:** Alan decided to fix the design document.
+    - **Revised the same day:** an independent review found that 24 buckets miss one: a 24 h TTL can span 25.
+    - **Verified:** by reasoning against the design text. The new failure test covers it once code exists.
+- **Links:**
+    - **Docs:** `cassandra-discussion.md` sweeper decision; roadmap Step 5 and section 6; walk-through G6.
