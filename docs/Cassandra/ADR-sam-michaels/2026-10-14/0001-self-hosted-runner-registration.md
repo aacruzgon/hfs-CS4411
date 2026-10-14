@@ -1,0 +1,101 @@
+# ADR-sam-michaels-0001: Self-hosted runner registered on the 7900X rig, run by a dedicated non-admin user with rootless Docker
+
+- **Date:** 2026-10-14
+- **Status:** accepted
+- **Context:**
+    - ADR-aacruzgon-0018 puts every CI workflow on the team's self-hosted runner (32 GB, AMD 7900X) and leaves its labels and OS to be recorded when it is registered. Roadmap Step 0 makes registration the first CI item: Rust, Docker and `cqlsh` installed, checked by a one-step workflow.
+    - The rig is my own desktop, which I also use for development alongside my Mac (my primary machine). That made three choices real decisions rather than routine setup:
+        - which label workflows target;
+        - which local user the runner runs as (ADR-aacruzgon-0018 asks for "a dedicated non-admin user");
+        - which Docker daemon its jobs use.
+- **Decision:**
+    - **Runner and labels.** The runner is `sam-7900x` on Fedora Linux 44, x86_64. Its labels are `self-hosted, Linux, X64` (automatic) and the custom label `hfs-cassandra`; every workflow uses `runs-on: [self-hosted, hfs-cassandra]`.
+    - **Service user.** It runs as a systemd service under a dedicated user, `gh-runner`, which has:
+        - no password, and no membership in `wheel` or `docker`;
+        - its own Rust toolchain (rustup, stable, with rustfmt and clippy), its own `uv`, and `cqlsh` 6.2.2, all in its home directory under `/home/gh-runner`.
+    - **Rootless Docker.** Jobs use `gh-runner`'s own rootless Docker daemon (`dockerd-rootless-setuptool.sh`, rootlesskit with `pasta` networking, socket `/run/user/1001/docker.sock`), never the system daemon.
+        - The runner reaches it through `DOCKER_HOST` in its `.env`.
+        - `loginctl enable-linger gh-runner` starts that daemon at boot, without a login.
+- **Alternatives considered:**
+    - **Run the runner as my own account:** lost.
+        - Every job could read my SSH key, which is both my GitHub authentication key and my commit-signing key, and my `gh` token.
+        - A careless step could delete my files or my dev containers.
+        - CI would depend on my personal `PATH` and toolchain, so updating my own Rust would change CI.
+        - It contradicts ADR-aacruzgon-0018.
+
+      I registered it this way first to prove the setup, then moved it.
+    - **`gh-runner` in the `docker` group, sharing the system daemon:** lost (it was the first version of this entry; Alan's review on PR #16 changed it).
+        - Membership in `docker` is root-equivalent, so any job could mount my home directory into a container and read my SSH key.
+        - CI and I would share one daemon. `docker/cassandra/docker-compose.yml` fixes the project name `hfs-cassandra` and the volume `hfs-cassandra_cassandra-data`, so a CI `docker compose up` or `down` on that file would act on my dev containers, and a `down -v` would delete my dev data.
+    - **Rootless Podman:** lost to rootless Docker. Rootless Docker is still Docker: the same CLI, Compose plugin, images and Compose files the team already uses. Podman's Compose support differs.
+    - **Only the generic `[self-hosted, Linux]` labels** (the inherited `ci.yml` precedent): lost. A custom label pins jobs to this machine if another self-hosted runner is ever added.
+    - **The label `helios-ci`** (suggested as an example): not chosen. `hfs-cassandra` names the project. It can be renamed with a re-registration or in the runner's settings, with every `runs-on` changed in the same commit.
+- **Consequences:**
+    - **Easier:**
+        - Jobs cannot read my home directory (`drwx------`), neither directly nor by mounting it into a container. `gh-runner` is refused on `/var/run/docker.sock`.
+        - CI's containers, images, Compose projects and volumes live in `gh-runner`'s own daemon, so a CI `compose down -v` cannot touch my dev data.
+        - CI's toolchain changes only when someone updates `gh-runner`'s, never because I updated mine.
+    - **Still true (known limits):**
+        - **Fork approval reduces the risk but does not isolate the runner.** A fork's pull request runs its own copy of the workflow files, so one mistaken "Approve and run" executes code the fork's author chose, on this machine, as `gh-runner`. The job guard cannot stop that (ADR-aacruzgon-0018). Rootless Docker limits what such code reaches; it does not keep it off the runner.
+        - **Job steps still run directly on the host as `gh-runner`.** They can read world-readable files and connect to services on the host's loopback, including my dev Cassandra on `127.0.0.1:59042`, which has no authentication. They cannot reach my home directory or the system Docker daemon.
+        - **The host port is still shared.** Rootless containers publish their ports on the host's network, so a CI container and my dev container both asking for host port 59042 still clash. Rules for the 0.5 Cassandra job (from Alan's review on PR #16):
+            - set its own `CASSANDRA_HOST_PORT`, never the default 59042;
+            - pass its own `-p` project name;
+            - never run `down -v` on the default project.
+
+          With rootless Docker the last two only protect CI's own data, but they keep the job safe if it ever runs on a shared daemon again.
+        - **My SSH key has a passphrase** (added 2026-10-14, as Alan's review asked), so a copied key file is useless on its own. Signing my commits now needs the key unlocked in my SSH agent.
+        - **The rig must be on for CI to run.** Queued jobs fail after 24 hours.
+        - **Toolchain updates are manual.** Rust and `cqlsh` for `gh-runner` are updated by hand (`sudo -iu gh-runner`), and must stay at or above the workspace MSRV, 1.90.
+        - **No `cpuset` in rootless mode.** The daemon logs `No cpuset support`, so `--cpuset-cpus` is unavailable. The Compose files use only `cpus` and `mem_limit`, and both are enforced (see verification).
+    - **Setup notes for anyone repeating this on Fedora:**
+        - **SELinux.** SELinux (enforcing) blocks the service's start script in a home directory with `203/EXEC`. `chcon -t bin_t runsvc.sh` fixes it only until the next `restorecon` or relabel, so the label is made persistent instead:
+          ```bash
+          semanage fcontext -a -t bin_t '/home/gh-runner/actions-runner/runsvc\.sh'
+          restorecon -v /home/gh-runner/actions-runner/runsvc.sh
+          ```
+        - **Rootless prerequisites.** Fedora 44 already has everything rootless Docker needs:
+            - `docker-ce-rootless-extras`;
+            - subordinate IDs for new users;
+            - `pasta`;
+            - cgroup v2 delegation of `cpu io memory` to user sessions.
+        - **`sudo` needs a terminal,** so the service install cannot be run through the assistant's `!` prompt.
+        - **Registration tokens last one hour,** and only a repository admin can make one.
+- **AI involvement:**
+    - **Tool and model:** Claude Code, Claude Opus 5.5.
+    - **What the AI proposed:**
+        - The Linux package with its checksum, in place of the macOS package shown on the first registration page.
+        - The `hfs-cassandra` label.
+        - Installing the runner as a systemd service, and the SELinux fix.
+        - The check workflow with the fork guard.
+        - Listing the drawbacks of running as my own account.
+        - The scripts that created `gh-runner` and later moved it to rootless Docker.
+        - SSH commit signing, which the repository's signed-commit rule required before the check branch could be pushed.
+    - **Errors in the AI's first draft, corrected after review on PR #16:**
+        - The first draft deferred rootless Docker and placed the clash on port 9042. Alan's review corrected the port: it is host port 59042, and the project and volume are shared too. He also showed that rootless Docker is no new tool.
+        - The first draft said the fork approval setting "keeps outside code off the runner". CodeRabbit corrected it.
+        - The first draft gave `chcon` as the whole SELinux fix. CodeRabbit pointed out that it does not survive a relabel.
+    - **What the human changed:**
+        - I registered the runner on my own rig.
+        - After reviewing the drawbacks, I chose to move it from my account to a dedicated user, and then, after Alan's review, to rootless Docker.
+        - I got the registration tokens from Alan, set up signing, added the key passphrase, and ran every `sudo` step.
+    - **What was verified and how:**
+        - **Runner package:** the SHA-256 matched the v2.337.0 release notes.
+        - **Tools on the rig:** checked with `--version` for each tool, and `docker run hello-world`.
+        - **The check workflow** (`ci/runner-check`, `.github/workflows/runner-check.yml`) went green:
+            - run 38619043411, three attempts: `run.sh` as my user; the service as my user; the service as `gh-runner`;
+            - run 38625042843, on the rootless daemon.
+        - **The setup script's own checks:**
+            - `gh-runner` is refused on `/var/run/docker.sock`;
+            - `docker info` reports `rootless`, cgroup v2 and the systemd driver;
+            - `runsvc.sh` keeps the `bin_t` label under the persistent rule.
+        - **Limits, from run 38625042843:**
+            - `--cpus 4 --memory 3g` (the `docker/cassandra` limits) gives `cpu.max=400000 100000` and `memory.max=3221225472`.
+            - CPU is enforced: two busy loops for 3 s under `--cpus 1` used 3.04 s of CPU and were throttled in 30 periods, against about 6 s unlimited.
+            - Memory is enforced: unbounded allocation under `--memory 64m` was killed with exit 137.
+- **Links:**
+    - ADR-aacruzgon-0018.
+    - `development-roadmap.md` Step 0, CI bullet (labels, OS, service user and Docker daemon recorded).
+    - PR #16 review comments.
+    - Runs https://github.com/aacruzgon/hfs-Cassandra-CS4411/actions/runs/38619043411 and https://github.com/aacruzgon/hfs-Cassandra-CS4411/actions/runs/38625042843.
+    - Branch `ci/runner-check`.
