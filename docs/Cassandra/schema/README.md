@@ -1,6 +1,8 @@
 # Cassandra schema: draft for the schema session
 
-**Status: DRAFT. Nothing here is signed off.** This is the starting point for roadmap Step 1 (items 1.1 to 1.4). The session decides; each member then records their sign-off, or objection, in their own ADR log.
+**Status: DRAFT. Nothing here is signed off.** This is the starting point for roadmap Step 1 (items 1.1 to 1.4).
+
+**"The schema session"** in these files means the two team design sessions that roadmap Step 1 plans for week 1 (13 to 18 October), led by the owner of the shared files (**W**). The team decides there. Each member then records their sign-off, or objection, in their own ADR log (item 1.4). Rows 1.1 to 1.3 are marked done only after that.
 
 Read [`spike-findings.md`](../spike-findings.md) first, then this page. The other files are reference.
 
