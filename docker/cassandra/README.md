@@ -17,7 +17,7 @@ docker compose -f docker/cassandra/docker-compose.yml \
                -f docker/cassandra/docker-compose.heap2g.yml up -d --wait
 ```
 
-`--wait` returns once CQL answers on `127.0.0.1:9042`. A first boot takes
+`--wait` returns once CQL answers on `127.0.0.1:59042`. A first boot takes
 about 59 seconds on an Apple-silicon laptop and a restart about 11. Data lives
 in the `hfs-cassandra_cassandra-data` volume and survives `down`; use
 `down -v` to start from an empty node.
@@ -26,8 +26,11 @@ in the `hfs-cassandra_cassandra-data` volume and survives `down`; use
 docker compose -f docker/cassandra/docker-compose.yml exec cassandra cqlsh
 ```
 
-Point clients at `127.0.0.1:9042`, not `localhost`: the port is published on
-IPv4 loopback only, and `localhost` can resolve to `::1` first. The node
+Point clients at `127.0.0.1:59042`, not `localhost`: the port is published on
+IPv4 loopback only, and `localhost` can resolve to `::1` first. The host port
+is 59042, not Cassandra's usual 9042, so a Cassandra already running on the
+host cannot silently answer instead; set `CASSANDRA_HOST_PORT` to change it.
+Inside the container, and for other containers, the port is still 9042. The node
 advertises its container IP as `rpc_address`; with one node a driver learns no
 peers and stays on the contact point, but if a driver ever tries to reconnect
 to the advertised address, set `CASSANDRA_BROADCAST_RPC_ADDRESS: 127.0.0.1`.
@@ -45,6 +48,7 @@ to the advertised address, set `CASSANDRA_BROADCAST_RPC_ADDRESS: 127.0.0.1`.
 | Heap | `MAX_HEAP_SIZE` 1G, or 2G with the override | G1 sets `-Xms` equal to `-Xmx`. `HEAP_NEWSIZE` stays unset, because it is ignored under G1. |
 | Direct memory | 512M, or 1G with the override | Half the heap. Otherwise `cassandra-env.sh` sizes it from the host's RAM. |
 | GC threads | 4 parallel, 4 concurrent | Otherwise `cassandra-env.sh` uses the host's core count, not the CPU limit |
+| Host port | `127.0.0.1:59042` (`CASSANDRA_HOST_PORT` overrides) | A process already listening on 9042 on the host would answer instead of the container without any error. See ADR-aacruzgon-0007. |
 | CPU limit | 4 | Same in both profiles and for PostgreSQL |
 | Memory limit | 3 GiB, or 5 GiB with the override; swap disabled | Indicative, Apple-silicon 18 GB laptop under OrbStack: idle 1.61 GiB (1G heap) and 2.65 GiB (2G heap); peak under a 32-thread write load 1.91 GiB of 3 GiB and 3.31 GiB of 5 GiB; no OOM kill. With the stock yaml a 1.5 GiB limit was OOM-killed at boot. |
 | Unchanged | `commitlog_sync: periodic` (10000ms), `batch_size_warn_threshold` 5KiB, `batch_size_fail_threshold` 50KiB, tombstone warn 1000 / fail 100000, `num_tokens` 16 | The same in both files. Recorded so that a benchmark report can state them |

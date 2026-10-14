@@ -46,6 +46,7 @@
 #                    cassandra-env.sh sizes it from the host's RAM)
 #   GC threads       4 parallel / 4 concurrent, matching the CPU limit
 #                    (otherwise cassandra-env.sh uses the host's core count)
+#   Host port        127.0.0.1:59042 (CASSANDRA_HOST_PORT overrides), not 9042
 #   CPU limit        4 CPUs
 #   Memory limit     3 GiB, swap disabled (indicative, Apple-silicon 18 GB
 #                    laptop under OrbStack: 1.61 GiB at idle, peak 1.91 GiB
@@ -77,7 +78,9 @@ services:
     mem_limit: 3g
     memswap_limit: 3g
     ports:
-      - "127.0.0.1:9042:9042"
+      # Host port 59042, not 9042, so a Cassandra already running on the
+      # host cannot silently answer instead. Override with CASSANDRA_HOST_PORT.
+      - "127.0.0.1:${CASSANDRA_HOST_PORT:-59042}:9042"
     volumes:
       - ./entrypoint.sh:/usr/local/bin/hfs-entrypoint.sh:ro
       - cassandra-data:/var/lib/cassandra
