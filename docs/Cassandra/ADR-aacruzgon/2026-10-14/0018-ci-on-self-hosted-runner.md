@@ -8,7 +8,7 @@
     - **No runner is registered yet.** `gh api repos/aacruzgon/hfs-Cassandra-CS4411/actions/runners` returned 0 runners on 2026-10-14.
     - **The inherited `ci.yml` is the precedent.** Every job in it targets `self-hosted` labels; it was archived to `.github/disabled-workflows/` because this fork had no such runner and its jobs queued forever.
 - **Decision:**
-    - Every workflow added for Step 0 (0.4, 0.5, 0.11) runs on the team's self-hosted runner: the team's own server, with 32 GB of RAM and an AMD 7900X CPU, separate from the five team machines in roadmap section 1.
+    - Every workflow added for Step 0 (0.4, 0.5, 0.11) runs on the team's self-hosted runner, a machine with 32 GB of RAM and an AMD 7900X CPU. *Corrected 2026-10-14:* this first said "the team's own server, separate from the five team machines". The machine is Sam's own desktop, which he also develops on, registered as `sam-7900x` (ADR-sam-michaels-0001).
     - Its `runs-on` labels and OS are recorded in the roadmap Step 0 bullet when the runner is registered, and no CI workflow is written before then.
     - The CI items are built in this order: register the runner, then 0.4, then 0.5 (fmt, clippy, Cassandra job), then 0.11. Roadmap Step 0 lists the reasons.
 - **Alternatives considered:**
@@ -23,7 +23,7 @@
         - **No workflow uses `pull_request_target` or `workflow_run`.** Both run in the base repository's context even when a fork triggered them, so a step that checks out or downloads the fork's code would run it on the runner with the base repository's permissions.
     - **The residual risk is a mistaken approval.** GitHub has no setting that turns fork pull request workflows off on a public repository. Making the repository private removes the risk: it needs leaving the fork network first, because a fork of a public repository cannot be private; that is a separate decision.
     - **The runner itself holds nothing worth stealing.** It runs as a dedicated non-admin user, has no secrets beyond what the jobs need, and every workflow keeps the repository default of read-only `GITHUB_TOKEN`, except the canary (0.11), which needs `issues: write`.
-    - **The Cassandra job needs Docker and at least 3 GiB free for the container** (`docker/cassandra`, ADR-aacruzgon-0002), plus room for `target/` and the `rust-cache` cache.
+    - **The Cassandra job needs Docker and at least 3 GiB free for the container** (`docker/cassandra`, ADR-aacruzgon-0002), plus room for the build output. *Corrected 2026-10-14:* this first said "the `rust-cache` cache"; CI keeps a bounded target directory on the runner instead (ADR-sam-michaels-0002).
     - **Out of scope:** `.github/workflows/coverage.yml` stays on GitHub-hosted `ubuntu-24.04`. The Inferno workflows in roadmap Step 8 still say "GitHub-hosted"; they are decided in Step 8.
 - **AI involvement:**
     - **Tools:** Claude Code (Opus 5.5).
