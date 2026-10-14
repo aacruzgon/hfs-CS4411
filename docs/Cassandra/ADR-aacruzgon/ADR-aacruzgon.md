@@ -56,3 +56,9 @@ A choice between two or more workable designs; a change to a trait surface, tabl
 | [0009](2026-10-13/0009-gc-grace-seconds.md) | 2026-10-13 | `gc_grace_seconds` per table | accepted |
 | [0010](2026-10-13/0010-compaction-default.md) | 2026-10-13 | Compaction stays at the node default for every table | accepted |
 | [0011](2026-10-13/0011-created-at.md) | 2026-10-13 | Where `created_at` lives and what revive does to it | accepted |
+| [0012](2026-10-14/0012-rewrite-previous-version-row.md) | 2026-10-14 | Every write also rewrites the previous version's history row | accepted |
+| [0013](2026-10-14/0013-sweeper-replays-versions.md) | 2026-10-14 | The sweeper replays the intent's version, even if superseded | accepted |
+| [0014](2026-10-14/0014-sweeper-startup-scan.md) | 2026-10-14 | The sweeper scans every live bucket when it starts | accepted |
+| [0015](2026-10-14/0015-outbox-clustered-by-time.md) | 2026-10-14 | `pending_index_writes` is clustered by `enqueued_at` first | accepted |
+| [0016](2026-10-14/0016-write-ts-from-last-updated.md) | 2026-10-14 | `write_ts` is derived from `last_updated` | accepted |
+| [0017](2026-10-14/0017-repair-on-read-rule.md) | 2026-10-14 | Repair on read deletes only keys the current version does not produce | accepted |

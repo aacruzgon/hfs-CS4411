@@ -1,0 +1,37 @@
+# ADR-aacruzgon-0015: `pending_index_writes` is clustered by `enqueued_at` first
+
+- **Date:** 2026-10-14
+- **Status:** accepted (team review at the schema session, roadmap item 1.4)
+- **Context:**
+    - **The problem.** The design put `tenant_id` before `enqueued_at` in the clustering key, so the sweeper had to read whole partitions.
+    - **Why it gets worse over time.** Almost every intent row is deleted within seconds, so each partition fills with tombstones over its hour.
+        - At 50 writes/s the 1,000-tombstone warning fires about 5 minutes into each hour.
+        - At about 445 writes/s, reads reach the 100,000 failure threshold.
+    - **Measured on a 5.0.9 node:**
+        - With the design's order, a partition with 3,000 finished intents traced `Read 0 live rows and 3000 tombstone cells` and logged the warning.
+        - With `enqueued_at` first, a slice past the deletes traced `Read 1 live rows and 0 tombstone cells`.
+    - **Found by:** the schema walk-through (gap G5).
+- **Decision:**
+    - **Clustering key:** `(enqueued_at, tenant_id, resource_type, id)`.
+    - **Low-water mark:** the sweeper keeps one per `(bucket, shard)` in memory and reads only rows after the mark and older than the grace period.
+        - After each successful poll the mark moves to the slice's upper bound, `now − grace`, even if no rows came back. Without that, when every intent has already been finished, the mark would never move, and every poll would re-read the hour's tombstones.
+        - An intent's bucket is always the hour of its own `enqueued_at`.
+        - An intent whose processing fails goes to an in-memory retry list, so it does not hold the mark back and make every poll re-read the tombstones behind it.
+    - **Retries:** the request keeps the row's full key, so a retry rewrites the same row, and step 6 deletes it even if the hour has rolled over.
+- **Alternatives considered:**
+    - **Keep the design's order and lower `gc_grace_seconds` further:** lost. Tombstones are scanned until compaction removes them, whatever `gc_grace_seconds` is.
+    - **Smaller buckets, for example one minute:** lost as the main fix. It multiplies the partitions to poll and still reads whole partitions. It remains an option if a sweeper read still scans too many tombstones.
+- **Consequences:**
+    - **What a normal poll scans:** only the tombstones of the last poll interval, about 60 per shard at 200 writes/s with a 5 s poll.
+    - **Clock assumption.** The mark relies on the same assumption as the grace period: clock skew plus intent-write latency stays under it. `cassandra-discussion.md` now states this.
+    - **`tenant_id` is no longer the first clustering column.** Every row still carries it, so tenant isolation is unchanged.
+- **AI involvement:**
+    - **Tools:** Claude Code (Opus 5.5), with Opus 5.5 and Sonnet 5.5 subagents.
+    - **What the AI proposed:** the walk-through agent found the gap and proposed this key. A second agent measured both key orders on a node.
+    - **What the human changed:** Alan decided to fix the design document.
+    - **Revised the same day:** an independent review found that a mark moving only past rows it reads stalls when every intent is already finished. The mark now moves to `now − grace` after each poll.
+    - **Verified:**
+        - The measurement above.
+        - `schema.cql` applies with the new key on a fresh node.
+- **Links:**
+    - **Docs:** `cassandra-discussion.md` data model table and outbox paragraph; roadmap Step 1 checklist and Step 5; walk-through G5; ADR-aacruzgon-0009 and 0014.

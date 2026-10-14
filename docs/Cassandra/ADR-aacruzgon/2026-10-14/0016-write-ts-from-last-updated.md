@@ -1,0 +1,31 @@
+# ADR-aacruzgon-0016: `write_ts` is derived from `last_updated`
+
+- **Date:** 2026-10-14
+- **Status:** accepted (team review at the schema session, roadmap item 1.4)
+- **Context:**
+    - **The formula could not be computed.** The design set `write_ts(N+1) = max(now_µs, write_ts(N) + 1)`. But `ResourceStorage::update` receives `current` as a `StoredResource`, which has `last_updated` and no `write_ts`, so the formula needed an extra read on every update.
+    - **ADR-aacruzgon-0012 makes it worse:** that rewrite needs `write_ts(N)` exactly.
+    - **Found by:** the schema walk-through (gap G4).
+- **Decision:**
+    - `last_updated(N+1) = max(now_ms, last_updated(N) + 1 ms)`.
+    - `write_ts(N+1) = last_updated(N+1) × 1000`, in microseconds.
+    - **A create** uses `now_ms`.
+    - **A delete is a version like any other.** Its compare-and-swap also sets `last_updated`, `write_ts` and `write_id`, so a later revive computes its timestamps from the delete. The design's delete statements did not set them before.
+- **Alternatives considered:**
+    - **Read `write_ts` before every update:** lost. It costs one more round trip on the hot path.
+    - **The walk-through's version,** `last_updated = floor(write_ts / 1000)` with a microsecond `write_ts`: lost. It also works for N+1, but a version's exact `write_ts` could not then be recomputed from its `last_updated`, which ADR-aacruzgon-0012 needs.
+- **Consequences:**
+    - **Timestamps strictly increase per resource,** which is all the fixed-timestamp rules need. Every index key contains the resource `id`, so writes to different resources never compete.
+    - **`last_updated` can run 1 ms ahead of the clock.** Two updates to one resource in the same millisecond get consecutive milliseconds. The same rule keeps `last_updated` moving forward if the clock steps back.
+    - **The `write_ts` column becomes redundant but stays,** so the sweeper and repair read it directly.
+    - **A clock that runs ahead moves `lastUpdated` forward for good.** A Helios process whose clock runs ahead, or a clock that steps back, leaves the resources it writes with a `lastUpdated` in the future. That skews `_lastUpdated` and the default order, but it is not a correctness problem.
+    - **Every write needs an explicit timestamp.** A future statement that writes `resource_versions` or an index table without `USING TIMESTAMP` derived from `write_ts` (a purge, a reindex, a manual fix) would lose to such cells. `schema.cql` states this rule.
+- **AI involvement:**
+    - **Tools:** Claude Code (Opus 5.5), with Opus 5.5 and Sonnet 5.5 subagents.
+    - **What the AI proposed:** the walk-through agent proposed `last_updated = floor(write_ts / 1000)`. The AI changed it to deriving `write_ts` from `last_updated`, so that the rewrite in ADR-aacruzgon-0012 has an exact timestamp.
+    - **What the human changed:** Alan decided to fix the design document.
+    - **Verified:**
+        - The `update` signature and the `StoredResource` fields, read in `crates/persistence/src/core/storage.rs` and `types/stored_resource.rs`.
+        - The ordering argument, by reasoning.
+- **Links:**
+    - **Docs:** `cassandra-discussion.md` write path step 3; roadmap Step 1 checklist and Step 3; walk-through G4.

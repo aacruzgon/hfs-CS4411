@@ -82,7 +82,7 @@ One row per checkable item, grouped by step; the milestone column says which gat
 | 2.6 | Conformance-seeder boot time measured and recorded | A | A | ☐ | | |
 | 2.7 | **Milestone A** script passes: create then read through REST, `versionId` 1, `ETag W/"1"`; `/_readiness` down when Cassandra is stopped | A | W | ☐ | | |
 | 3.1 | Six-step write path: intent row, CAS with `write_ts`/`write_id`, versions row, index batches, intent delete | B | A | ☐ | | |
-| 3.2 | CAS outcome mapping (404/409/410 from condition columns) and timeout handling (`CAS`, `CAS_WRITE_UNKNOWN`, `SIMPLE`, serial-read timeout) | B | A | ☐ | | |
+| 3.2 | CAS outcome mapping (404/409 from condition columns; 410 only from `read`/`vread`) and timeout handling (`CAS`, `CAS_WRITE_UNKNOWN`, `SIMPLE`, serial-read timeout) | B | A | ☐ | | |
 | 3.3 | `crud_suite.rs` and `search/versioned_write_race_suite.rs` pass | B | A | ☐ | | |
 | 3.4 | 410 after delete, 200 after revive; no CQL `DELETE` ever issued against `resources` | B | A | ☐ | | |
 | 4.1 | `VersionedStorage` real; `versioning_suite.rs` and `search/conditional_if_match_suite.rs` pass; `list_versions` numeric order past 9 | B | A | ☐ | | |
@@ -156,14 +156,14 @@ Each step also lists **Cassandra docs**: the [Apache Cassandra 5.0 documentation
 | Item | Decision to record |
 | --- | --- |
 | Keyspace | `CREATE KEYSPACE … WITH replication = {'class': 'NetworkTopologyStrategy', '<dc>': 1}` locally and `3` on the cluster; the DC name must match the Compose files' `GossipingPropertyFileSnitch` setting |
-| Common types | `tenant_id text`, `resource_type text`, `id text` (never `uuid`), `version_id int`, `last_updated timestamp` (milliseconds), `fhir_version text` (`as_mime_param()` form), `write_ts bigint` (microseconds, used in `USING TIMESTAMP`), `write_id uuid` |
+| Common types | `tenant_id text`, `resource_type text`, `id text` (never `uuid`), `version_id int`, `last_updated timestamp` (milliseconds), `fhir_version text` (`as_mime_param()` form), `write_ts bigint` (microseconds, used in `USING TIMESTAMP`; always `last_updated × 1000`, ADR-aacruzgon-0016), `write_id uuid` |
 | `resources` regular columns | `data` (choose `text` holding the JSON, or `blob` if compression measurements favour it; `text` is the default), `created_at timestamp`, `deleted_at timestamp` (unset, never bound null), `fhir_version`, `write_ts`, `write_id` |
 | `resource_versions` regular columns | `data` (unset for a delete marker), `last_updated`, `deleted_at`, `fhir_version`, `write_ts` |
 | `resources_by_type` | clustering `WITH CLUSTERING ORDER BY (last_updated DESC, id DESC)`; regular `version_id` |
 | Token tables | `token_code_index` clustering `(last_updated DESC, id DESC, system ASC)`; `token_system_code_index` `(last_updated DESC, id DESC)`; `token_system_index` `(last_updated DESC, id DESC, code ASC)`; `param text` in every partition key; regular `version_id` |
 | Date tables | `date_index` clustering `(start ASC, id ASC, end ASC)`; `date_index_by_end` clustering `(end ASC, id ASC, start ASC)`; `start`/`end timestamp`, finite because the shared `indexed_range` maps an open Period end to its `open_end` sentinel; regular `version_id` |
 | `uri_index` | `uri text` in the partition key; clustering `(last_updated DESC, id DESC)`; regular `version_id` |
-| `pending_index_writes` | partition `(bucket text, shard smallint)`, `bucket` = UTC hour as `YYYY-MM-DDTHH`, `shard` = `hash(tenant_id, id) mod 16`; clustering `(tenant_id, enqueued_at timeuuid, resource_type, id)`; regular `write_id uuid`; `default_time_to_live = 86400` |
+| `pending_index_writes` | partition `(bucket text, shard smallint)`, `bucket` = UTC hour as `YYYY-MM-DDTHH`, `shard` = `hash(tenant_id, id) mod 16`; clustering `(enqueued_at timeuuid, tenant_id, resource_type, id)` (ADR-aacruzgon-0015); regular `write_id uuid`, `version_id int` (ADR-aacruzgon-0013); `default_time_to_live = 86400` |
 | Index-table options | lower `gc_grace_seconds` to 10,800 s (3 h, the hint window) on the six index tables, `resources_by_type` and `pending_index_writes` (the tag check makes resurrected index rows harmless, and a resurrected intent only replays writes already applied); never on `resources` or `resource_versions` (ADR-aacruzgon-0009) |
 | Compaction | pick per table and record why: the index tables are read-heavy and tombstone-heavy, `resources` is point-read, `pending_index_writes` is TTL-churn; the 5.0 default (`UnifiedCompactionStrategy` in `cassandra_latest.yaml`) is the starting point, with the choice confirmed by the tombstone numbers in section 7 |
 | Statements that must never exist | a CQL `DELETE` against `resources`; any bind of `null`; any `ALLOW FILTERING` |
@@ -207,8 +207,8 @@ Each step also lists **Cassandra docs**: the [Apache Cassandra 5.0 documentation
 
 **Tasks.**
 - `update`, `delete`, `create_or_update`, `delete_versioned`, `exists`, `count`, `read_batch` (concurrent point reads).
-- The six-step write path from the design: permission check and extraction; intent row; CAS with `write_ts(N+1) = max(now_µs, write_ts(N)+1)` and `write_id`; `resource_versions` row `USING TIMESTAMP`; index batches under 5 KiB (empty until step 5); intent delete and return.
-- CAS outcome handling: not-applied rows mapped to 404/409/410 from the returned condition columns; `WriteTimeout` with `write_type = CAS` or `CAS_WRITE_UNKNOWN` resolved by a `LOCAL_SERIAL` read and `write_id` match; `SIMPLE` treated as applied; serial-read timeout → 503.
+- The six-step write path from the design: permission check and extraction; intent row; CAS with `last_updated(N+1) = max(now_ms, last_updated(N) + 1 ms)`, `write_ts = last_updated × 1000` and `write_id`; `resource_versions` row for N+1, plus a rewrite of the row for N from `current` at `write_ts(N) − 1` (ADR-aacruzgon-0012); index batches under 5 KiB (empty until step 5); intent delete and return.
+- CAS outcome handling: not-applied rows mapped to 404 (no row, or deleted in the gap) or 409 (other version) from the returned condition columns, and the intent row deleted; `WriteTimeout` with `write_type = CAS` or `CAS_WRITE_UNKNOWN` resolved by a `LOCAL_SERIAL` read and `write_id` match; `SIMPLE` treated as applied; serial-read timeout → 503.
 - Revive via `create_or_update` with `IF version_id = N` and no `deleted_at` condition; `create` via `INSERT … IF NOT EXISTS`.
 - `tenant.check_permission` at the start of every write.
 
@@ -240,8 +240,12 @@ Each step also lists **Cassandra docs**: the [Apache Cassandra 5.0 documentation
 
 **Tasks.**
 - `SearchParameterExtractor::extract` on every write; diff old and new key sets; deletes and upserts `USING TIMESTAMP write_ts`; batches grouped under the warn threshold and sent concurrently; `BATCH` vs `BATCH_LOG` timeout handling.
-- `pending_index_writes` sweeper as a backend-owned background task: poll interval and grace period from config; the 16 shards of the current and previous hour bucket; `LOCAL_SERIAL` read of the resource row; `write_id` comparison decides whether the CAS applied; re-run steps 4 and 5 for that version using the previous version's keys from `resource_versions`; delete the intent row. No clock comparison anywhere in the sweeper.
-- Repair on read hook (used by step 6): given a mismatched tag, re-run index maintenance inline and delete the stale key.
+- `pending_index_writes` sweeper as a backend-owned background task:
+    - Poll interval and grace period come from config.
+    - It polls the 16 shards of the current and previous hour bucket, each from an in-memory low-water mark on `enqueued_at`. After each poll the mark moves to `now − grace`. At startup it first scans the 25 most recent buckets in one-minute slices (ADR-aacruzgon-0014 and 0015).
+    - For an intent for version V, it reads the resource row at `LOCAL_SERIAL`. No row, or a version below V, means the CAS never applied: delete the intent. If V is current, it replays steps 4 and 5 for V at `write_ts(V)`, using V−1's keys from `resource_versions`. If V has been superseded, it only deletes V−1's keys at `write_ts(V)`, with no inserts. It then deletes the intent (ADR-aacruzgon-0013). An intent that keeps failing goes to a retry list instead of holding back the low-water mark.
+    - The grace period is the only clock comparison. It assumes that clock skew plus intent-to-CAS latency stays under it.
+- Repair on read hook (used by step 6): given a mismatched tag, re-run index maintenance for the current version inline at its `write_ts`. Delete the stale key only if the current version does not produce it; otherwise upsert it with the current tag (ADR-aacruzgon-0017).
 - Measure and record batch sizes per fixture resource; assert the largest fixture stays under 5 KiB per batch.
 
 **Spec.** What gets extracted is defined by each SearchParameter's `expression` ([R4 SearchParameter](https://hl7.org/fhir/R4/searchparameter.html), evaluated with [FHIRPath](https://hl7.org/fhir/R4/fhirpath.html)); the shared extractor already does this and we only store its output. Which elements feed a token, date or uri key is listed per type in [R4 search.html#token](https://hl7.org/fhir/R4/search.html#token), [#date](https://hl7.org/fhir/R4/search.html#date) and [#uri](https://hl7.org/fhir/R4/search.html#uri), and per resource in [Patient](https://hl7.org/fhir/R4/patient.html#search) and [Observation](https://hl7.org/fhir/R4/observation.html#search). The requirement the sweeper exists to meet is [R4 search.html#currency](https://hl7.org/fhir/R4/search.html#currency): search results must reflect the current state of the resources, so a committed write that is missing from an index table is a correctness bug, not a performance one.
@@ -366,9 +370,11 @@ All run against the single node first, then the three-node cluster (RF 3, `LOCAL
 | Test | Kill or fault point | Expected |
 | --- | --- | --- |
 | Intent then crash | Helios killed after step 2 (intent row) and before step 3 (CAS) | After the grace period the sweeper deletes the intent row; `read` is unchanged; no index rows change |
-| CAS then crash | Helios killed after step 3 and before step 5 | `read` and `vread` return N+1 immediately; search hides the resource until the sweeper runs (bounded by poll interval + grace), then returns it; `count` is correct after the sweep |
+| CAS then crash | Helios killed after step 3 and before step 5 | `read` returns N+1 immediately; `vread` of N+1 is 404 if the kill came before step 4, and correct after the sweep; search hides the resource until the sweeper runs (bounded by poll interval + grace), then returns it; `count` is correct after the sweep |
 | Batch partially applied | Coordinator node killed mid-batch on the cluster | Batchlog replay completes the batch; tag check hides nothing wrong meanwhile |
 | Concurrent updates | 32 clients updating the same resource | Exactly one writer per version; every other gets 409; final index state equals a fresh extraction |
+| CAS then crash, then superseded | Helios killed after step 3 and before step 4; the same resource updated again before the sweeper runs | `vread` of the crashed version returns its content (the next update rewrote its version row); after the sweep no index row of the version before the crash remains; `count` is correct |
+| Sweeper outage | Sweeper stopped while intents older than two hours are pending (a test clock or a short bucket length), then restarted | Every pending intent is processed on startup; a crashed create becomes searchable |
 | Stale batch ordering | Writer of N+1 paused after its CAS until N+2 completes, then resumed | N+1's late writes are ignored (older `write_ts`); search returns N+2 content; no orphan rows |
 | Node down, RF 3 | One of three nodes stopped | Reads and writes continue at `LOCAL_QUORUM`; LWTs continue; restart and repair; no data loss |
 | Partition, RF 3 | Coordinator isolated from the other two | Writes fail with `Unavailable` (503) rather than silently; heal; reconciliation verified |
