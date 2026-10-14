@@ -1,0 +1,19 @@
+# Override for the 32 GB machines and for every benchmark run in the report;
+# the counterpart of docker/cassandra/docker-compose.heap2g.yml. Use together
+# with docker-compose.yml; only the values below change.
+#
+#   shared_buffers        1280MB (25% of 5 GiB)
+#   effective_cache_size  3584MB
+#   maintenance_work_mem  256MB
+#   CPU limit             4 CPUs (unchanged)
+#   Memory limit          5 GiB, swap disabled (same as Cassandra's 2G-heap
+#                         profile)
+
+services:
+  postgres:
+    environment:
+      PG_SHARED_BUFFERS: 1280MB
+      PG_EFFECTIVE_CACHE_SIZE: 3584MB
+      PG_MAINTENANCE_WORK_MEM: 256MB
+    mem_limit: 5g
+    memswap_limit: 5g

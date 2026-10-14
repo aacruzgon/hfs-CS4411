@@ -1,0 +1,35 @@
+# ADR-aacruzgon-0005: `synchronous_commit` for the PostgreSQL baseline
+
+- **Date:** 2026-10-13
+- **Status:** accepted
+- **Context:** Item 0.2 requires the PostgreSQL file to record `synchronous_commit`, because durability decides whether the write benchmark compares like with like. The two databases behave differently on a single node:
+    - **Cassandra (ADR-aacruzgon-0001):** runs `commitlog_sync: periodic` with a 10 s period. Writes are acknowledged before the commit log is synced, so a crash can lose up to about 10 s of acknowledged writes. Writes block if the last sync is more than 1.5 periods (15 s) old.
+    - **PostgreSQL `on` (its default):** a commit returns only after its WAL is flushed, so it loses nothing.
+    - **PostgreSQL `off`:** a commit returns before the flush. It loses at most 3 × `wal_writer_delay` (600 ms) and never corrupts data.
+    - **Not confirmed:** whether Cassandra syncs the commit log immediately for lightweight transactions, which every resource write here is, as opposed to plain writes. No primary source settled it.
+- **Decision:**
+    - **Default:** `docker/postgres/docker-compose.yml` runs `synchronous_commit = on`, PostgreSQL's normal durability.
+    - **Override:** `docker-compose.async.yml` sets `off`, so the benchmarks can also run PostgreSQL with acknowledge-before-flush semantics, as Cassandra's commit log has.
+    - **Labelling:** every reported number states which baseline it comes from.
+    - **Deferred to item 0.8:** whether the report uses one baseline or both.
+- **Alternatives considered:**
+    - **`on` only:** lost. The asymmetry favours Cassandra on writes and could only be argued, not measured.
+    - **`off` only:** lost. It understates PostgreSQL's normal durability, and the windows still differ (600 ms against 10 s).
+    - **Making Cassandra sync before acknowledging (`commitlog_sync: group` or `batch`):** lost. It would reopen ADR-aacruzgon-0001 and change Cassandra's latency profile away from how it is normally run. `group` mode's example window is 1,000 ms.
+    - **`fsync = off`:** never considered for the baseline. Unlike `synchronous_commit = off`, it risks corruption.
+- **Consequences:**
+    - **The cost of flushing becomes measurable:** it is the difference between the two PostgreSQL baselines.
+    - **Item 0.8** decides whether to run both baselines for both dataset sizes, which doubles PostgreSQL's benchmark runs.
+    - **The report** must still state that Cassandra's window (about 10 s) is far longer than PostgreSQL's (600 ms) even with `off`.
+    - **Open question:** if the LWT commit-log question is ever settled, the comparison should be revisited.
+- **AI involvement:**
+    - **Tools:** Claude Code (Opus 5.5), with Sonnet 5.5 subagents.
+    - **Research:** the AI researched both databases' durability semantics from the PostgreSQL documentation and from Cassandra 5.0's `cassandra.yaml` and source code. That is where the 1.5× blocking rule was found (`DatabaseDescriptor.getPeriodicCommitLogSyncBlock`).
+    - **What the AI proposed:** it laid out four options and recommended `on` plus an `off` override.
+    - **What the human changed:** Alan accepted the recommendation as proposed.
+    - **Verified:**
+        - The default profile reports `synchronous_commit = on` with `source = command line`.
+        - The async override reports `off`, and also does so combined with the 5 GiB override.
+- **Links:**
+    - **Files:** `docker/postgres/docker-compose.yml`, `docker/postgres/docker-compose.async.yml` and `docker/postgres/README.md` ("Durability").
+    - **Docs:** roadmap items 0.2 and 0.8; ADR-aacruzgon-0001.

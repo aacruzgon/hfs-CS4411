@@ -1,0 +1,29 @@
+# ADR-aacruzgon-0004: PostgreSQL version for the benchmark baseline
+
+- **Date:** 2026-10-13
+- **Status:** accepted
+- **Context:** Roadmap item 0.2 needs a PostgreSQL container for the baseline the Cassandra backend is compared against. The repo uses two versions:
+    - **PostgreSQL 16** is what the persistence test suite runs on. It uses `16-alpine` testcontainers, and the migration tests assert the major version is 16 (`crates/persistence/src/backends/postgres/schema.rs`). The bulk-export and bulk-submit Compose files also use 16.
+    - **PostgreSQL 18** is what the project's own benchmark workflow runs on (`.github/disabled-workflows/fhir-benchmark.yml`), and its published results are on 18.6.
+    - **Constraints:** the backend needs PostgreSQL 14 or later for LZ4 TOAST compression and 13 or later for trusted `pg_trgm`/`btree_gin`. PostgreSQL 19 is still in beta.
+- **Decision:** Pin `postgres:18.6-trixie@sha256:74935e72241653ca55e0414067e6d8763aceb8a810eb51b452253ec3dcfc4336` (PostgreSQL 18.6, Debian 13, amd64 and arm64) in `docker/postgres/docker-compose.yml`.
+- **Alternatives considered:**
+    - **16.15:** lost. It matches the test suite, but the benchmark baseline would then not be comparable with the project's own PostgreSQL benchmark results. It is also supported for two fewer years: until November 2028, against November 2030 for 18.
+    - **19:** lost. It is not generally available; only beta 4 exists.
+    - **An Alpine image:** lost. Debian trixie matches the Cassandra image's base, so both databases sit on the same libc and kernel interface.
+- **Consequences:**
+    - **Tests are unaffected.** The persistence test suite keeps using its own PostgreSQL 16 containers; this file is for benchmarks and the demonstration.
+    - **Two new 18 behaviours are recorded as defaults.** Asynchronous I/O is on (`io_method = worker`), and initdb enables data checksums.
+    - **Data directory.** PostgreSQL 18 images keep `PGDATA` under `/var/lib/postgresql/18/docker`, so the volume mounts `/var/lib/postgresql`.
+    - **Bumping the version.** Moving to a newer 18.x means changing the digest in the Compose file and the README.
+- **AI involvement:**
+    - **Tools:** Claude Code (Opus 5.5), with Sonnet 5.5 and Haiku 5.5 subagents.
+    - **What the AI did:**
+        - It found which PostgreSQL versions the repo tests and benchmarks against, and the backend's version floors.
+        - It listed the maintained postgres image tags, digests and end-of-life dates, and read the image's volume and `PGDATA` layout.
+        - It recommended 18.6.
+    - **What the human changed:** Alan accepted the recommendation as proposed.
+    - **Verified:** a cold boot reports `server_version = 18.6 (Debian 18.6-1.pgdg13+2)`, `io_method = worker` and `data_checksums = on`. The digest was confirmed with `docker buildx imagetools inspect`.
+- **Links:**
+    - **Files:** `docker/postgres/`.
+    - **Docs:** roadmap item 0.2; ADR-aacruzgon-0005 and 0006.

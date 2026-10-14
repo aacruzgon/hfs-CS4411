@@ -48,3 +48,7 @@ A choice between two or more workable designs; a change to a trait surface, tabl
 | [0001](2026-10-13/0001-image-pin-and-paxos-v2.md) | 2026-10-13 | Cassandra image, configuration file and `paxos_variant: v2` | accepted |
 | [0002](2026-10-13/0002-container-resource-limits.md) | 2026-10-13 | Resource limits for the single-node container | accepted |
 | [0003](2026-10-13/0003-snitch-and-dc-name.md) | 2026-10-13 | Snitch, data-centre, rack and cluster names | accepted |
+| [0004](2026-10-13/0004-postgres-version.md) | 2026-10-13 | PostgreSQL version for the benchmark baseline | accepted |
+| [0005](2026-10-13/0005-postgres-synchronous-commit.md) | 2026-10-13 | `synchronous_commit` for the PostgreSQL baseline | accepted |
+| [0006](2026-10-13/0006-postgres-server-settings.md) | 2026-10-13 | PostgreSQL server settings inside the shared envelope | accepted |
+| [0007](2026-10-13/0007-non-standard-host-ports.md) | 2026-10-13 | Non-standard host ports for the benchmark databases | accepted |

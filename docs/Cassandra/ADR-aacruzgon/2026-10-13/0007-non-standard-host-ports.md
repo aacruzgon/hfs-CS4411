@@ -1,0 +1,36 @@
+# ADR-aacruzgon-0007: Non-standard host ports for the benchmark databases
+
+- **Date:** 2026-10-13
+- **Status:** accepted
+- **Context:** Both Compose files published their database on the standard port, on host loopback: Cassandra on `127.0.0.1:9042`, PostgreSQL on `127.0.0.1:5432`.
+    - **The failure we hit.** During the item 0.2 smoke test, HFS failed against the PostgreSQL container with `role "helios" does not exist`. The developer machine runs a native PostgreSQL that already listens on `127.0.0.1:5432`, and that server answered instead of the container.
+    - **Docker did not warn.** It published the port without error even though the address was already held.
+    - **Why it matters beyond the error.** With a matching user on the host server, HFS, a test or a benchmark run could have used the wrong database with no visible failure. A benchmark would then have measured the wrong server.
+    - **Cassandra is exposed the same way** on any machine that runs a local Cassandra.
+- **Decision:**
+    - **Default host ports:** PostgreSQL on `127.0.0.1:55432` and Cassandra on `127.0.0.1:59042`, still loopback only.
+    - **Overrides:** `PG_HOST_PORT` and `CASSANDRA_HOST_PORT` change them.
+    - **Inside Docker** the ports stay 5432 and 9042.
+    - **Connection URL:** `HFS_DATABASE_URL=postgresql://helios:helios@127.0.0.1:55432/helios`.
+- **Alternatives considered:**
+    - **Keep 5432 and 9042, with an override variable:** lost. Anyone with a local database would have to remember to override, and forgetting fails silently or confusingly, as it did here.
+    - **Ports below the dynamic range, for example 15432 and 19042:** not chosen. Both chosen ports sit in macOS's dynamic port range (49152–65535), which Linux also uses for outgoing connections. An outgoing connection could hold the port at the moment the container starts. That collision is with a client socket rather than a listening server, so it should be reported as "port already in use" and not shadow anything. The override variables fix it.
+    - **Change only PostgreSQL:** lost. Cassandra has the same failure mode, and the same pattern in both files is easier to remember.
+- **Consequences:**
+    - **Connection settings change.** Every client on the host uses 55432 and 59042: HFS, the benchmark harness (item 0.6), the demonstration script (item 0.9) and the backend's local configuration.
+    - **Tests are unaffected.** Testcontainers-based tests map their own random host ports.
+    - **Teammates** who already started either container must bring it up again (`down` then `up`) to pick up the new port; their data volume is kept.
+    - **The READMEs** of both directories explain the ports and the override variables.
+- **AI involvement:**
+    - **Tools:** Claude Code (Opus 5.5), with Sonnet 5.5 and Haiku 5.5 subagents.
+    - **How it was found:** a subagent found the collision while booting HFS against the PostgreSQL container. It worked around it with a scratch override on port 55432 and reported it.
+    - **What the AI proposed:** a non-standard PostgreSQL port with an override variable.
+    - **What the human changed:** Alan chose 55432 and asked for the same protection on Cassandra.
+    - **Checked by the AI:** with `lsof`, the AI confirmed both new ports were free on this machine and that only the native PostgreSQL holds 5432. It checked the macOS dynamic port range with `sysctl`.
+    - **Verified:**
+        - `docker port` shows `127.0.0.1:55432` and `127.0.0.1:59042`, and an override changes the published port.
+        - Clients outside the containers reach PostgreSQL 18.6 as `helios` on 55432, and Cassandra (`helios | helios-dc1`) on 59042.
+        - Port 5432 still reaches the host's own server, which rejects `helios`.
+- **Links:**
+    - **Files:** `docker/postgres/docker-compose.yml`, `docker/cassandra/docker-compose.yml` and both READMEs.
+    - **Docs:** roadmap items 0.1, 0.2, 0.6 and 0.9; ADR-aacruzgon-0006.
