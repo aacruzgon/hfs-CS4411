@@ -1,0 +1,53 @@
+# ADR-sam-michaels-0001: Self-hosted runner registered on the 7900X rig, run by a dedicated non-admin user
+
+- **Date:** 2026-10-14
+- **Status:** accepted
+- **Context:**
+    - ADR-aacruzgon-0018 puts every CI workflow on the team's self-hosted runner (32 GB, AMD 7900X) and leaves its labels and OS to be recorded when it is registered. Roadmap Step 0 makes registration the first CI item: Rust, Docker and `cqlsh` installed, checked by a one-step workflow.
+    - The rig is my own desktop, which I also use for development alongside my Mac (my primary machine). That made two choices real decisions rather than routine setup: which label workflows target, and which local user the runner runs as. ADR-aacruzgon-0018 asks for "a dedicated non-admin user".
+- **Decision:**
+    - The runner is `sam-7900x` on Fedora Linux 44, x86_64. Its labels are `self-hosted, Linux, X64` (automatic) and the custom label `hfs-cassandra`; every workflow uses `runs-on: [self-hosted, hfs-cassandra]`.
+    - It runs as a systemd service under a dedicated user, `gh-runner`: no password, not in `wheel`, in `docker`. That user has its own Rust toolchain (rustup, stable, with rustfmt and clippy), its own `uv`, and `cqlsh` 6.2.2, all in its home directory under `/home/gh-runner`.
+- **Alternatives considered:**
+    - **Run the runner as my own account:** lost. Every job could read my SSH key, which is both my GitHub authentication key and my commit-signing key, and my `gh` token. A careless step could delete my files or my dev containers. CI would also depend on my personal `PATH` and toolchain, so updating my own Rust would change CI. It also contradicts ADR-aacruzgon-0018. I registered it this way first to prove the setup, then moved it.
+    - **Only the generic `[self-hosted, Linux]` labels** (the inherited `ci.yml` precedent): lost. A custom label pins jobs to this machine if another self-hosted runner is ever added.
+    - **The label `helios-ci`** (suggested as an example): not chosen. `hfs-cassandra` names the project. It can be renamed with a re-registration or in the runner's settings, with every `runs-on` changed in the same commit.
+    - **Rootless Docker or Podman for `gh-runner`:** deferred. It would stop a malicious job from reaching other users' files through the Docker daemon. However, the Compose files and testcontainers are only tested under Docker, and the fork-approval setting from ADR-aacruzgon-0018 already keeps outside code off the runner.
+- **Consequences:**
+    - **Easier:**
+        - Jobs cannot read my home directory directly, and a broken cleanup step cannot touch my files.
+        - CI's toolchain changes only when someone updates `gh-runner`'s, never because I updated mine.
+    - **Still true (known limits):**
+        - **Root through Docker.** Membership in `docker` is root-equivalent, so a deliberately malicious job could still mount any path into a container. The separate user protects against accidents, not attackers; approval of fork pull requests (ADR-aacruzgon-0018) remains the real control.
+        - **Shared Docker daemon.** Both users use the same daemon, so a CI Cassandra container and my own dev container clash on port 9042 and on container names. I stop my dev Cassandra while CI runs until the Cassandra job (0.5) uses its own Compose project name and port.
+        - **The rig must be on for CI to run.** Queued jobs fail after 24 hours.
+        - **Toolchain updates are manual.** Rust and `cqlsh` for `gh-runner` are updated by hand (`sudo -iu gh-runner`), and must stay at or above the workspace MSRV, 1.90.
+    - **Setup notes for anyone repeating this on Fedora:**
+        - SELinux (enforcing) blocks the service's start script in a home directory with `203/EXEC`. The fix is `chcon -t bin_t runsvc.sh` before the first start.
+        - `sudo` needs a terminal, so the service install cannot be run through the assistant's `!` prompt.
+        - Runner registration tokens last one hour, and only a repository admin can make one.
+- **AI involvement:**
+    - **Tool and model:** Claude Code, Claude Opus 5.5.
+    - **What the AI proposed:**
+        - The Linux package with its checksum, in place of the macOS package shown on the first registration page.
+        - The `hfs-cassandra` label.
+        - Installing the runner as a systemd service, and the SELinux fix.
+        - The one-step check workflow with the fork guard.
+        - Listing the drawbacks of running as my own account.
+        - The `gh-runner` setup script, which creates the user, installs its tools, registers the runner with `--replace` and installs the service.
+        - SSH commit signing, which the repository's signed-commit rule required before the check branch could be pushed.
+    - **What the human changed:**
+        - I registered the runner on my own rig.
+        - I chose to move from my account to a dedicated user after reviewing the drawbacks.
+        - I got the registration tokens from Alan, set up signing myself, and ran every `sudo` step.
+    - **What was verified and how:**
+        - **Tools on the rig:** checked with `--version` for each tool, and `docker run hello-world`.
+        - **Runner package:** the SHA-256 matched the v2.337.0 release notes.
+        - **The check workflow** (`ci/runner-check`, `.github/workflows/runner-check.yml`, `runs-on: [self-hosted, hfs-cassandra]`) went green three times, in run 38619043411:
+            - attempt 1 with `run.sh` as my user;
+            - attempt 2 with the service as my user;
+            - attempt 3 with the service as `gh-runner`.
+          Each attempt printed the kernel, cargo 1.99.0, Docker 29.9.0 and cqlsh 6.2.2.
+        - **Service user:** `systemctl show` reports `User=gh-runner`, active and running.
+        - **Old runner removed:** the old runner directory under my home was deleted after `--replace`.
+- **Links:** ADR-aacruzgon-0018; `development-roadmap.md` Step 0, CI bullet (labels and OS recorded); run https://github.com/aacruzgon/hfs-Cassandra-CS4411/actions/runs/38619043411; branch `ci/runner-check`.
