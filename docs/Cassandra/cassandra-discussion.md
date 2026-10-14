@@ -159,7 +159,7 @@ We test against R4 only, but Helios is a multi-version server and the backend mu
 - Index tables do not need the version. Search loads the `resources` row for the tag check anyway and builds the `StoredResource` from it.
 - No `FhirVersion::R4` literal appears outside tests. Defaults come from `default_enabled()` and `self.config().fhir_version`; version-specific behaviour, if any is ever needed, goes behind `#[cfg(feature = ...)]` the way PostgreSQL does it.
 - The search-parameter registry is the one the server hands us through `TenantSearchRegistries`, so R4B, R5 and R6 parameter definitions arrive without backend changes.
-- CI runs `cargo check -p helios-persistence --no-default-features --features cassandra,R4B` next to the R4 build, which is the cheapest proof that nothing in the backend assumes R4. **Decision:** functional tests stay on R4 fixtures for this project, and the R4B compile check is the gate. Running the shared suites under an R5 build is a follow-up once the R4 backend is accepted.
+- CI runs `cargo check -p helios-persistence --no-default-features --features cassandra,R4B` on the self-hosted runner (roadmap item 0.4, PR #17), next to the default R4 build that `.github/workflows/coverage.yml` compiles. It is the cheapest proof that nothing in the backend assumes R4. **Decision:** functional tests stay on R4 fixtures for this project, and the R4B compile check is the gate: a required status check on `main` since 2026-10-14 (ADR-aacruzgon-0019). Running the shared suites under an R5 build is a follow-up once the R4 backend is accepted.
 
 ## Proposed Cassandra data model
 
