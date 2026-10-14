@@ -1,0 +1,16 @@
+# Asynchronous-commit baseline. Add to either profile:
+#
+#     docker compose -f docker/postgres/docker-compose.yml \
+#                    [-f docker/postgres/docker-compose.mem5g.yml] \
+#                    -f docker/postgres/docker-compose.async.yml up -d --wait
+#
+# synchronous_commit off: a commit returns before its WAL is flushed, as
+# Cassandra's periodic commit log acknowledges before syncing. A crash loses
+# at most 3 x wal_writer_delay (600 ms) of acknowledged commits and never
+# corrupts data; Cassandra's window is up to ~10 s. Reports must say which
+# baseline a number comes from.
+
+services:
+  postgres:
+    environment:
+      PG_SYNCHRONOUS_COMMIT: "off"

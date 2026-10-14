@@ -1,0 +1,99 @@
+# Single PostgreSQL instance: the baseline the Cassandra backend is compared
+# against (docs/Cassandra/development-roadmap.md, item 0.2). Same CPU and
+# memory limits as docker/cassandra (ADR-aacruzgon-0002). See README.md here.
+#
+#     docker compose -f docker/postgres/docker-compose.yml up -d --wait
+#
+# On a 32 GB machine, and for every benchmark that goes in the report, add the
+# 5 GiB override (the counterpart of docker/cassandra's heap2g file):
+#
+#     docker compose -f docker/postgres/docker-compose.yml \
+#                    -f docker/postgres/docker-compose.mem5g.yml up -d --wait
+#
+# For the asynchronous-commit baseline, add docker-compose.async.yml as well.
+#
+# Recorded configuration (keep in step with README.md):
+#
+#   Image              postgres:18.6-trixie, pinned by index digest
+#                      (PostgreSQL 18.6, Debian 13 trixie, amd64 and arm64;
+#                      the same Debian base as the Cassandra image). 18 is
+#                      the version this project's own benchmark workflow uses.
+#   synchronous_commit on (a commit returns after its WAL is flushed; no
+#                      acknowledged write is lost in a crash). Cassandra's
+#                      periodic commit log acknowledges first and may lose up
+#                      to ~10 s; docker-compose.async.yml sets off (at most
+#                      3 x wal_writer_delay = 600 ms lost, never corruption)
+#                      so the benchmarks can run both.
+#   shared_buffers     768MB (25% of the 3 GiB limit, the docs' starting point)
+#   effective_cache_size  2GB (planner estimate only; the 4GB default exceeds
+#                      the limit)
+#   maintenance_work_mem  128MB (index builds in HFS's migrations)
+#   max_connections    200 (HFS opens up to 64 per pool and may open two)
+#   huge_pages         off (removes a host-dependent variable)
+#   shared_preload_libraries  pg_stat_statements (database time per query
+#                      for the benchmarks; created by initdb/)
+#   Host port          127.0.0.1:55432 (PG_HOST_PORT overrides), not 5432
+#   CPU limit          4 CPUs
+#   Memory limit       3 GiB, swap disabled; /dev/shm 256 MB (Docker's 64 MB
+#                      default can fail parallel queries)
+#   Left at defaults   fsync on, full_page_writes on, wal_sync_method
+#                      fdatasync, wal_writer_delay 200ms, work_mem 4MB,
+#                      checkpoint_timeout 5min, max_wal_size 1GB,
+#                      io_method worker (new in 18), data checksums on
+#                      (initdb default in 18)
+#
+# OrbStack or Docker Desktop must be allowed more memory than the limit above.
+
+name: hfs-postgres
+
+services:
+  postgres:
+    image: postgres:18.6-trixie@sha256:74935e72241653ca55e0414067e6d8763aceb8a810eb51b452253ec3dcfc4336
+    # Server settings are passed as -c flags built from the PG_* variables
+    # below, so the override files only change environment entries. $$ defers
+    # expansion to the shell in the container.
+    entrypoint:
+      - sh
+      - -c
+      - >-
+        exec docker-entrypoint.sh postgres
+        -c synchronous_commit=$$PG_SYNCHRONOUS_COMMIT
+        -c shared_buffers=$$PG_SHARED_BUFFERS
+        -c effective_cache_size=$$PG_EFFECTIVE_CACHE_SIZE
+        -c maintenance_work_mem=$$PG_MAINTENANCE_WORK_MEM
+        -c max_connections=200
+        -c huge_pages=off
+        -c shared_preload_libraries=pg_stat_statements
+    environment:
+      # Matches HFS's HFS_PG_* defaults (user and database "helios"):
+      #   HFS_DATABASE_URL=postgresql://helios:helios@127.0.0.1:55432/helios
+      POSTGRES_USER: helios
+      POSTGRES_PASSWORD: helios
+      POSTGRES_DB: helios
+      PG_SYNCHRONOUS_COMMIT: "on"
+      PG_SHARED_BUFFERS: 768MB
+      PG_EFFECTIVE_CACHE_SIZE: 2GB
+      PG_MAINTENANCE_WORK_MEM: 128MB
+    cpus: 4
+    mem_limit: 3g
+    memswap_limit: 3g
+    shm_size: 256mb
+    ports:
+      # Host port 55432, not 5432: a PostgreSQL installed on the host and
+      # listening on 5432 silently answers instead of this container.
+      # Override with PG_HOST_PORT.
+      - "127.0.0.1:${PG_HOST_PORT:-55432}:5432"
+    volumes:
+      # PostgreSQL 18 images keep PGDATA under /var/lib/postgresql/18/docker
+      # and declare the volume one level up.
+      - postgres-data:/var/lib/postgresql
+      - ./initdb:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U helios -d helios"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+volumes:
+  postgres-data:
