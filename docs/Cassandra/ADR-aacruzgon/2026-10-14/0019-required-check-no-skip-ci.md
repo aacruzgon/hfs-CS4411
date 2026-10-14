@@ -1,0 +1,32 @@
+# ADR-aacruzgon-0019: The R4B compile check is required on `main`, and commits no longer use `[skip ci]`
+
+- **Date:** 2026-10-14
+- **Status:** accepted
+- **Context:**
+    - Item 0.4 (PR #17, ADR-sam-michaels-0002) added `cargo check (cassandra, R4B)` on the self-hosted runner. The roadmap's CI-order bullet says checks become required on `main` once they work.
+    - **`[skip ci]` and required checks don't mix.** When the latest commit of a pull request has `[skip ci]` in its message, GitHub runs none of its workflows. A required check that never runs stays "Expected — Waiting for status", and the pull request cannot merge.
+    - **Docs commits use `[skip ci]` today.** `CONTRIBUTING.md` asks for it on documentation-only commits, and the team's docs commits follow that; the last commit of PR #17 had it.
+    - The ruleset "Require PRs for main and master" already lets repository admins bypass its rules on a pull request, so a blocked pull request could still be merged by an admin.
+- **Decision:**
+    - **`cargo check (cassandra, R4B)` is a required status check on `main`.** It was added on 2026-10-14 to the existing ruleset "Require PRs for main and master", tied to the GitHub Actions app so another app cannot report it. Branches do not have to be up to date with `main` before merging.
+    - **Commits in this repository do not use `[skip ci]`,** documentation-only ones included.
+    - **fmt and clippy join the required checks** when item 0.5 adds them.
+- **Alternatives considered:**
+    - **Require the check and keep `[skip ci]`:** lost. Every docs pull request would wait for an admin to tick "Merge without waiting for requirements", so only Alan could merge them, and bypassing would become routine.
+    - **Don't require the check until 0.5:** lost. The check already works, and until it is required, a pull request that breaks the R4B build can still merge.
+- **Consequences:**
+    - **Every pull request runs CI, docs ones included.** On the runner this costs about 3 s once the target directory is warm (ADR-sam-michaels-0002). `.github/workflows/coverage.yml` also runs on GitHub-hosted runners, which are free for a public repository.
+    - **This deviates from `CONTRIBUTING.md`,** which still asks for `[skip ci]`. That file is upstream's and is merged weekly from `upstream/main`, so it is left unchanged. This repository's rule is recorded instead in the roadmap's ground rules and in the "Commits and CI" section of `AGENTS.md` and `CLAUDE.md`, which the AI assistants read.
+    - **The runner must be on for a pull request to merge.** The required check only runs on `sam-7900x` (ADR-sam-michaels-0001). If Sam's desktop is off, pull requests wait; an admin can still bypass in an emergency.
+    - **The check's name is now a contract.** Renaming the job's `name:` in `r4b-compile-check.yml` breaks the ruleset until the required check is renamed in the same change.
+- **AI involvement:**
+    - **Tool and model:** Claude Code (Opus 5.5).
+    - **What the AI proposed:** making the check required; pointing out that `[skip ci]` would block required checks; the three options; tying the check to the GitHub Actions app.
+    - **What the human changed:** Alan chose to require the check and drop `[skip ci]`, over keeping `[skip ci]` with admin bypass or waiting for 0.5.
+    - **Verified:**
+        - The ruleset's rules and bypass actors, before and after, with `gh api repos/aacruzgon/hfs-Cassandra-CS4411/rulesets/24684567`.
+        - The check's name and app (`github-actions`, id 15368), from the check run on `main` at `4290ee829`.
+        - The `[skip ci]` advice in `CONTRIBUTING.md` (section on commit messages).
+- **Links:**
+    - **Docs:** `development-roadmap.md` section 1, "Heavy checks run on CI" ground rule.
+    - PR #17; ADR-aacruzgon-0018; ADR-sam-michaels-0001 and 0002.

@@ -135,6 +135,11 @@ export CARGO_BUILD_JOBS=4
 ### Windows and worktree notes
 See `CLAUDE.md` -> "Windows and worktree notes" (the only place they live; do not copy them here).
 
+## Commits and CI
+
+- **Never put `[skip ci]` in a commit message, documentation-only commits included.** `cargo check (cassandra, R4B)` is a required status check on `main` (ADR-aacruzgon-0019). GitHub runs no workflow for a pull request whose latest commit has `[skip ci]`, so that check never reports and the pull request cannot merge. This overrides the `[skip ci]` advice in `CONTRIBUTING.md`, which is upstream's file and is left unchanged.
+- Workflows run on the self-hosted runner `[self-hosted, hfs-cassandra]` and follow the fork rules in ADR-aacruzgon-0018: the fork guard on every job, and no `pull_request_target` or `workflow_run`. Pin every action to a full commit SHA with its version in a comment, as `.github/workflows/r4b-compile-check.yml` does.
+
 ## Decision records (ADR)
 
 Every design decision made in a session with an AI assistant (Codex, Claude Code or any other) is recorded by the human driving the session, in that person's own ADR log under `docs/Cassandra/`, in the directory `ADR-<github username>/`. That directory holds `ADR-<github username>.md` (rules, entry template and index) and one file per entry, `YYYY-MM-DD/NNNN-<short-slug>.md`, in a folder named for the day the decision was worked on. Current logs: `ADR-aacruzgon/`, `ADR-anastasiabryz/`, `ADR-diya-patel83/`, `ADR-sam-michaels/`, `ADR-sara-lahourpour/`.
