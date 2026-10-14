@@ -16,16 +16,21 @@
     - **The 32 GB team laptop** (what section 1 said): lost. It may be the 32 GB machine that runs the report's benchmarks (roadmap section 1), which CI load would disturb, and a laptop that sleeps or leaves the network stalls every pull request.
 - **Consequences:**
     - **Roadmap items 0.4, 0.5 and 0.11 are blocked until the runner is registered.** The week 1 schedule row (13 to 18 Oct) now says so. Step 2 (Milestone A, Wed 21 Oct 2026) can start without them, but its pull requests merge without the R4B check until 0.4 exists.
-    - **The repository is public, so the runner must not run untrusted code.** GitHub warns against self-hosted runners on public repositories, because a pull request from a fork can run its own workflow on the machine. Before the first workflow is merged: in Settings → Actions → General, set fork pull request workflows to need approval for every outside contributor, not only first-time ones, and give the runner no secrets beyond what the jobs need.
+    - **The repository is public, so only collaborators' code runs on the runner.** GitHub warns against self-hosted runners on public repositories ("Forks of your public repository can potentially run dangerous code on your self-hosted runner by creating a pull request", shown on the Add runner page). Three rules, all required:
+        - **Repository setting (applied 2026-10-14):** fork pull request workflows need approval from every outside contributor, not only first-time ones (`approval_policy: all_external_contributors`; it was `first_time_contributors`).
+        - **Every job on the runner skips fork pull requests,** even approved ones: `if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository`. The five collaborators push branches to this repository rather than to forks, so their pull requests pass.
+        - **No workflow uses `pull_request_target` or `workflow_run`.** Both run in the base repository's context even when a fork triggered them, so a step that checks out or downloads the fork's code would run it on the runner with the base repository's permissions.
+    - **The runner itself holds nothing worth stealing.** It runs as a dedicated non-admin user, has no secrets beyond what the jobs need, and every workflow keeps the repository default of read-only `GITHUB_TOKEN`, except the canary (0.11), which needs `issues: write`.
     - **The Cassandra job needs Docker and at least 3 GiB free for the container** (`docker/cassandra`, ADR-aacruzgon-0002), plus room for `target/` and the `rust-cache` cache.
     - **Out of scope:** `.github/workflows/coverage.yml` stays on GitHub-hosted `ubuntu-24.04`. The Inferno workflows in roadmap Step 8 still say "GitHub-hosted"; they are decided in Step 8.
 - **AI involvement:**
     - **Tools:** Claude Code (Opus 5.5).
-    - **What the AI proposed:** the order of the CI items and the reasons for it; recording the decision as an ADR and correcting the two roadmap statements; the public-repository safeguard.
-    - **What the human changed:** Alan made the self-hosted decision on 2026-10-13 and gave the reason GitHub-hosted runners lost (the team wants its own machine) and the server's specification (32 GB, AMD 7900X), and asked for these fixes before handing the CI items to a teammate.
+    - **What the AI proposed:** the order of the CI items and the reasons for it; recording the decision as an ADR and correcting the two roadmap statements; the public-repository safeguards (the approval setting, the job guard, no `pull_request_target` or `workflow_run`).
+    - **What the human changed:** Alan made the self-hosted decision on 2026-10-13 and gave the reason GitHub-hosted runners lost (the team wants its own machine) and the server's specification (32 GB, AMD 7900X), and asked for these fixes before handing the CI items to a teammate. Alan asked that only approved collaborators can run workflows and nobody who forks the repository can.
     - **Verified:**
         - The runner count, with `gh api .../actions/runners` (0 on 2026-10-14).
         - The repository visibility, with `gh repo view` (public).
+        - The approval setting, with `gh api .../actions/permissions/fork-pr-contributor-approval`: `first_time_contributors` before, `all_external_contributors` after the change on 2026-10-14. The default `GITHUB_TOKEN` is read-only (`.../actions/permissions/workflow`).
         - The `self-hosted` labels in `.github/disabled-workflows/ci.yml` and the archive reason in `.github/disabled-workflows/README.md`.
 - **Links:**
     - **Docs:** `development-roadmap.md` section 1 ("Machines"), Step 0 (CI bullet and the new "Order of the CI items" bullet), section 9 week 1.
