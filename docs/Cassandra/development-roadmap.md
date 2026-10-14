@@ -92,7 +92,7 @@ One row per checkable item, grouped by step; the milestone column says which gat
 | 5.4 | Index-versus-fresh-extraction consistency utility passes after any write sequence | B | B | ☐ | | |
 | 6.1 | Search framework entry validation and every documented rejection with its status code | B | B | ☐ | | |
 | 6.2 | `_id`, `_lastUpdated`, unfiltered type search, `search_count`, `_count=0` | B | B | ☐ | | |
-| 6.3 | Streaming AND/OR, dedupe on `(last_updated, id)`, candidate cap with `too-costly`, `next_cursor` always minted | B | B | ☐ | | |
+| 6.3 | Streaming AND/OR, dedupe on `(last_updated, id)`, candidate cap (error and status open: `cassandra-discussion.md`, "Open questions", G27), `next_cursor` always minted | B | B | ☐ | | |
 | 6.4 | `search/meta_params_suite.rs`, `empty_value_suite.rs`, `large_id_set_suite.rs` pass | B | B | ☐ | | |
 | 6a | Token: four forms, implicit system merge, case-sensitive, pipe rule; `token_code_system_suite.rs` passes | B | C | ☐ | | |
 | 6b | Date: both tables, nine prefixes, residual filter; `date_boundary`, `date_period`, `date_precision`, `ap_prefix`, `ap_relations` suites pass; parity with PostgreSQL on the fixtures | B | D | ☐ | | |
@@ -185,7 +185,7 @@ Each step also lists **Cassandra docs**: the [Apache Cassandra 5.0 documentation
 
 **Tasks.**
 - `crates/persistence/src/backends/cassandra/{mod.rs, backend.rs, storage.rs, config.rs, schema.rs, errors.rs}`; uncomment `pub mod cassandra` in `backends/mod.rs`.
-- Implement `Backend` (`type Connection`, `kind() = BackendKind::Cassandra`, `health_check`, `initialize` applies `schema.cql`, `migrate`), connection setup with `cdrs-tokio` 8 (explicit `LOCAL_QUORUM`/`LOCAL_SERIAL` on every statement, prepared statements cached).
+- Implement `Backend` (`type Connection`, `kind() = BackendKind::Cassandra`, `health_check`, `initialize`, `migrate`; whether `initialize` applies `schema.cql` itself or only checks that the tables exist is proposal P6 in `docs/Cassandra/schema/README.md`, open for the Step 1 design sessions), connection setup with `cdrs-tokio` 8 (explicit `LOCAL_QUORUM`/`LOCAL_SERIAL` on every statement, prepared statements cached).
 - Implement `ResourceStorage::create` and `read` only; stub every other required method of the 12 bound traits with `UnsupportedCapability { backend_name: "cassandra" }` (or `TransactionError::AtomicityUnsupported` for `BundleProvider`). Override the defaults the design lists: `readiness_check`, `is_cluster_shared`, `bulk_write_concurrency`, `supports_conditional`.
 - Wiring (owner **W**): `cassandra` feature threaded through `crates/rest/Cargo.toml` and `crates/hfs/Cargo.toml` like `mongodb`; `StorageBackendMode::Cassandra` with `Display`, `FromStr`, `primary_backend_kind`; `start_cassandra` in `main.rs` modelled on `start_s3` (passing `None` wherever S3 does); the `patient_name_search_support` arm (`IdOnly`); the `#[cfg(not(feature = "cassandra"))]` fallback.
 - `TenantSearchRegistries` plumbing and `search_param_registry`, because capabilities and batch call it even before search exists.
@@ -208,7 +208,7 @@ Each step also lists **Cassandra docs**: the [Apache Cassandra 5.0 documentation
 **Tasks.**
 - `update`, `delete`, `create_or_update`, `delete_versioned`, `exists`, `count`, `read_batch` (concurrent point reads).
 - The six-step write path from the design: permission check and extraction; intent row; CAS with `last_updated(N+1) = max(now_ms, last_updated(N) + 1 ms)`, `write_ts = last_updated × 1000` and `write_id`; `resource_versions` row for N+1, plus a rewrite of the row for N from `current` at `write_ts(N) − 1` (ADR-aacruzgon-0012); index batches under 5 KiB (empty until step 5); intent delete and return.
-- CAS outcome handling: not-applied rows mapped to 404 (no row, or deleted in the gap) or 409 (other version) from the returned condition columns, and the intent row deleted; `WriteTimeout` with `write_type = CAS` or `CAS_WRITE_UNKNOWN` resolved by a `LOCAL_SERIAL` read and `write_id` match; `SIMPLE` treated as applied; serial-read timeout → 503.
+- CAS outcome handling: not-applied rows mapped to 404 (no row, or deleted in the gap) or 409 (other version) from the returned condition columns, and the intent row deleted; `WriteTimeout` with `write_type = CAS` or `CAS_WRITE_UNKNOWN` resolved by a `LOCAL_SERIAL` read and `write_id` match; `SIMPLE` treated as applied; serial-read timeout → `BackendError::Timeout` (504).
 - Revive via `create_or_update` with `IF version_id = N` and no `deleted_at` condition; `create` via `INSERT … IF NOT EXISTS`.
 - `tenant.check_permission` at the start of every write.
 
@@ -261,11 +261,11 @@ Each step also lists **Cassandra docs**: the [Apache Cassandra 5.0 documentation
 **Goal.** `search()` and `search_count()` exist, enforce the rules, and dispatch to per-type modules.
 
 **Tasks.**
-- Entry validation in order: `validate_date_values`, `validate_value_presence`, `reject_unsupported_metadata_modifier`; refuse parameter types other than token, date, URI (400); refuse any modifier (400); refuse `_include`/`_revinclude` when `query.includes` is non-empty (501); refuse `_text`/`_content` (501); refuse `_offset` and non-default `_sort` (400).
+- Entry validation in order: `validate_date_values`, `validate_value_presence`, `reject_unsupported_metadata_modifier`; refuse `_text`/`_content` by name (501), before the type check, since R4 types them as `string`; refuse parameter types other than token, date, URI (400); refuse any modifier (400); refuse `_include`/`_revinclude` when `query.includes` is non-empty (501); refuse `_offset` and non-default `_sort` (400).
 - `_id` as a point read on `resources`; `_lastUpdated` as a slice on `resources_by_type`; unfiltered type search on `resources_by_type`.
 - AND across parameters by streaming intersection in `(last_updated DESC, id DESC)` order with clustering point reads; OR within a parameter by merging partitions; dedupe on `(last_updated, id)`; stop at `_count + 1` distinct resources that pass the tag check.
 - Date predicates as residual filters when combined with any other parameter.
-- Configurable candidate cap returning an OperationOutcome with `too-costly`.
+- Configurable candidate cap; which error it returns is open (`cassandra-discussion.md`, "Open questions", G27).
 - `search_count` and `_count=0` behaving as `_summary=count`.
 - Always mint `next_cursor` when a next page exists.
 
@@ -284,7 +284,7 @@ Each step also lists **Cassandra docs**: the [Apache Cassandra 5.0 documentation
 | 6a Token | `search/token.rs` | `code`, `system\|code`, `\|code`, `system\|`; `''` sentinel; `IMPLICIT_TOKEN_SYSTEM` two-partition merge; case-sensitive matching; pipe forms rejected on ContactPoint, uri and boolean elements | `search/token_code_system_suite.rs` passes; a token search for a code present under two systems returns each resource once | **C** |
 | 6b Date | `search/date.rs` | `date_index` and `date_index_by_end`; slice choice per prefix per the design; `RangePredicate::matches` on every row; Rust-side sort and cursor cut; candidate cap | `search/date_boundary_suite.rs`, `date_period_suite.rs`, `date_precision_suite.rs`, `ap_prefix_suite.rs`, `ap_relations_suite.rs` pass; every prefix verified against PostgreSQL on the same fixtures | **D** |
 | 6c URI | `search/uri.rs` | exact, case- and accent-sensitive whole-URI match on `uri_index` | the URI cases from the coverage table pass; a trailing-slash variant does not match | **C** |
-| 6d Cursor | `search/paging.rs` | `PageCursor` with millisecond RFC 3339 and reserved bucket slot; `(last_updated, id) < (?, ?)` slices; `InvalidCursor` on malformed input; no `previous` on page one, no `next` after the last | `search/pagination_tests.rs` adapted to the backend passes; paging through all 100,000 benchmark resources yields exactly 100,000 distinct ids | **D** |
+| 6d Cursor | `search/paging.rs` | `PageCursor` with millisecond RFC 3339 and reserved bucket slot; `(last_updated, id) < (?, ?)` slices; `InvalidCursor` on malformed input; no `previous` on page one, no `next` after the last | `search/pagination_tests.rs` adapted to the backend passes; paging through all 100,000 benchmark resources, with no writes during the run, yields exactly 100,000 distinct ids (keyset paging on a changing key can skip a resource updated mid-run: walkthrough G21) | **D** |
 
 **Spec for 6a to 6d.**
 - **6a Token:** [R4 search.html#token](https://hl7.org/fhir/R4/search.html#token) (four forms; literal, case-sensitive matching; `_id` always case-sensitive; no pipe form on ContactPoint, uri or boolean elements), [#escaping](https://hl7.org/fhir/R4/search.html#escaping) (`\|` and `\,` inside values), and the source datatypes [Coding](https://hl7.org/fhir/R4/datatypes.html#Coding), [CodeableConcept](https://hl7.org/fhir/R4/datatypes.html#CodeableConcept), [Identifier](https://hl7.org/fhir/R4/datatypes.html#Identifier), [ContactPoint](https://hl7.org/fhir/R4/datatypes.html#ContactPoint), [code](https://hl7.org/fhir/R4/datatypes.html#code), [boolean](https://hl7.org/fhir/R4/datatypes.html#boolean). The build adds `id` to the token table ([build #token](https://build.fhir.org/search.html#token)).
