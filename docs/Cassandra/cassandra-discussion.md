@@ -26,7 +26,7 @@ Two cautions about reading #28 today:
 
 ## Scope: the Cassandra column of the capability matrix
 
-With those constraints in place, we implement every capability marked ○ (planned) for Cassandra except bulk export, bulk-submit ingest and `:exact`, and nothing marked ✗. The matrix is in the persistence README under [Backend Capability Matrix](https://github.com/aacruzgon/hfs-CS4411/blob/a5e74a3604b181722a2d02b11f29cc76e91520bd/crates/persistence/README.md#backend-capability-matrix). We checked the Cassandra column cell by cell: it is identical at the baseline revision and at today's HEAD.
+With those constraints in place, we implement every capability marked ○ (planned) for Cassandra except bulk export, bulk-submit ingest and `:exact`, and nothing marked ✗. The matrix is in the persistence README under [Backend Capability Matrix](https://github.com/aacruzgon/hfs-Cassandra-CS4411/blob/a5e74a3604b181722a2d02b11f29cc76e91520bd/crates/persistence/README.md#backend-capability-matrix). We checked the Cassandra column cell by cell: it is identical at the baseline revision and at today's HEAD.
 
 | Matrix row | Cassandra cell | Our plan |
 | --- | --- | --- |
@@ -312,7 +312,7 @@ The ordered plan, with milestones, exit criteria, test gates, failure tests, the
 ## References
 
 - smunini, [Building a Modern FHIR Persistence Layer - Architectural Considerations for Healthcare's AI Era](https://github.com/HeliosSoftware/hfs/discussions/28), HeliosSoftware/hfs discussion #28, January 2026.
-- Helios FHIR Server, [persistence README, Backend Capability Matrix](https://github.com/aacruzgon/hfs-CS4411/blob/a5e74a3604b181722a2d02b11f29cc76e91520bd/crates/persistence/README.md#backend-capability-matrix), baseline revision `a5e74a3604b181722a2d02b11f29cc76e91520bd` (fork of HeliosSoftware/hfs; the commit exists upstream).
+- Helios FHIR Server, [persistence README, Backend Capability Matrix](https://github.com/aacruzgon/hfs-Cassandra-CS4411/blob/a5e74a3604b181722a2d02b11f29cc76e91520bd/crates/persistence/README.md#backend-capability-matrix), baseline revision `a5e74a3604b181722a2d02b11f29cc76e91520bd` (fork of HeliosSoftware/hfs; the commit exists upstream).
 - HL7 FHIR R4, [RESTful API](https://hl7.org/fhir/R4/http.html) and [Search](https://hl7.org/fhir/R4/search.html).
 - HL7 FHIR (current build), [RESTful API](https://build.fhir.org/http.html) and [Search](https://build.fhir.org/search.html).
 - ONC Inferno, [Inferno on HealthIT.gov](https://inferno.healthit.gov/), [US Core Test Kit](https://github.com/inferno-framework/us-core-test-kit), and [Inferno CLI (`inferno execute`)](https://inferno-framework.github.io/docs/getting-started/inferno-cli.html).

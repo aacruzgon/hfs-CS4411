@@ -1,0 +1,31 @@
+# ADR-aacruzgon-0018: CI runs on the team's self-hosted runner
+
+- **Date:** 2026-10-14 (decided 2026-10-13, recorded 2026-10-14)
+- **Status:** accepted
+- **Context:**
+    - **The roadmap disagreed with itself.** Section 1 ("Machines") said the 32 GB Apple-silicon laptop also runs the CI workflow; Step 0 said CI runs "on the GitHub-hosted workflow".
+    - **Neither is the plan.** On 2026-10-13 Alan decided that the CI items in Step 0 (progress matrix 0.4 R4B compile check, 0.5 fmt, clippy and the Cassandra test job, 0.11 upstream canary) wait for a self-hosted GitHub Actions runner the team is setting up, and run there.
+    - **No runner is registered yet.** `gh api repos/aacruzgon/hfs-Cassandra-CS4411/actions/runners` returned 0 runners on 2026-10-14.
+    - **The inherited `ci.yml` is the precedent.** Every job in it targets `self-hosted` labels; it was archived to `.github/disabled-workflows/` because this fork had no such runner and its jobs queued forever.
+- **Decision:**
+    - Every workflow added for Step 0 (0.4, 0.5, 0.11) runs on the team's self-hosted runner: the team's own server, with 32 GB of RAM and an AMD 7900X CPU, separate from the five team machines in roadmap section 1.
+    - Its `runs-on` labels and OS are recorded in the roadmap Step 0 bullet when the runner is registered, and no CI workflow is written before then.
+    - The CI items are built in this order: register the runner, then 0.4, then 0.5 (fmt, clippy, Cassandra job), then 0.11. Roadmap Step 0 lists the reasons.
+- **Alternatives considered:**
+    - **GitHub-hosted runners** (what Step 0 said): lost. The team wants CI on a machine it owns and controls, and its server (32 GB, AMD 7900X) has more memory and cores than a standard hosted runner for the `--all-features` clippy build.
+    - **The 32 GB team laptop** (what section 1 said): lost. It may be the 32 GB machine that runs the report's benchmarks (roadmap section 1), which CI load would disturb, and a laptop that sleeps or leaves the network stalls every pull request.
+- **Consequences:**
+    - **Roadmap items 0.4, 0.5 and 0.11 are blocked until the runner is registered.** The week 1 schedule row (13 to 18 Oct) now says so. Step 2 (Milestone A, Wed 21 Oct 2026) can start without them, but its pull requests merge without the R4B check until 0.4 exists.
+    - **The repository is public, so the runner must not run untrusted code.** GitHub warns against self-hosted runners on public repositories, because a pull request from a fork can run its own workflow on the machine. Before the first workflow is merged: in Settings → Actions → General, set fork pull request workflows to need approval for every outside contributor, not only first-time ones, and give the runner no secrets beyond what the jobs need.
+    - **The Cassandra job needs Docker and at least 3 GiB free for the container** (`docker/cassandra`, ADR-aacruzgon-0002), plus room for `target/` and the `rust-cache` cache.
+    - **Out of scope:** `.github/workflows/coverage.yml` stays on GitHub-hosted `ubuntu-24.04`. The Inferno workflows in roadmap Step 8 still say "GitHub-hosted"; they are decided in Step 8.
+- **AI involvement:**
+    - **Tools:** Claude Code (Opus 5.5).
+    - **What the AI proposed:** the order of the CI items and the reasons for it; recording the decision as an ADR and correcting the two roadmap statements; the public-repository safeguard.
+    - **What the human changed:** Alan made the self-hosted decision on 2026-10-13 and gave the reason GitHub-hosted runners lost (the team wants its own machine) and the server's specification (32 GB, AMD 7900X), and asked for these fixes before handing the CI items to a teammate.
+    - **Verified:**
+        - The runner count, with `gh api .../actions/runners` (0 on 2026-10-14).
+        - The repository visibility, with `gh repo view` (public).
+        - The `self-hosted` labels in `.github/disabled-workflows/ci.yml` and the archive reason in `.github/disabled-workflows/README.md`.
+- **Links:**
+    - **Docs:** `development-roadmap.md` section 1 ("Machines"), Step 0 (CI bullet and the new "Order of the CI items" bullet), section 9 week 1.
