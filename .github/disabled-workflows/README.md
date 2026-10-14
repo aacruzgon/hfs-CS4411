@@ -11,7 +11,7 @@ integration tests. Optional backend integration coverage is not yet enabled.
 It uploads reports to Codecov using the `CODECOV_TOKEN` repository secret
 (tokenless for fork PRs); no remote Docker host is needed. Install the
 [Codecov GitHub app](https://github.com/apps/codecov) for this repository and
-connect it at [Codecov](https://app.codecov.io/gh/aacruzgon/hfs-CS4411) to finish
+connect it at [Codecov](https://app.codecov.io/gh/aacruzgon/hfs-Cassandra-CS4411) to finish
 the service setup. Coverage runs on pushes to `main`, pull requests targeting
 `main`, and manual dispatches.
 
