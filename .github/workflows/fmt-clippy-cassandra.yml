@@ -88,14 +88,13 @@ jobs:
           echo "CARGO_TARGET_DIR=$TARGET_DIR" >> "$GITHUB_ENV"
 
       # The exact command from CONTRIBUTING.md. The runner is also Sam's
-      # desktop (31 GB), so the build runs 12 of its 24 threads at low
-      # priority: at the default 24 jobs an all-features build froze it during
-      # testing, and one compiler process alone peaks at about 12.8 GB. The
-      # runner service is capped at MemoryMax=20G, so a memory spike fails
-      # this step instead of the desktop (ADR-sam-michaels-0003).
+      # desktop (31 GB), so the build runs 8 jobs at low priority and the
+      # runner service is capped at MemoryMax=20G (ADR-sam-michaels-0003). At
+      # 24 jobs a local build froze the rig; at 12 the first CI run hit the
+      # 20 GB cap and was killed. One compiler process alone peaks at 12.8 GB.
       - name: cargo clippy --all-targets --all-features -- -D warnings (CONTRIBUTING.md)
         env:
-          CARGO_BUILD_JOBS: 12
+          CARGO_BUILD_JOBS: 8
         run: |
           nice -n 10 cargo clippy --all-targets --all-features -- -D warnings \
             -A clippy::items_after_test_module \

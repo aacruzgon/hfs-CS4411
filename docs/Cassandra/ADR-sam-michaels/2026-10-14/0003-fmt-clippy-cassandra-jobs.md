@@ -24,9 +24,10 @@
         - None waits for another, so a failure in one still lets the others report.
         - The runner has one executor, so they run one after another anyway.
         - Under ADR-aacruzgon-0019 the job names become required-check names, so renaming one means changing the ruleset in the same change.
-    - **Clippy runs with `CARGO_BUILD_JOBS: 12` under `nice -n 10`:** half the rig's 24 threads, at low priority.
-    - **The runner service is capped at `MemoryMax=20G`, `MemorySwapMax=0`,** set in the systemd drop-in `/etc/systemd/system/actions.runner.aacruzgon-hfs-Cassandra-CS4411.sam-7900x.service.d/memory.conf`.
+    - **Clippy runs with `CARGO_BUILD_JOBS: 8` under `nice -n 10`,** at low priority. I first chose 12. The first CI run at 12 hit the memory cap below and was killed, so it went back to 8, the setting measured locally, before merge (see Alternatives).
+    - **The runner service is capped at `MemoryMax=20G`, `MemorySwapMax=0`, with `OOMPolicy=continue`,** set in the systemd drop-in `/etc/systemd/system/actions.runner.aacruzgon-hfs-Cassandra-CS4411.sam-7900x.service.d/memory.conf`.
         - Every CI step runs inside that service's cgroup, cargo and rustc included, so a memory spike kills the build instead of pushing the desktop into swap.
+        - `OOMPolicy=continue` keeps the runner online when that happens. systemd's default for a service, `stop`, stops the whole unit when the kernel kills any process in it, so a killed build took the runner offline and left the other jobs queued.
         - `gh-runner`'s rootless Docker runs in its own user session (`user@1001.service`), so the Cassandra container is not under this cap. It has its own 3 GiB limit from `docker/cassandra`.
     - **The Cassandra job:**
         - removes any leftover `hfs-cassandra-ci` project first, because a cancelled run skips its clean-up;
@@ -39,10 +40,12 @@
         - **When:** Saturdays at 20:00 UTC, which is 16:00 Eastern in summer time and 15:00 in winter (cron runs in UTC). The rig is usually on then. Manual dispatch is also available.
         - **What goes:** stopped containers, unused networks, dangling images, build cache and anonymous volumes.
         - **What stays:** tagged images, so the pinned `cassandra:5.0.9` image is not downloaded again every week.
+        - **Which daemon:** the step refuses to run unless `DOCKER_HOST` is exactly `gh-runner`'s own socket, `unix:///run/user/<uid>/docker.sock` (CodeRabbit on PR #20).
 - **Alternatives considered:**
     - **Three workflow files, or jobs chained with `needs:`:** lost. Separate files triplicate the trigger, concurrency and environment blocks. With `needs:`, a fmt failure would hide whether clippy and the schema pass.
     - **Clippy at cargo's default of 24 jobs:** lost. It is what froze the rig.
-    - **Clippy at 8 jobs:** the setting actually measured (passed with no findings in 3 min 53 s, partly warm). The AI recommended it. I chose 12 instead for faster CI, with the memory cap as the backstop.
+    - **Clippy at 12 jobs:** my first choice, for faster CI, with the memory cap as the backstop. The AI had recommended 8, the measured setting. The first CI run, run 38661209397 on PR #20, reached the cap after about 4.5 minutes: the service's memory peak was 20G, and the kernel OOM killer fired. As this entry already said, the fix was to return to 8 jobs, not to raise the cap.
+    - **systemd's default `OOMPolicy=stop`:** lost. In that same run, it stopped the whole runner service, so fmt and the Cassandra job stayed queued until the service was restarted by hand.
     - **Clippy at 4 jobs:** lost. Gentler on the desktop, but slower than needed once the memory cap is in place.
     - **No memory limit, or deferring one until a CI run had been measured:** lost. The AI recommended deferring. I chose to add the cap now, so the first CI runs are already protected.
     - **`docker compose exec cassandra cqlsh` inside the container:** lost. The host's `cqlsh`, through the published port and rootless Docker's `pasta` networking, is the same path the backend and its tests will use. It is also why `cqlsh` was installed for `gh-runner` (roadmap Step 0).
@@ -51,7 +54,7 @@
     - **A nightly prune:** lost. The clutter comes from CI runs, at most a few a day, and a nightly run would mostly find nothing.
     - **Other weekly times** (Mondays 10:00 Eastern, as first drafted; Sunday evening; a weekday evening): lost to Saturday afternoon, when my rig is usually on.
 - **Consequences:**
-    - **12 jobs is untested.** The measured peak at 8 jobs was one compiler process of about 12.8 GB. At 12 jobs, more heavy crates can compile at once, so the build may hit the 20 GB cap and be killed (exit 137, or an OOM line in the job log). If that happens, the fix is to go back to 8 jobs, the tested setting, not to raise the cap: a cap near the rig's 31 GB would no longer protect the desktop.
+    - **The cap can still be reached.** At 8 jobs, one compiler process peaked at about 12.8 GB. At 12, the build reached the 20 GB cap. If a future change (new crates, a new FHIR version) pushes 8 jobs over the cap too, the build fails with an OOM kill in its log and the runner stays online. The fix is fewer jobs, not a higher cap: a cap near the rig's 31 GB would no longer protect the desktop.
     - **The cold clippy time has not been measured yet.** My local 3 min 53 s reused part of a build from an earlier run. The job's `timeout-minutes` is 90 until the first CI runs give real numbers.
     - **The desktop stays usable during CI.** `nice` yields the CPU to me, and the cap bounds CI's memory at 20 of 31 GB.
     - **A host `cqlsh` timeout under heavy load is a known false failure.** On the runner, jobs are serial, so clippy never runs during the Cassandra job. My own work on the desktop can still slow it. The `cqlsh` calls therefore use `--connect-timeout 30 --request-timeout 60`.
@@ -70,7 +73,7 @@
     - **What the human changed:**
         - I reported that my computer became very slow during the AI's first local clippy run, which led to limiting clippy's jobs and priority.
         - I held the pull request until I had reviewed this entry.
-        - I chose 12 jobs over the measured 8, for faster CI.
+        - I chose 12 jobs over the measured 8, for faster CI. When the first CI run at 12 was killed at the cap, I went back to 8.
         - I chose to add the 20 GB memory cap now instead of deferring it.
         - I moved the prune to Saturday afternoon, when my rig is usually on.
         - I approved the rest of the design as drafted: independent jobs, host `cqlsh` with the two schema checks, and the prune without `--all`.
@@ -87,10 +90,11 @@
 
           The first attempt failed because the table count included the header underline, so the parse was fixed. Separately, `cqlsh` exits 2 on a bad statement in both `-f` and `-e` modes, so a schema error fails the step. The leftover step exits 0 when there is nothing to remove.
         - **Both workflows parse,** and `zizmor` 1.30.1 reports no findings for them or for `r4b-compile-check.yml`.
-        - **The memory cap:** `systemctl show` on the runner service after applying the drop-in reports `MemoryMax` and `MemorySwapMax` with the values above.
+        - **The memory cap:** `systemctl show` on the runner service after applying the drop-in reports `MemoryMax=21474836480`, `MemorySwapMax=0` and `OOMPolicy=continue`.
+        - **The 12-job failure:** the runner service's journal (`journalctl -u`) shows "The kernel OOM killer killed some processes in this unit" at 20:43:05, then "Failed with result 'oom-kill'" with a 20G memory peak. `systemctl show` reported `OOMPolicy=stop` before the fix.
         - **Still to check, on the pull request:**
             - the three jobs on the runner itself, under rootless Docker;
-            - clippy at 12 jobs under the cap, with its cold time.
+            - clippy at 8 jobs under the cap, with its cold time.
 - **Links:**
     - Roadmap item 0.5 and Step 0.
     - ADR-aacruzgon-0018 and 0019; ADR-sam-michaels-0001 and 0002.

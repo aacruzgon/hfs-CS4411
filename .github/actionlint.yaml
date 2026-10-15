@@ -1,0 +1,5 @@
+# The self-hosted runner's custom label (ADR-sam-michaels-0001), so actionlint
+# does not report it as unknown.
+self-hosted-runner:
+  labels:
+    - hfs-cassandra

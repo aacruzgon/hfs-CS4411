@@ -35,7 +35,13 @@ jobs:
       # container is running while this does.
       - name: docker system prune --force --volumes
         run: |
-          echo "Daemon: ${DOCKER_HOST:-default}"
+          # Refuse to prune any daemon but gh-runner's own rootless one.
+          want="unix:///run/user/$(id -u)/docker.sock"
+          if [ "${DOCKER_HOST:-}" != "$want" ]; then
+            echo "::error::DOCKER_HOST is '${DOCKER_HOST:-unset}', expected '$want'; not pruning."
+            exit 1
+          fi
+          echo "Daemon: $DOCKER_HOST"
           docker system df
           docker system prune --force --volumes
           docker system df
