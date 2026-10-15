@@ -36,6 +36,17 @@
     - **The rig must be on at 02:00 UTC.** A run queued while it is off or asleep waits up to 24 h and then expires. Making KDE's "When inactive" on AC power "Do nothing" fixes that, and is my call.
     - **Not covered:** code outside `helios-persistence` with `cassandra,R4B`, such as REST or clippy changes, until the weekly sync branch runs the full CI.
     - **`test_report` proves the issue path.** A manual run with the box ticked opens or updates the issue even when everything passes, and the next normal run closes it. That tests opening, commenting and closing before a real drift relies on them.
+    - **Accepted risk: the canary builds upstream's code unreviewed, every night, on my desktop.** CodeRabbit's security review of PR #22 pointed it out:
+        - **The risk:** build scripts and proc-macros run as `gh-runner`. Malicious code there could reach my dev Cassandra on `127.0.0.1:59042`, which has no authentication. It could also change `gh-runner`'s toolchain, registry or build folders, which later CI jobs use. The issue steps that follow run as the same user, so it could read their token as well.
+        - **Why we accept it:** it is the exposure we already have.
+            - The weekly `sync/upstream-*` branch runs CI on the same runner, and builds upstream's code before anyone reviews it.
+            - Each of us builds upstream on our own machines.
+            - The canary only makes it nightly instead of weekly.
+        - **What limits it:**
+            - The job token can only write issues on this repository, and it expires when the job ends.
+            - `gh-runner` is not an admin and has its own rootless Docker (ADR-sam-michaels-0001).
+            - Upstream is HeliosSoftware, the project we forked.
+        - **Not adopted: CodeRabbit's hardening proposal,** to build in a disposable container with no host network and to report from a separate job. It would not cover the weekly sync branch, which carries the same risk. It is worth revisiting if the runner ever builds code from a source we trust less than upstream.
     - **Another ~1.6 GB folder** under `target/` on the rig, within its 10 GB cap.
     - **actionlint flags `runner.workspace`** as undefined, here and in the three existing workflows. GitHub doesn't document it, but the runner sets it, and every CI run so far has used it. It is kept for consistency.
 - **AI involvement:**
@@ -50,6 +61,7 @@
     - **What the human changed:**
         - I picked 02:00 UTC over the suggested 23:00 UTC.
         - I chose to keep `test_report`.
+        - After Alan's review of PR #22, I added the accepted-risk bullet and the PR link. The AI drafted both from his review and CodeRabbit's.
         - The 0.11 task list I worked from already settled the 0.4 check over the workspace check, the separate target directory and the issue rules; the AI implemented them.
     - **What was verified and how, on the rig, as me, in a separate worktree of `origin/main` (`f256e091c`):**
         - Fetching upstream (`8aada6230`, 202 commits ahead) with no token.
@@ -61,6 +73,6 @@
         - `actionlint` 1.7.12 with `shellcheck` 0.11.0: clean except the `runner.workspace` note.
         - The workflow itself can only run once it is on `main`.
 - **Links:**
-    - `.github/workflows/upstream-canary.yml`; pull request to follow.
+    - `.github/workflows/upstream-canary.yml`; PR #22, with CodeRabbit's security review and Alan's review.
     - `development-roadmap.md`: "Track upstream weekly", the Step 0 CI-order and "Upstream canary" bullets, row 0.11.
     - ADR-aacruzgon-0018; ADR-sam-michaels-0001, 0002.
