@@ -44,4 +44,4 @@
         - The setting before the change, with `gh api repos/aacruzgon/hfs-Cassandra-CS4411/actions/permissions`.
 - **Links:**
     - **Docs:** `development-roadmap.md` section 1, "Track upstream weekly" ground rule; the "Commits and CI" section of `AGENTS.md` and `CLAUDE.md`.
-    - ADR-aacruzgon-0018; ADR-sam-michaels-0005; `.github/dependabot.yml`.
+    - PR #25; ADR-aacruzgon-0018; ADR-sam-michaels-0005; `.github/dependabot.yml`.
