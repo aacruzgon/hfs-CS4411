@@ -65,3 +65,4 @@ A choice between two or more workable designs; a change to a trait surface, tabl
 | [0018](2026-10-14/0018-ci-on-self-hosted-runner.md) | 2026-10-14 | CI runs on the team's self-hosted runner | accepted |
 | [0019](2026-10-14/0019-required-check-no-skip-ci.md) | 2026-10-14 | The R4B compile check is required on `main`, and commits no longer use `[skip ci]` | accepted |
 | [0020](2026-10-14/0020-cassandra-test-harness-rules.md) | 2026-10-14 | Cassandra tests connect to a running node and isolate their data by tenant | accepted |
+| [0021](2026-10-15/0021-item-0.5-required-checks.md) | 2026-10-15 | Item 0.5's four checks are required on `main`, the Cassandra schema job included | accepted |
