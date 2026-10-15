@@ -87,24 +87,31 @@ jobs:
           mkdir -p "$TARGET_DIR" && echo "$stamp" > "$TARGET_DIR/.stamp"
           echo "CARGO_TARGET_DIR=$TARGET_DIR" >> "$GITHUB_ENV"
 
-      # The exact command from CONTRIBUTING.md. The runner is also Sam's
-      # desktop (31 GB), so the build runs 8 jobs at low priority and the
-      # runner service is capped at MemoryMax=20G (ADR-sam-michaels-0003). At
-      # 24 jobs a local build froze the rig; at 12 the first CI run hit the
-      # 20 GB cap and was killed. One compiler process alone peaks at 12.8 GB.
+      # The exact command from CONTRIBUTING.md, at low priority, because the
+      # runner is also Sam's desktop (31 GB) and its service is capped at
+      # MemoryMax=20G (ADR-sam-michaels-0003). helios-fhir's lib and lib-test
+      # units need about 12.8 GB each, and cargo builds them side by side, so
+      # a cold build at 8 jobs is killed at the cap. The retry runs the same
+      # command at 1 job: everything already built is reused, and the
+      # remaining units, those two included, build one at a time. A real lint
+      # error fails both attempts.
       - name: cargo clippy --all-targets --all-features -- -D warnings (CONTRIBUTING.md)
-        env:
-          CARGO_BUILD_JOBS: 8
         run: |
-          nice -n 10 cargo clippy --all-targets --all-features -- -D warnings \
-            -A clippy::items_after_test_module \
-            -A clippy::large_enum_variant \
-            -A clippy::question_mark \
-            -A clippy::collapsible_match \
-            -A clippy::collapsible_if \
-            -A clippy::field_reassign_with_default \
-            -A clippy::doc-overindented-list-items \
-            -A clippy::doc-lazy-continuation
+          clippy() {
+            CARGO_BUILD_JOBS="$1" nice -n 10 cargo clippy --all-targets --all-features -- -D warnings \
+              -A clippy::items_after_test_module \
+              -A clippy::large_enum_variant \
+              -A clippy::question_mark \
+              -A clippy::collapsible_match \
+              -A clippy::collapsible_if \
+              -A clippy::field_reassign_with_default \
+              -A clippy::doc-overindented-list-items \
+              -A clippy::doc-lazy-continuation
+          }
+          if ! clippy 8; then
+            echo "::warning::clippy failed at 8 jobs; retrying at 1 job. On a cold build this is the expected memory-cap kill of helios-fhir's two units (ADR-sam-michaels-0003)."
+            clippy 1
+          fi
 
   cassandra:
     name: Cassandra schema (single node)

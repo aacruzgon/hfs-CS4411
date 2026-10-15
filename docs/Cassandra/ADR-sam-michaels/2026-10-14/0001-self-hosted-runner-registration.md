@@ -1,7 +1,7 @@
 # ADR-sam-michaels-0001: Self-hosted runner registered on the 7900X rig, run by a dedicated non-admin user with rootless Docker
 
 - **Date:** 2026-10-14
-- **Status:** accepted
+- **Status:** accepted; its `pasta` networking is superseded by ADR-sam-michaels-0004
 - **Context:**
     - ADR-aacruzgon-0018 puts every CI workflow on the team's self-hosted runner (32 GB, AMD 7900X) and leaves its labels and OS to be recorded when it is registered. Roadmap Step 0 makes registration the first CI item: Rust, Docker and `cqlsh` installed, checked by a one-step workflow.
     - The rig is my own desktop, which I also use for development alongside my Mac (my primary machine). That made three choices real decisions rather than routine setup:

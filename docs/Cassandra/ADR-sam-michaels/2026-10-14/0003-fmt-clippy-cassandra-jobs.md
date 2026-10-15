@@ -24,7 +24,10 @@
         - None waits for another, so a failure in one still lets the others report.
         - The runner has one executor, so they run one after another anyway.
         - Under ADR-aacruzgon-0019 the job names become required-check names, so renaming one means changing the ruleset in the same change.
-    - **Clippy runs with `CARGO_BUILD_JOBS: 8` under `nice -n 10`,** at low priority. I first chose 12. The first CI run at 12 hit the memory cap below and was killed, so it went back to 8, the setting measured locally, before merge (see Alternatives).
+    - **Clippy runs at `CARGO_BUILD_JOBS=8` under `nice -n 10`, and if that attempt fails, runs the same command again at `CARGO_BUILD_JOBS=1`.**
+        - `helios-fhir`'s lib and lib-test units, the generated models for all four FHIR versions, need about 12.8 GB each. Cargo builds them side by side, so on a cold build any job count above 1 can pass the 20 GB cap below. CI showed this at 12 jobs and again at 8 (see Alternatives).
+        - The retry reuses everything the first attempt finished, and builds the remaining units, those two included, one at a time.
+        - The command text stays exactly as in `CONTRIBUTING.md`. Only `CARGO_BUILD_JOBS` differs between the attempts.
     - **The runner service is capped at `MemoryMax=20G`, `MemorySwapMax=0`, with `OOMPolicy=continue`,** set in the systemd drop-in `/etc/systemd/system/actions.runner.aacruzgon-hfs-Cassandra-CS4411.sam-7900x.service.d/memory.conf`.
         - Every CI step runs inside that service's cgroup, cargo and rustc included, so a memory spike kills the build instead of pushing the desktop into swap.
         - `OOMPolicy=continue` keeps the runner online when that happens. systemd's default for a service, `stop`, stops the whole unit when the kernel kills any process in it, so a killed build took the runner offline and left the other jobs queued.
@@ -44,17 +47,22 @@
 - **Alternatives considered:**
     - **Three workflow files, or jobs chained with `needs:`:** lost. Separate files triplicate the trigger, concurrency and environment blocks. With `needs:`, a fmt failure would hide whether clippy and the schema pass.
     - **Clippy at cargo's default of 24 jobs:** lost. It is what froze the rig.
-    - **Clippy at 12 jobs:** my first choice, for faster CI, with the memory cap as the backstop. The AI had recommended 8, the measured setting. The first CI run, run 38661209397 on PR #20, reached the cap after about 4.5 minutes: the service's memory peak was 20G, and the kernel OOM killer fired. As this entry already said, the fix was to return to 8 jobs, not to raise the cap.
+    - **Clippy at 12 jobs:** my first choice, for faster CI, with the memory cap as the backstop. The AI had recommended 8, the measured setting. The first CI run, run 38661209397 on PR #20, reached the cap after about 4.5 minutes: the service's memory peak was 20G, and the kernel OOM killer fired.
+    - **Clippy at 8 jobs with no retry:** lost. The second CI run, run 38662774109, was killed at the cap after 105 s with `could not compile helios-fhir (lib)` and `(lib test)`: two OOM kills, each of a `clippy-driver` near 10 GB resident. My local 8-job run had passed only because it was partly warm, so those two units never overlapped.
+    - **Building `helios-fhir` first** (`cargo clippy -p helios-fhir --lib --all-features`, then the full command): lost. Tested locally on a warm build, a narrower package selection resolves crate features differently, so cargo rebuilt everything from `proc-macro2` up instead of reusing the full build's units.
+    - **Always 1 job:** lost. It never reaches the cap, but every build, warm ones included, would run serially.
+    - **Raising the cap to about 28 GB:** lost. It would leave about 3 GB of the rig's 31 GB for the desktop while those units build, close to the freeze this entry starts from.
     - **systemd's default `OOMPolicy=stop`:** lost. In that same run, it stopped the whole runner service, so fmt and the Cassandra job stayed queued until the service was restarted by hand.
     - **Clippy at 4 jobs:** lost. Gentler on the desktop, but slower than needed once the memory cap is in place.
     - **No memory limit, or deferring one until a CI run had been measured:** lost. The AI recommended deferring. I chose to add the cap now, so the first CI runs are already protected.
-    - **`docker compose exec cassandra cqlsh` inside the container:** lost. The host's `cqlsh`, through the published port and rootless Docker's `pasta` networking, is the same path the backend and its tests will use. It is also why `cqlsh` was installed for `gh-runner` (roadmap Step 0).
+    - **`docker compose exec cassandra cqlsh` inside the container:** lost. The host's `cqlsh`, through the published port and rootless Docker's port forwarding, is the same path the backend and its tests will use. It is also why `cqlsh` was installed for `gh-runner` (roadmap Step 0). The second CI run showed the cost of skipping that path: `pasta`'s port driver published nothing on the host, which `exec` would have hidden until Step 2 (ADR-sam-michaels-0004).
     - **Only applying the schema, with no checks:** lost. The two checks cost about a second and catch a statement that silently stops being idempotent, or a table that goes missing.
     - **`docker system prune --all`:** lost. It would delete the pinned Cassandra image every week, costing a download on the next run, for no disk that matters on a 464 GB disk.
     - **A nightly prune:** lost. The clutter comes from CI runs, at most a few a day, and a nightly run would mostly find nothing.
     - **Other weekly times** (Mondays 10:00 Eastern, as first drafted; Sunday evening; a weekday evening): lost to Saturday afternoon, when my rig is usually on.
 - **Consequences:**
-    - **The cap can still be reached.** At 8 jobs, one compiler process peaked at about 12.8 GB. At 12, the build reached the 20 GB cap. If a future change (new crates, a new FHIR version) pushes 8 jobs over the cap too, the build fails with an OOM kill in its log and the runner stays online. The fix is fewer jobs, not a higher cap: a cap near the rig's 31 GB would no longer protect the desktop.
+    - **A cold clippy build is expected to be killed once.** Each one rebuilds `helios-fhir`'s two units, so its first attempt at 8 jobs hits the cap. The job log shows a warning, and the journal shows the OOM kill, then the retry at 1 job finishes the build. The same happens on a warm build whenever `crates/fhir` changes. A real lint error fails both attempts, so it costs a second, mostly warm, run.
+    - **The cap still protects the desktop.** If a future change pushes even a single `helios-fhir` unit past 20 GB, both attempts fail with OOM kills, and the runner stays online. The answer then is to look at that unit, not to raise the cap toward the rig's 31 GB.
     - **The cold clippy time has not been measured yet.** My local 3 min 53 s reused part of a build from an earlier run. The job's `timeout-minutes` is 90 until the first CI runs give real numbers.
     - **The desktop stays usable during CI.** `nice` yields the CPU to me, and the cap bounds CI's memory at 20 of 31 GB.
     - **A host `cqlsh` timeout under heavy load is a known false failure.** On the runner, jobs are serial, so clippy never runs during the Cassandra job. My own work on the desktop can still slow it. The `cqlsh` calls therefore use `--connect-timeout 30 --request-timeout 60`.
@@ -74,6 +82,7 @@
         - I reported that my computer became very slow during the AI's first local clippy run, which led to limiting clippy's jobs and priority.
         - I held the pull request until I had reviewed this entry.
         - I chose 12 jobs over the measured 8, for faster CI. When the first CI run at 12 was killed at the cap, I went back to 8.
+        - When 8 jobs was killed too, I chose the retry at 1 job, which the AI recommended, over always running 1 job or raising the cap.
         - I chose to add the 20 GB memory cap now instead of deferring it.
         - I moved the prune to Saturday afternoon, when my rig is usually on.
         - I approved the rest of the design as drafted: independent jobs, host `cqlsh` with the two schema checks, and the prune without `--all`.
@@ -92,12 +101,15 @@
         - **Both workflows parse,** and `zizmor` 1.30.1 reports no findings for them or for `r4b-compile-check.yml`.
         - **The memory cap:** `systemctl show` on the runner service after applying the drop-in reports `MemoryMax=21474836480`, `MemorySwapMax=0` and `OOMPolicy=continue`.
         - **The 12-job failure:** the runner service's journal (`journalctl -u`) shows "The kernel OOM killer killed some processes in this unit" at 20:43:05, then "Failed with result 'oom-kill'" with a 20G memory peak. `systemctl show` reported `OOMPolicy=stop` before the fix.
+        - **The 8-job failure:** run 38662774109's clippy log (`could not compile helios-fhir (lib)` and `(lib test)`), the runner cgroup's `memory.peak` of 20.0 GiB and `oom_kill 2`, and the kernel's `Memory cgroup out of memory: Killed process … (clippy-driver)` lines, all confined to the runner's cgroup (`CONSTRAINT_MEMCG`).
+        - **The narrower pre-build:** run locally after the full command. `cargo clippy -p helios-fhir --lib --all-features` started compiling from `proc-macro2` instead of reusing anything.
+        - **The retry step:** parses as bash, and a stub run takes the retry branch after a failed first attempt.
         - **Still to check, on the pull request:**
             - the three jobs on the runner itself, under rootless Docker;
-            - clippy at 8 jobs under the cap, with its cold time.
+            - clippy's retry at 1 job on a cold build, with its total time.
 - **Links:**
     - Roadmap item 0.5 and Step 0.
-    - ADR-aacruzgon-0018 and 0019; ADR-sam-michaels-0001 and 0002.
+    - ADR-aacruzgon-0018 and 0019; ADR-sam-michaels-0001, 0002 and 0004.
     - `.github/workflows/fmt-clippy-cassandra.yml` and `.github/workflows/runner-docker-prune.yml`.
     - `docs/Cassandra/schema/README.md`.
-    - Pull request: _to be added._
+    - Pull request #20 (runs 38661209397 and 38662774109).
