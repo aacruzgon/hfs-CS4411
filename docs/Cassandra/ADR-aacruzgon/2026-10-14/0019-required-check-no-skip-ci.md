@@ -10,7 +10,7 @@
 - **Decision:**
     - **`cargo check (cassandra, R4B)` is a required status check on `main`.** It was added on 2026-10-14 to the existing ruleset "Require PRs for main and master", tied to the GitHub Actions app so another app cannot report it. Branches do not have to be up to date with `main` before merging.
     - **Commits in this repository do not use `[skip ci]`,** documentation-only ones included.
-    - **fmt and clippy join the required checks** when item 0.5 adds them.
+    - **fmt and clippy join the required checks** when item 0.5 adds them. *Update 2026-10-15:* done when PR #20 merged, together with the Cassandra schema job (ADR-aacruzgon-0021).
 - **Alternatives considered:**
     - **Require the check and keep `[skip ci]`:** lost. Every docs pull request would wait for an admin to tick "Merge without waiting for requirements", so only Alan could merge them, and bypassing would become routine.
     - **Don't require the check until 0.5:** lost. The check already works, and until it is required, a pull request that breaks the R4B build can still merge.

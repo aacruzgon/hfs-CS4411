@@ -137,7 +137,7 @@ See `CLAUDE.md` -> "Windows and worktree notes" (the only place they live; do no
 
 ## Commits and CI
 
-- **Never put `[skip ci]` in a commit message, documentation-only commits included.** `cargo check (cassandra, R4B)` is a required status check on `main` (ADR-aacruzgon-0019). GitHub runs no workflow for a pull request whose latest commit has `[skip ci]`, so that check never reports and the pull request cannot merge. This overrides the `[skip ci]` advice in `CONTRIBUTING.md`, which is upstream's file and is left unchanged.
+- **Never put `[skip ci]` in a commit message, documentation-only commits included.** Five checks are required on `main`: `cargo check (cassandra, R4B)`, `cargo fmt --check`, `cargo clippy (helios-fhir)`, `cargo clippy (workspace)` and `Cassandra schema (single node)` (ADR-aacruzgon-0019, 0021). GitHub runs no workflow for a pull request whose latest commit has `[skip ci]`, so those checks never report and the pull request cannot merge. For the same reason, never add a `paths:` filter to `r4b-compile-check.yml` or `fmt-clippy-cassandra.yml`, and rename a job's `name:` only together with the ruleset. This overrides the `[skip ci]` advice in `CONTRIBUTING.md`, which is upstream's file and is left unchanged.
 - Workflows run on the self-hosted runner `[self-hosted, hfs-cassandra]` and follow the fork rules in ADR-aacruzgon-0018: the fork guard on every job, and no `pull_request_target` or `workflow_run`. Pin every action to a full commit SHA with its version in a comment, as `.github/workflows/r4b-compile-check.yml` does.
 
 ## Decision records (ADR)
