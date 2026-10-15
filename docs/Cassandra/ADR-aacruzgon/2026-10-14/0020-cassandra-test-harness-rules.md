@@ -1,0 +1,36 @@
+# ADR-aacruzgon-0020: Cassandra tests connect to a running node and isolate their data by tenant
+
+- **Date:** 2026-10-14
+- **Status:** accepted
+- **Context:**
+    - Roadmap Step 2 (row 2.0) planned a `GenericImage` test container started by each Cassandra test binary. Cassandra takes about 60 s to boot (`docker/cassandra`'s healthcheck allows 90 s), and a JVM is heavy on the 16 and 18 GB laptops.
+    - A Cassandra node is already running wherever the tests run. In CI, the item 0.5 job starts its own container on the self-hosted runner (ADR-sam-michaels-0001). Locally, every developer runs `docker/cassandra` on `127.0.0.1:59042` (ADR-aacruzgon-0007).
+    - `cargo test` runs a binary's tests in parallel, against one shared node.
+    - **`cargo nextest` was considered and not adopted.** Its process per test would turn the shared-container pattern of `tests/mongodb_tests.rs` and `tests/postgres_tests.rs` (`static … OnceCell`) into one container and one schema application per test. No workflow or document in the repository uses it. The roadmap's "measure before optimizing" rule applies: adopt it only if the Cassandra suite turns out slow or prone to hanging.
+- **Decision:** two rules for every Cassandra test, written into roadmap Step 2 (the "Cassandra test node" bullet, rows 2.0 and 2.5):
+    - **Rule 1: connect to a running node when `HFS_TEST_CASSANDRA_URL` is set,** the way `HFS_TEST_MONGODB_URL` works in `tests/mongodb_tests.rs`.
+        - The schema must already be applied to that node: `schema/keyspace-single-node.cql`, then `schema/schema.cql`. In CI the 0.5 job does it; locally the developer does it with `cqlsh`.
+        - Only when the variable is unset does the harness start its own `GenericImage` container, as planned before.
+    - **Rule 2: each test writes under its own tenant or ids.** Tests running in parallel never share rows, and data left by an earlier run on a reused node cannot change a result.
+- **Alternatives considered:**
+    - **A test container per test binary only** (the roadmap's plan): kept as the fallback, not the default. It adds a Cassandra boot to every run and a second JVM next to the node that is already running.
+    - **`cargo nextest`:** not adopted, for the reasons in Context.
+    - **Cleaning up data between tests instead of isolating it:** lost. Deletes create tombstones, which slow later reads, and cleanup between parallel tests would need locking.
+- **Consequences:**
+    - **Faster runs and less memory,** in CI and on the laptops: no Cassandra boot when a node is running, and no second JVM next to it.
+    - **The tests run against the configuration we benchmark:** the pinned image, `paxos_variant: v2` and the resource limits of `docker/cassandra` (ADR-aacruzgon-0001, 0002).
+    - **Rule 2 fits the draft schema.** Every data table's partition key starts with `tenant_id`. **The exception is `pending_index_writes`,** partitioned by `(bucket, shard)` across tenants: a sweeper test sees other tests' intents, so it asserts only on its own tenant's.
+    - **A reused node does not pick up schema changes.** `schema.cql` uses `CREATE TABLE IF NOT EXISTS`, which leaves an existing table unchanged. After any change to `schema.cql` (for example after the Step 1 design sessions), the `helios` keyspace on a reused node is dropped and applied again.
+    - **Proposal P6 is not decided here.** Whether `initialize` or the harness applies the schema is still P6 (`schema/README.md`). Rule 1 works with either answer, because a node reached through the variable already has the schema.
+    - **nextest later needs Rule 1's shared node.** With `HFS_TEST_CASSANDRA_URL` set, each nextest process only opens a connection to that node, so switching stays cheap. With it unset, every test process would start its own fallback container, because a `static … OnceCell` lives for one process; nextest would then need the variable to be required, or a container lifecycle that outlives one process. Either way the schema must not be applied per test.
+- **AI involvement:**
+    - **Tool and model:** Claude Code (Opus 5.5).
+    - **What the AI proposed:** `cargo nextest` with three harness rules. When Alan asked whether nextest would really help, the AI assessed it as little benefit for one test binary, and against the upstream test pattern. It then proposed keeping the two rules that help with plain `cargo test`. Its first draft of this entry said switching to nextest later would mainly mean moving schema creation out of the fallback container's setup; CodeRabbit's review on PR #19 pointed out that with the variable unset, every nextest process would still start its own container, and the consequence was corrected.
+    - **What the human changed:** Alan asked whether nextest could replace `cargo test`, chose to stay with `cargo test`, and asked to record the two rules.
+    - **Verified:**
+        - The shared-container pattern (`static SHARED: OnceCell`) and `HFS_TEST_MONGODB_URL`, read in `crates/persistence/tests/mongodb_tests.rs`; the same pattern at `postgres_tests.rs:2564`.
+        - Every partition key in `docs/Cassandra/schema/schema.cql`, and its 10 `CREATE TABLE IF NOT EXISTS` statements.
+        - No `nextest` anywhere in the repository (`git grep`).
+- **Links:**
+    - **Docs:** `development-roadmap.md` Step 2 ("Cassandra test node" bullet), rows 2.0 and 2.5, and the Step 0 CI-order bullet (the 0.5 Cassandra job).
+    - `schema/README.md` proposal P6; ADR-aacruzgon-0007; ADR-sam-michaels-0001.
