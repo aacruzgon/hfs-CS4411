@@ -1,0 +1,229 @@
+name: fmt, clippy and Cassandra schema
+
+# Roadmap item 0.5 on the team's self-hosted runner (ADR-aacruzgon-0018,
+# ADR-sam-michaels-0001): rustfmt, the CONTRIBUTING.md clippy command split
+# into two jobs, and a single-node Cassandra that the schema is applied to.
+# The runner has one executor, so the jobs run one after another.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One run per ref; a newer push supersedes the run in flight.
+concurrency:
+  group: fmt-clippy-cassandra-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Pinned by environment, which rustup ranks above any directory override left
+  # on the runner (the inherited ci.yml hit exactly that). Cargo itself refuses
+  # a toolchain older than the workspace rust-version, 1.90.
+  RUSTUP_TOOLCHAIN: stable
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    name: cargo fmt --check
+    # Fork guard (ADR-aacruzgon-0018). It only keeps this unmodified workflow
+    # from running a fork's code; approval is what keeps forks off the runner.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, hfs-cassandra]
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Keep the job token out of .git/config, where build scripts and
+          # proc-macros run by cargo could read it.
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master, 2026-10-09
+        with:
+          toolchain: stable
+          components: rustfmt
+
+      - name: cargo fmt --all -- --check
+        run: cargo fmt --all -- --check
+
+  # Clippy is the CONTRIBUTING.md command split in two (ADR-sam-michaels-0003).
+  # With --all-features, helios-fhir holds all four FHIR versions, and its lib
+  # and lib-test units need about 12.8 GB each. In one command cargo builds
+  # them side by side, past the runner service's MemoryMax=20G. So helios-fhir
+  # is checked alone, one unit at a time, and the rest of the workspace after
+  # it, with helios-fhir only as a dependency. Together the two jobs lint the
+  # same crates and targets as the CONTRIBUTING.md command, with the same lint
+  # flags, at low priority because the runner is also Sam's desktop.
+  clippy-fhir:
+    name: cargo clippy (helios-fhir)
+    # Fork guard (ADR-aacruzgon-0018).
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, hfs-cassandra]
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master, 2026-10-09
+        with:
+          toolchain: stable
+          components: clippy
+
+      # Same bounded, persistent target directory as r4b-compile-check.yml
+      # (ADR-sam-michaels-0002). Both clippy jobs share it, under the ~30 GB
+      # cap that ADR records for clippy; they never run at the same time.
+      - name: Reset the target dir if it is stale or over its cap
+        env:
+          TARGET_DIR: ${{ runner.workspace }}/target/clippy
+          CAP_GB: 30
+        run: |
+          stamp="$(rustc -V) $(sha256sum Cargo.lock | cut -c1-16)"
+          size_gb=$(du -s --block-size=1G "$TARGET_DIR" 2>/dev/null | cut -f1)
+          if [ "$(cat "$TARGET_DIR/.stamp" 2>/dev/null)" != "$stamp" ] || [ "${size_gb:-0}" -gt "$CAP_GB" ]; then
+            echo "Resetting $TARGET_DIR (size ${size_gb:-0} GB, cap $CAP_GB GB, stamp: $stamp)"
+            rm -rf "$TARGET_DIR"
+          fi
+          mkdir -p "$TARGET_DIR" && echo "$stamp" > "$TARGET_DIR/.stamp"
+          echo "CARGO_TARGET_DIR=$TARGET_DIR" >> "$GITHUB_ENV"
+
+      - name: cargo clippy -p helios-fhir --all-targets --all-features, one job at a time
+        env:
+          CARGO_BUILD_JOBS: 1
+        run: |
+          nice -n 10 cargo clippy -p helios-fhir --all-targets --all-features -- -D warnings \
+              -A clippy::items_after_test_module \
+              -A clippy::large_enum_variant \
+              -A clippy::question_mark \
+              -A clippy::collapsible_match \
+              -A clippy::collapsible_if \
+              -A clippy::field_reassign_with_default \
+              -A clippy::doc-overindented-list-items \
+              -A clippy::doc-lazy-continuation
+
+  clippy-workspace:
+    name: cargo clippy (workspace)
+    # Runs only after helios-fhir passes: the order is what keeps the two
+    # 12.8 GB helios-fhir units apart. If clippy-fhir fails, this job is
+    # skipped, so both job names must be required checks (ADR-aacruzgon-0019).
+    needs: clippy-fhir
+    # Fork guard (ADR-aacruzgon-0018).
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, hfs-cassandra]
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master, 2026-10-09
+        with:
+          toolchain: stable
+          components: clippy
+
+      # Same bounded, persistent target directory as r4b-compile-check.yml
+      # (ADR-sam-michaels-0002). Both clippy jobs share it, under the ~30 GB
+      # cap that ADR records for clippy; they never run at the same time.
+      - name: Reset the target dir if it is stale or over its cap
+        env:
+          TARGET_DIR: ${{ runner.workspace }}/target/clippy
+          CAP_GB: 30
+        run: |
+          stamp="$(rustc -V) $(sha256sum Cargo.lock | cut -c1-16)"
+          size_gb=$(du -s --block-size=1G "$TARGET_DIR" 2>/dev/null | cut -f1)
+          if [ "$(cat "$TARGET_DIR/.stamp" 2>/dev/null)" != "$stamp" ] || [ "${size_gb:-0}" -gt "$CAP_GB" ]; then
+            echo "Resetting $TARGET_DIR (size ${size_gb:-0} GB, cap $CAP_GB GB, stamp: $stamp)"
+            rm -rf "$TARGET_DIR"
+          fi
+          mkdir -p "$TARGET_DIR" && echo "$stamp" > "$TARGET_DIR/.stamp"
+          echo "CARGO_TARGET_DIR=$TARGET_DIR" >> "$GITHUB_ENV"
+
+      # helios-fhir is built here once, as a dependency, never its test target.
+      # helios-fhir/skip-r6-download gives it the same features as the
+      # CONTRIBUTING.md command (R4, R4B, R5, R6, xml, skip-r6-download);
+      # without it, helios-fhir's build script downloads R6 examples from
+      # build.fhir.org, because an excluded package gets no --all-features.
+      - name: cargo clippy --workspace --exclude helios-fhir --all-targets --all-features
+        env:
+          CARGO_BUILD_JOBS: 8
+        run: |
+          nice -n 10 cargo clippy --workspace --exclude helios-fhir --all-targets --all-features \
+            --features helios-fhir/skip-r6-download -- -D warnings \
+              -A clippy::items_after_test_module \
+              -A clippy::large_enum_variant \
+              -A clippy::question_mark \
+              -A clippy::collapsible_match \
+              -A clippy::collapsible_if \
+              -A clippy::field_reassign_with_default \
+              -A clippy::doc-overindented-list-items \
+              -A clippy::doc-lazy-continuation
+
+  cassandra:
+    name: Cassandra schema (single node)
+    # Fork guard (ADR-aacruzgon-0018).
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, hfs-cassandra]
+    timeout-minutes: 15
+    env:
+      COMPOSE_FILE: docker/cassandra/docker-compose.yml
+      # CI's own host port, never the default 59042 that a developer's
+      # Cassandra uses (ADR-sam-michaels-0001). Every compose command below
+      # also names CI's own project, hfs-cassandra-ci, so down -v can only
+      # ever remove CI's containers and volume.
+      CASSANDRA_HOST_PORT: 59142
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # A run killed mid-job (cancelled, runner restarted) skips its cleanup.
+      - name: Remove leftovers of an earlier run
+        run: docker compose -p hfs-cassandra-ci down -v --remove-orphans
+
+      # First boot takes about 60 s; the healthcheck allows a 90 s start
+      # period and then 12 retries 10 s apart.
+      - name: Start Cassandra and wait for its healthcheck
+        run: |
+          start=$(date +%s)
+          docker compose -p hfs-cassandra-ci up -d --wait --wait-timeout 240
+          echo "Healthy after $(( $(date +%s) - start )) s"
+
+      - name: Apply keyspace-single-node.cql, then schema.cql
+        run: |
+          cqlsh --connect-timeout 30 --request-timeout 60 127.0.0.1 "$CASSANDRA_HOST_PORT" \
+            -f docs/Cassandra/schema/keyspace-single-node.cql
+          cqlsh --connect-timeout 30 --request-timeout 60 127.0.0.1 "$CASSANDRA_HOST_PORT" \
+            -k helios -f docs/Cassandra/schema/schema.cql
+
+      # docs/Cassandra/schema/README.md: every statement is IF NOT EXISTS, so a
+      # second apply is silent, and the keyspace holds the design's ten tables.
+      - name: Check the schema re-applies silently and has ten tables
+        run: |
+          out=$(cqlsh 127.0.0.1 "$CASSANDRA_HOST_PORT" -k helios -f docs/Cassandra/schema/schema.cql 2>&1 \
+            | grep -v 'cqlsh was built against' || true)
+          if [ -n "$out" ]; then echo "Re-applying schema.cql printed:"; echo "$out"; exit 1; fi
+          tables=$(cqlsh 127.0.0.1 "$CASSANDRA_HOST_PORT" -e \
+            "SELECT table_name FROM system_schema.tables WHERE keyspace_name = 'helios'" 2>/dev/null \
+            | awk 'NF == 1 && $1 !~ /^(table_name|-+)$/')
+          echo "$tables"
+          [ "$(echo "$tables" | wc -l)" -eq 10 ]
+
+      - name: Cassandra logs
+        if: failure()
+        run: docker compose -p hfs-cassandra-ci logs --tail 200
+
+      # down -v is safe here only because -p names CI's own project.
+      - name: Stop Cassandra and remove CI's volume
+        if: always()
+        run: docker compose -p hfs-cassandra-ci down -v --remove-orphans

@@ -1,0 +1,44 @@
+# ADR-sam-michaels-0004: gh-runner's rootless Docker uses slirp4netns with the builtin port driver, not pasta
+
+- **Date:** 2026-10-14
+- **Status:** accepted
+- **Context:**
+    - ADR-sam-michaels-0001 gave `gh-runner` its own rootless Docker, set up by `dockerd-rootless-setuptool.sh`. That script picks the network driver for itself:
+        - `slirp4netns` if it is installed;
+        - otherwise `pasta`, with `pasta`'s `implicit` port driver.
+
+      The rig had no `slirp4netns`, so it got `pasta`. ADR-0001 listed `pasta` among the prerequisites Fedora already had, and nothing published a port at the time, so no check exercised it.
+    - The second CI run of PR #20 (run 38662774109) was the first to publish a port from that daemon. The Cassandra container became healthy, but `cqlsh` on the host got `ConnectionRefusedError` on `127.0.0.1:59142`.
+    - `/usr/bin/dockerd-rootless.sh`'s own guide marks `pasta` with the `implicit` port driver as "Experimental". With that driver, rootlesskit does not bind the host port itself.
+- **Decision:**
+    - **Install Fedora's `slirp4netns` package (1.3.1) on the rig and restart `gh-runner`'s Docker.** `dockerd-rootless.sh` then defaults to `slirp4netns` with the `builtin` port driver, in which rootlesskit binds each published port on the host itself.
+    - No configuration file changes. The choice follows from which package is installed, which this entry records so that a rebuilt runner gets the same driver.
+- **Alternatives considered:**
+    - **Keep `pasta` and debug its `implicit` port driver:** lost. The script marks it experimental, and it failed on the first port this project published.
+    - **`pasta` with the `pesto` port driver:** lost. Also marked experimental, and IPv4 only.
+    - **Avoid host ports, by running `docker compose exec cassandra cqlsh` inside the container:** lost. It would only hide the problem until Step 2. The backend's tests connect from the runner to the node's published port, through `HFS_TEST_CASSANDRA_URL` (ADR-aacruzgon-0020).
+    - **Give the runner rootful Docker again:** lost. ADR-sam-michaels-0001 moved away from it, because membership in `docker` is root-equivalent.
+- **Consequences:**
+    - **Published ports work for CI.**
+        - **The Cassandra job:** it has connected on `127.0.0.1:59142` since run 38669779300, and on every attempt of run 38672131127, PR #20.
+        - **From Step 2:** the Cassandra tests connect to that node through `HFS_TEST_CASSANDRA_URL`. Their fallback `GenericImage` container also publishes a host port (ADR-aacruzgon-0020).
+    - **Network throughput into containers is still "Slow"** in the script's guide, the same rating as `pasta`. Port throughput with the `builtin` driver is rated "Fast". Nothing in CI moves enough data for either to matter.
+    - **One more system package on the rig.** If `slirp4netns` is ever removed, `gh-runner`'s Docker silently falls back to `pasta` on its next restart, and the Cassandra job fails the same way again. A rebuilt runner must install it before running `dockerd-rootless-setuptool.sh`.
+    - **ADR-sam-michaels-0001's networking detail is superseded.** Its "rootlesskit with `pasta` networking" decision and its `pasta` prerequisite no longer hold. The rest of that entry stands.
+- **AI involvement:**
+    - **Tool and model:** Claude Code, Claude Opus 5.5.
+    - **What the AI proposed:**
+        - Reading `dockerd-rootless.sh`'s driver guide after the connection was refused.
+        - The diagnosis that the `implicit` port driver was not publishing.
+        - The before-and-after port test.
+        - Switching by installing `slirp4netns`, rather than changing configuration.
+    - **What the human changed:** I ran the diagnostic and fix script with `sudo` on the rig, after a reboot had wiped the first copy of the script from `/tmp`.
+    - **What was verified and how:** the script ran as `gh-runner`, with `gh-runner`'s `DOCKER_HOST`, the same context a CI step runs in:
+        - **Before:** the driver reported as `pasta/<no value>`. A `busybox:1.37` `httpd` published on `127.0.0.1:59199` gave `HTTP 000`: nothing answered.
+        - **After:** with `slirp4netns` 1.3.1 installed and the daemon restarted, the driver reported as `slirp4netns/builtin`, and the same test gave `HTTP 200`.
+        - **In CI:** the Cassandra job on PR #20 connected on `127.0.0.1:59142`, applied both files, re-applied them silently and counted ten tables. It did so in run 38669779300 and in all three attempts of run 38672131127. The two runs before the fix had failed with `ConnectionRefusedError`.
+- **Links:**
+    - ADR-sam-michaels-0001 (superseded in part).
+    - ADR-sam-michaels-0003; ADR-aacruzgon-0020.
+    - PR #20: runs 38662774109 (refused), 38669779300 and 38672131127 (connected).
+    - `/usr/bin/dockerd-rootless.sh`, its driver guide.
