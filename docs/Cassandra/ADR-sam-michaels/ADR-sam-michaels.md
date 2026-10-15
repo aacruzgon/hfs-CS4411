@@ -44,5 +44,5 @@ A choice between two or more workable designs; a change to a trait surface, tabl
 | --- | --- | --- | --- |
 | [0001](2026-10-14/0001-self-hosted-runner-registration.md) | 2026-10-14 | Self-hosted runner registered on the 7900X rig, run by a dedicated non-admin user with rootless Docker | accepted; networking superseded by ADR-sam-michaels-0004 |
 | [0002](2026-10-14/0002-persistent-target-dir-instead-of-rust-cache.md) | 2026-10-14 | CI keeps a bounded cargo target directory on the runner instead of using rust-cache | accepted |
-| [0003](2026-10-14/0003-fmt-clippy-cassandra-jobs.md) | 2026-10-14 | Item 0.5's fmt, clippy and Cassandra jobs, clippy's resource limits, and the weekly Docker prune | accepted |
+| [0003](2026-10-14/0003-fmt-clippy-cassandra-jobs.md) | 2026-10-14 | Item 0.5's fmt, clippy and Cassandra jobs, clippy split in two under a memory cap, and the weekly Docker prune | accepted |
 | [0004](2026-10-14/0004-rootless-docker-slirp4netns.md) | 2026-10-14 | gh-runner's rootless Docker uses slirp4netns with the builtin port driver, not pasta | accepted |
