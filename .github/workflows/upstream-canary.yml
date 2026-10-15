@@ -1,0 +1,211 @@
+name: Upstream canary
+
+# Roadmap item 0.11: every night, merge upstream's main into a throwaway local
+# branch and run 0.4's check on the result, so a change upstream that breaks
+# the Cassandra backend is found the day it lands, not at the weekly sync
+# (ADR-sam-michaels-0005). A conflict or a failed check opens, or comments on,
+# one issue titled "upstream drift"; the first night that passes again closes
+# it. The merge is never pushed. Scheduled workflows run from the default
+# branch only, so this runs only once it is on main.
+
+on:
+  schedule:
+    # Daily 02:00 UTC: 22:00 Eastern the evening before in summer time, 21:00
+    # in winter (cron is UTC). Sam's rig is usually on then; a run queued while
+    # it is off or asleep waits up to 24 h for the runner (ADR-sam-michaels-0005).
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+    inputs:
+      test_report:
+        description: Open or update the upstream drift issue even if everything passes, to test that path
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# Never cancel a run in flight: a slow night just delays the next one.
+concurrency:
+  group: upstream-canary
+  cancel-in-progress: false
+
+env:
+  # As in r4b-compile-check.yml: rustup ranks this above any directory override.
+  RUSTUP_TOOLCHAIN: stable
+  # The check's output goes into an issue, so no ANSI colour codes.
+  CARGO_TERM_COLOR: never
+  UPSTREAM_URL: https://github.com/HeliosSoftware/hfs.git
+
+jobs:
+  canary:
+    name: upstream canary (merge + cassandra,R4B check)
+    # Fork guard (ADR-aacruzgon-0018); schedule and dispatch always pass it.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, hfs-cassandra]
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # No token in .git/config: build scripts can't read it, and the job
+          # has no way to push the canary branch.
+          persist-credentials: false
+          # Full history, so git can find the merge base with upstream.
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master, 2026-10-09
+        with:
+          toolchain: stable
+
+      # Upstream is public, so no token. If this fails, the job fails here and
+      # no issue is opened: that is the network, not drift.
+      - name: Fetch upstream main
+        id: fetch
+        run: |
+          git fetch --no-tags "$UPSTREAM_URL" main
+          echo "ours=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "upstream=$(git rev-parse FETCH_HEAD)" >> "$GITHUB_OUTPUT"
+          echo "Ours: $(git log -1 --format='%h %s' HEAD)"
+          echo "Upstream: $(git log -1 --format='%h %s' FETCH_HEAD)"
+          echo "Upstream commits not in ours: $(git rev-list --count HEAD..FETCH_HEAD)"
+
+      # -C, not -c: a run killed before its clean-up step leaves the branch.
+      - name: Merge upstream into a throwaway branch
+        id: merge
+        run: |
+          set +e
+          git switch -C "canary/upstream-$(date -u +%F)"
+          git -c user.name="upstream canary" -c user.email="canary@invalid" \
+            merge --no-edit FETCH_HEAD 2>&1 | tee "$RUNNER_TEMP/merge.log"
+          if [ "${PIPESTATUS[0]}" -eq 0 ]; then
+            echo "result=clean" >> "$GITHUB_OUTPUT"
+          else
+            git diff --name-only --diff-filter=U > "$RUNNER_TEMP/conflicts.txt"
+            git merge --abort
+            echo "result=conflict" >> "$GITHUB_OUTPUT"
+          fi
+
+      # The r4b-compile-check.yml step with its own folder and cap. Never
+      # target/r4b-compile-check: upstream's Cargo.lock differs from ours, so
+      # sharing it would wipe that folder every night and leave the next pull
+      # request's required check cold (ADR-sam-michaels-0005).
+      - name: Reset the target dir if it is stale or over its cap
+        if: steps.merge.outputs.result == 'clean'
+        env:
+          TARGET_DIR: ${{ runner.workspace }}/target/upstream-canary
+          CAP_GB: 10
+        run: |
+          stamp="$(rustc -V) $(sha256sum Cargo.lock | cut -c1-16)"
+          size_gb=$(du -s --block-size=1G "$TARGET_DIR" 2>/dev/null | cut -f1)
+          if [ "$(cat "$TARGET_DIR/.stamp" 2>/dev/null)" != "$stamp" ] || [ "${size_gb:-0}" -gt "$CAP_GB" ]; then
+            echo "Resetting $TARGET_DIR (size ${size_gb:-0} GB, cap $CAP_GB GB, stamp: $stamp)"
+            rm -rf "$TARGET_DIR"
+          fi
+          mkdir -p "$TARGET_DIR" && echo "$stamp" > "$TARGET_DIR/.stamp"
+          echo "CARGO_TARGET_DIR=$TARGET_DIR" >> "$GITHUB_ENV"
+
+      # 0.4's required check, on the merged tree. No --locked: the merged
+      # Cargo.lock may need updating, as it would on the weekly sync branch.
+      - name: cargo check -p helios-persistence --no-default-features --features cassandra,R4B
+        id: check
+        if: steps.merge.outputs.result == 'clean'
+        run: |
+          set +e
+          cargo check -p helios-persistence --no-default-features --features cassandra,R4B 2>&1 \
+            | tee "$RUNNER_TEMP/check.log"
+          code=${PIPESTATUS[0]}
+          tail -n 50 "$RUNNER_TEMP/check.log" > "$RUNNER_TEMP/check-tail.txt"
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+
+      - name: Decide
+        id: verdict
+        env:
+          MERGE_RESULT: ${{ steps.merge.outputs.result }}
+          CHECK_CODE: ${{ steps.check.outputs.code }}
+          TEST_REPORT: ${{ inputs.test_report }}
+        run: |
+          if [ "$MERGE_RESULT" = conflict ]; then failed="merge"
+          elif [ "$CHECK_CODE" != 0 ]; then failed="cargo check"
+          elif [ "$TEST_REPORT" = true ]; then failed="none (test_report run)"
+          else failed=""
+          fi
+          echo "merge: $MERGE_RESULT; check exit code: ${CHECK_CODE:-not run}; test_report: ${TEST_REPORT:-false}"
+          if [ -n "$failed" ]; then echo "drift=true"; else echo "drift=false"; fi >> "$GITHUB_OUTPUT"
+          echo "failed_step=$failed" >> "$GITHUB_OUTPUT"
+
+      # One open issue with exactly this title. The REST list, not search, so
+      # an issue opened minutes ago is found; pull requests are left out.
+      - name: Open or update the upstream drift issue
+        id: report
+        if: steps.verdict.outputs.drift == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OURS: ${{ steps.fetch.outputs.ours }}
+          UPSTREAM: ${{ steps.fetch.outputs.upstream }}
+          FAILED_STEP: ${{ steps.verdict.outputs.failed_step }}
+        run: |
+          gh --version | head -n 1
+          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          body="$RUNNER_TEMP/body.md"
+          {
+            echo "### $(date -u +%F): $FAILED_STEP failed"
+            echo
+            echo "- **Upstream** \`HeliosSoftware/hfs\` \`main\`: [\`${UPSTREAM:0:9}\`](https://github.com/HeliosSoftware/hfs/commit/$UPSTREAM)"
+            echo "- **Ours** \`main\`: [\`${OURS:0:9}\`]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/commit/$OURS)"
+            echo "- **Run:** $run_url"
+            echo
+            if [ -s "$RUNNER_TEMP/conflicts.txt" ]; then
+              echo "Conflicted files:"
+              echo; echo '~~~~'; cat "$RUNNER_TEMP/conflicts.txt"; echo '~~~~'
+            elif [ -f "$RUNNER_TEMP/conflicts.txt" ]; then
+              echo "The merge failed without conflicted files. Last 50 lines of its output:"
+              echo; echo '~~~~'; tail -n 50 "$RUNNER_TEMP/merge.log"; echo '~~~~'
+            elif [ -s "$RUNNER_TEMP/check-tail.txt" ]; then
+              echo "Last 50 lines of \`cargo check -p helios-persistence --no-default-features --features cassandra,R4B\`:"
+              echo; echo '~~~~'; cat "$RUNNER_TEMP/check-tail.txt"; echo '~~~~'
+            fi
+          } > "$body"
+          issue=$(gh api --paginate "repos/$GITHUB_REPOSITORY/issues?state=open&per_page=100" \
+            --jq '.[] | select(.pull_request == null and .title == "upstream drift") | .number' | head -n 1)
+          if [ -n "$issue" ]; then
+            gh issue comment "$issue" --repo "$GITHUB_REPOSITORY" --body-file "$body"
+          else
+            url=$(gh issue create --repo "$GITHUB_REPOSITORY" --title "upstream drift" --body-file "$body")
+            issue=${url##*/}
+          fi
+          echo "issue=$issue" >> "$GITHUB_OUTPUT"
+
+      - name: Close the upstream drift issue if one is open
+        if: steps.verdict.outputs.drift == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM: ${{ steps.fetch.outputs.upstream }}
+        run: |
+          issue=$(gh api --paginate "repos/$GITHUB_REPOSITORY/issues?state=open&per_page=100" \
+            --jq '.[] | select(.pull_request == null and .title == "upstream drift") | .number' | head -n 1)
+          if [ -z "$issue" ]; then echo "No open upstream drift issue."; exit 0; fi
+          gh issue comment "$issue" --repo "$GITHUB_REPOSITORY" --body \
+            "Passing again on $(date -u +%F): upstream \`${UPSTREAM:0:9}\` merges cleanly and the check passes. $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          gh issue close "$issue" --repo "$GITHUB_REPOSITORY"
+
+      # The checkout is reused by the next job on this runner; leave no merge
+      # state and no canary branch behind.
+      - name: Remove the canary branch
+        if: always()
+        run: |
+          git merge --abort 2>/dev/null || true
+          git checkout -q --detach
+          git for-each-ref --format='%(refname:short)' 'refs/heads/canary/' | xargs -r git branch -D
+
+      - name: Fail the run on drift
+        if: steps.verdict.outputs.drift == 'true'
+        env:
+          FAILED_STEP: ${{ steps.verdict.outputs.failed_step }}
+          ISSUE: ${{ steps.report.outputs.issue }}
+        run: |
+          echo "::error::Upstream canary: $FAILED_STEP failed; see issue #$ISSUE"
+          exit 1

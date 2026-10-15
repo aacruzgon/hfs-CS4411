@@ -46,3 +46,4 @@ A choice between two or more workable designs; a change to a trait surface, tabl
 | [0002](2026-10-14/0002-persistent-target-dir-instead-of-rust-cache.md) | 2026-10-14 | CI keeps a bounded cargo target directory on the runner instead of using rust-cache | accepted |
 | [0003](2026-10-14/0003-fmt-clippy-cassandra-jobs.md) | 2026-10-14 | Item 0.5's fmt, clippy and Cassandra jobs, clippy split in two under a memory cap, and the weekly Docker prune | accepted |
 | [0004](2026-10-14/0004-rootless-docker-slirp4netns.md) | 2026-10-14 | gh-runner's rootless Docker uses slirp4netns with the builtin port driver, not pasta | accepted |
+| [0005](2026-10-15/0005-upstream-canary.md) | 2026-10-15 | The upstream canary merges upstream nightly, runs 0.4's check, and keeps one "upstream drift" issue | accepted |
