@@ -74,5 +74,12 @@
         - The workflow itself can only run once it is on `main`.
 - **Links:**
     - `.github/workflows/upstream-canary.yml`; PR #22, with CodeRabbit's security review and Alan's review.
+    - First runs on `main` (`e268d7d6d`), dispatched by hand on 2026-10-15:
+        - Run 38798726307: green; upstream `8aada6230` merged cleanly; cold check 62 s; no issue.
+        - Run 38799140457, with `test_report`: red; opened issue #23.
+        - Run 38799415655: green; commented "Passing again" on #23 and closed it.
+
+      No `canary/*` branch was pushed.
+    - The weekly sync is Alan's, every Sunday (`development-roadmap.md`, "Track upstream weekly").
     - `development-roadmap.md`: "Track upstream weekly", the Step 0 CI-order and "Upstream canary" bullets, row 0.11.
     - ADR-aacruzgon-0018; ADR-sam-michaels-0001, 0002.
