@@ -1,0 +1,99 @@
+# ADR-sam-michaels-0003: Item 0.5's fmt, clippy and Cassandra jobs, clippy's resource limits, and the weekly Docker prune
+
+- **Date:** 2026-10-14
+- **Status:** accepted
+- **Context:**
+    - Roadmap item 0.5 adds three jobs to the self-hosted runner:
+        - `cargo fmt --all -- --check`;
+        - the `CONTRIBUTING.md` clippy command with `-D warnings`;
+        - a job that starts the single-node Cassandra and applies the schema, until Step 2 adds `tests/cassandra_tests.rs`.
+    - Alan's checklist for 0.5 fixed several points, which this entry does not re-decide:
+        - the runner labels, fork guard, `contents: read`, SHA pins and `persist-credentials: false`;
+        - no `[skip ci]` (ADR-aacruzgon-0019);
+        - the clippy target directory `${{ runner.workspace }}/target/clippy` with a 30 GB cap (ADR-sam-michaels-0002);
+        - the Compose project `hfs-cassandra-ci` on host port 59142, cleaned up with `down -v` on CI's project only;
+        - a weekly prune of `gh-runner`'s Docker.
+    - Four questions were left open:
+        - how to lay out the jobs, whose names become required checks;
+        - how hard clippy may load the runner, which is also my desktop;
+        - how the Cassandra job applies and checks the schema;
+        - what the weekly prune removes, and when it runs.
+    - Testing on the rig made the second question concrete. My first local run of the clippy command used cargo's default 24 jobs while a test Cassandra was starting. The load average reached 37, the desktop became unusable, and the machine had to be rebooted. In the same window, `cqlsh` on the host timed out connecting to the healthy container even with a 30 s timeout. On an idle machine the same connection took 0.2 s.
+- **Decision:**
+    - **One workflow, `.github/workflows/fmt-clippy-cassandra.yml`, with three independent jobs:** `cargo fmt --check`, `cargo clippy (all features)` and `Cassandra schema (single node)`.
+        - None waits for another, so a failure in one still lets the others report.
+        - The runner has one executor, so they run one after another anyway.
+        - Under ADR-aacruzgon-0019 the job names become required-check names, so renaming one means changing the ruleset in the same change.
+    - **Clippy runs with `CARGO_BUILD_JOBS: 12` under `nice -n 10`:** half the rig's 24 threads, at low priority.
+    - **The runner service is capped at `MemoryMax=20G`, `MemorySwapMax=0`,** set in the systemd drop-in `/etc/systemd/system/actions.runner.aacruzgon-hfs-Cassandra-CS4411.sam-7900x.service.d/memory.conf`.
+        - Every CI step runs inside that service's cgroup, cargo and rustc included, so a memory spike kills the build instead of pushing the desktop into swap.
+        - `gh-runner`'s rootless Docker runs in its own user session (`user@1001.service`), so the Cassandra container is not under this cap. It has its own 3 GiB limit from `docker/cassandra`.
+    - **The Cassandra job:**
+        - removes any leftover `hfs-cassandra-ci` project first, because a cancelled run skips its clean-up;
+        - starts the container with `up -d --wait --wait-timeout 240`;
+        - applies the two `.cql` files with the runner's own `cqlsh` through the published host port, `127.0.0.1:59142`, not `docker compose exec`;
+        - checks that re-applying `schema.cql` prints nothing and that keyspace `helios` has exactly ten tables, the acceptance checks in `docs/Cassandra/schema/README.md`;
+        - prints the container's last 200 log lines on failure;
+        - always ends with `down -v` on `hfs-cassandra-ci`.
+    - **`runner-docker-prune.yml`** runs `docker system prune --force --volumes` against `gh-runner`'s rootless daemon:
+        - **When:** Saturdays at 20:00 UTC, which is 16:00 Eastern in summer time and 15:00 in winter (cron runs in UTC). The rig is usually on then. Manual dispatch is also available.
+        - **What goes:** stopped containers, unused networks, dangling images, build cache and anonymous volumes.
+        - **What stays:** tagged images, so the pinned `cassandra:5.0.9` image is not downloaded again every week.
+- **Alternatives considered:**
+    - **Three workflow files, or jobs chained with `needs:`:** lost. Separate files triplicate the trigger, concurrency and environment blocks. With `needs:`, a fmt failure would hide whether clippy and the schema pass.
+    - **Clippy at cargo's default of 24 jobs:** lost. It is what froze the rig.
+    - **Clippy at 8 jobs:** the setting actually measured (passed with no findings in 3 min 53 s, partly warm). The AI recommended it. I chose 12 instead for faster CI, with the memory cap as the backstop.
+    - **Clippy at 4 jobs:** lost. Gentler on the desktop, but slower than needed once the memory cap is in place.
+    - **No memory limit, or deferring one until a CI run had been measured:** lost. The AI recommended deferring. I chose to add the cap now, so the first CI runs are already protected.
+    - **`docker compose exec cassandra cqlsh` inside the container:** lost. The host's `cqlsh`, through the published port and rootless Docker's `pasta` networking, is the same path the backend and its tests will use. It is also why `cqlsh` was installed for `gh-runner` (roadmap Step 0).
+    - **Only applying the schema, with no checks:** lost. The two checks cost about a second and catch a statement that silently stops being idempotent, or a table that goes missing.
+    - **`docker system prune --all`:** lost. It would delete the pinned Cassandra image every week, costing a download on the next run, for no disk that matters on a 464 GB disk.
+    - **A nightly prune:** lost. The clutter comes from CI runs, at most a few a day, and a nightly run would mostly find nothing.
+    - **Other weekly times** (Mondays 10:00 Eastern, as first drafted; Sunday evening; a weekday evening): lost to Saturday afternoon, when my rig is usually on.
+- **Consequences:**
+    - **12 jobs is untested.** The measured peak at 8 jobs was one compiler process of about 12.8 GB. At 12 jobs, more heavy crates can compile at once, so the build may hit the 20 GB cap and be killed (exit 137, or an OOM line in the job log). If that happens, the fix is to go back to 8 jobs, the tested setting, not to raise the cap: a cap near the rig's 31 GB would no longer protect the desktop.
+    - **The cold clippy time has not been measured yet.** My local 3 min 53 s reused part of a build from an earlier run. The job's `timeout-minutes` is 90 until the first CI runs give real numbers.
+    - **The desktop stays usable during CI.** `nice` yields the CPU to me, and the cap bounds CI's memory at 20 of 31 GB.
+    - **A host `cqlsh` timeout under heavy load is a known false failure.** On the runner, jobs are serial, so clippy never runs during the Cassandra job. My own work on the desktop can still slow it. The `cqlsh` calls therefore use `--connect-timeout 30 --request-timeout 60`.
+    - **Each Cassandra run costs about 60 s of start-up,** with a fresh node and volume every time, so no state leaks between runs.
+    - **The prune only runs once merged.** Scheduled workflows run from the default branch, so the first run is the Saturday after merge, or a manual dispatch. In winter time it runs an hour earlier on the clock, because cron does not follow daylight saving.
+- **AI involvement:**
+    - **Tool and model:** Claude Code, Claude Opus 5.5.
+    - **What the AI proposed:**
+        - The single workflow with independent jobs.
+        - The job names.
+        - Limiting clippy (first 12 jobs, then 8 after measuring) under `nice`.
+        - Deferring a memory limit.
+        - Host `cqlsh` over `exec`, and the two schema checks.
+        - Removing leftovers before starting, and logs on failure.
+        - The prune policy, and a Monday 10:00 Eastern schedule.
+    - **What the human changed:**
+        - I reported that my computer became very slow during the AI's first local clippy run, which led to limiting clippy's jobs and priority.
+        - I held the pull request until I had reviewed this entry.
+        - I chose 12 jobs over the measured 8, for faster CI.
+        - I chose to add the 20 GB memory cap now instead of deferring it.
+        - I moved the prune to Saturday afternoon, when my rig is usually on.
+        - I approved the rest of the design as drafted: independent jobs, host `cqlsh` with the two schema checks, and the prune without `--all`.
+    - **What was verified and how:**
+        - **fmt:** `cargo fmt --all -- --check` passes on `main` at `51c99dd1f`.
+        - **clippy:** the exact `CONTRIBUTING.md` command with `CARGO_BUILD_JOBS=8 nice -n 10` passed with no warnings in 3 min 53 s. The largest child process used 12.8 GB, and the target directory was 7.6 GB. The figures come from `/usr/bin/time` and `du`.
+        - **The Cassandra job's run steps,** extracted from the workflow and run unchanged against my own Docker:
+            - leftovers removed;
+            - healthy after 59 s;
+            - both files applied;
+            - re-apply silent;
+            - the ten tables listed;
+            - `down -v` left no container or volume.
+
+          The first attempt failed because the table count included the header underline, so the parse was fixed. Separately, `cqlsh` exits 2 on a bad statement in both `-f` and `-e` modes, so a schema error fails the step. The leftover step exits 0 when there is nothing to remove.
+        - **Both workflows parse,** and `zizmor` 1.30.1 reports no findings for them or for `r4b-compile-check.yml`.
+        - **The memory cap:** `systemctl show` on the runner service after applying the drop-in reports `MemoryMax` and `MemorySwapMax` with the values above.
+        - **Still to check, on the pull request:**
+            - the three jobs on the runner itself, under rootless Docker;
+            - clippy at 12 jobs under the cap, with its cold time.
+- **Links:**
+    - Roadmap item 0.5 and Step 0.
+    - ADR-aacruzgon-0018 and 0019; ADR-sam-michaels-0001 and 0002.
+    - `.github/workflows/fmt-clippy-cassandra.yml` and `.github/workflows/runner-docker-prune.yml`.
+    - `docs/Cassandra/schema/README.md`.
+    - Pull request: _to be added._

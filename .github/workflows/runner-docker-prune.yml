@@ -1,0 +1,41 @@
+name: Runner Docker prune
+
+# Weekly clean-up of the self-hosted runner's own rootless Docker daemon
+# (ADR-sam-michaels-0001, ADR-sam-michaels-0002). The runner reaches it through
+# DOCKER_HOST in its .env, so this never touches any other user's Docker.
+# Scheduled workflows run from the default branch only.
+
+on:
+  schedule:
+    # Saturdays 20:00 UTC: 16:00 Eastern in summer time, 15:00 in winter
+    # (cron is UTC). Sam's rig is usually on then; a run queued while it is
+    # off waits up to 24 h for the runner (ADR-sam-michaels-0003).
+    - cron: "0 20 * * 6"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: runner-docker-prune
+  cancel-in-progress: false
+
+jobs:
+  prune:
+    name: docker system prune (gh-runner)
+    # Fork guard (ADR-aacruzgon-0018); schedule and dispatch always pass it.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, hfs-cassandra]
+    timeout-minutes: 15
+    steps:
+      # Without --all, tagged images such as the pinned cassandra image stay,
+      # so the next Cassandra job does not download it again. Stopped
+      # containers, unused networks, dangling images, build cache and
+      # anonymous volumes go. Jobs run one at a time on this runner, so no CI
+      # container is running while this does.
+      - name: docker system prune --force --volumes
+        run: |
+          echo "Daemon: ${DOCKER_HOST:-default}"
+          docker system df
+          docker system prune --force --volumes
+          docker system df
