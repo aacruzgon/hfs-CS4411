@@ -1,0 +1,66 @@
+# ADR-sam-michaels-0005: The upstream canary merges upstream nightly, runs 0.4's check, and keeps one "upstream drift" issue
+
+- **Date:** 2026-10-15
+- **Status:** accepted
+- **Context:**
+    - The roadmap's "Track upstream weekly" rule promises a nightly dry-run merge of upstream (`HeliosSoftware/hfs`) that opens an issue when the build breaks, so that a new required trait method is found the day it lands. Item 0.11 is that workflow.
+    - The roadmap disagreed with itself about what the canary builds:
+        - The Step 0 "Upstream canary" bullet said "`cargo check` on the workspace with the `cassandra` feature".
+        - The CI-order bullet said it "reuses 0.4's check".
+    - It runs on the self-hosted runner (ADR-sam-michaels-0001). That runner is also my desktop, so a scheduled run only starts while the rig is on.
+    - Upstream was 202 commits ahead of our `main` on 2026-10-15.
+- **Decision:**
+    - **What it checks: 0.4's check.** `.github/workflows/upstream-canary.yml` fetches upstream's `main` with no token, because it is public. It merges it into a local branch `canary/upstream-YYYY-MM-DD`, then runs `cargo check -p helios-persistence --no-default-features --features cassandra,R4B` on the merged tree. That is the required check every pull request must pass, so the canary predicts exactly what the weekly sync branch will meet. The roadmap's Step 0 bullet is corrected to say so.
+    - **When: daily at 02:00 UTC**, which is 22:00 Eastern the evening before in summer time and 21:00 in winter. My rig is usually on then. Plus `workflow_dispatch`, with a `test_report` checkbox. Triggers: no `push`, no `pull_request`, never `pull_request_target` or `workflow_run` (ADR-aacruzgon-0018).
+    - **Its own target directory, `target/upstream-canary`,** with the same reset step and 10 GB cap as 0.4 (ADR-sam-michaels-0002). Upstream's `Cargo.lock` differs from ours, so sharing `target/r4b-compile-check` would wipe that folder every night and leave the next pull request's required check cold.
+    - **One issue, titled exactly `upstream drift`:**
+        - **Merge conflict or failed check:** the run finds an open issue with that exact title, comments on it if there is one, and opens it if not. The text gives the date, upstream's and our commits, the failed step, the conflicted files or the check's last 50 lines, and the run link. The run then exits 1, so it shows red in the Actions tab.
+        - **First night that passes:** it comments "Passing again" with the run link and closes the issue.
+        - **Fetch failure:** fails the run but opens no issue, because that is the network, not drift.
+        - **Lookup:** through the REST issue list, not search, so an issue opened minutes earlier is still found. Pull requests are left out.
+    - **The merge is never pushed.** The checkout has `persist-credentials: false`, so the job has no credentials to push with. An `always()` step deletes every local `canary/*` branch, so the runner's checkout doesn't collect one a night.
+    - **Permissions:** `contents: read` for the workflow, `issues: write` on the job. `GH_TOKEN` is set only on the two steps that call `gh`.
+    - **`gh`, not `actions/github-script`.** `gh` 2.97.0 is installed system-wide at `/usr/bin/gh` with mode 755, so `gh-runner` can run it, and it means one less action to pin. The report step prints `gh --version`, so the first run that reports proves it.
+- **Alternatives considered:**
+    - **`cargo check` on the whole workspace with the `cassandra` feature:** lost.
+        - It builds `helios-fhir` and every crate that depends on it, each night, for code that only lives in `helios-persistence`.
+        - It is not the check pull requests are gated on, so a green night would not mean a green sync branch.
+        - The 0.4 check took 71 s cold on the merged tree.
+    - **Sharing `target/r4b-compile-check`:** lost, for the reason under the target-directory decision.
+    - **One issue per failing night:** lost. It would fill the tracker during a long drift. One issue with a comment per night keeps the history in one place.
+    - **Leaving the issue open for a person to close:** lost. Closing it automatically means the issue's state always shows whether the latest night passed.
+    - **`actions/github-script`:** lost. It is one more third-party action to pin, and `gh` is already on the runner.
+    - **14:00 UTC and 23:00 UTC:** lost to 02:00 UTC, which I picked. My rig is usually on at 02:00 UTC, and that time comes after most of a US working day of upstream commits.
+- **Consequences:**
+    - **Upstream breakage shows up within a day.** A conflict or a broken `cassandra,R4B` build appears as an open `upstream drift` issue. The weekly `sync/upstream-YYYY-MM-DD` merge then starts from a known state.
+    - **The rig must be on at 02:00 UTC.** A run queued while it is off or asleep waits up to 24 h and then expires. Making KDE's "When inactive" on AC power "Do nothing" fixes that, and is my call.
+    - **Not covered:** code outside `helios-persistence` with `cassandra,R4B`, such as REST or clippy changes, until the weekly sync branch runs the full CI.
+    - **`test_report` proves the issue path.** A manual run with the box ticked opens or updates the issue even when everything passes, and the next normal run closes it. That tests opening, commenting and closing before a real drift relies on them.
+    - **Another ~1.6 GB folder** under `target/` on the rig, within its 10 GB cap.
+    - **actionlint flags `runner.workspace`** as undefined, here and in the three existing workflows. GitHub doesn't document it, but the runner sets it, and every CI run so far has used it. It is kept for consistency.
+- **AI involvement:**
+    - **Tool and model:** Claude Code, Claude Opus 5.5.
+    - **What the AI proposed:**
+        - The plan and the workflow.
+        - The REST lookup instead of search.
+        - Closing the issue automatically.
+        - The `test_report` input.
+        - The clean-up step.
+        - Checking for `gh` from the file's permissions instead of with `sudo`.
+    - **What the human changed:**
+        - I picked 02:00 UTC over the suggested 23:00 UTC.
+        - I chose to keep `test_report`.
+        - The 0.11 task list I worked from already settled the 0.4 check over the workspace check, the separate target directory and the issue rules; the AI implemented them.
+    - **What was verified and how, on the rig, as me, in a separate worktree of `origin/main` (`f256e091c`):**
+        - Fetching upstream (`8aada6230`, 202 commits ahead) with no token.
+        - Merging it on a `canary/` branch: clean.
+        - The 0.4 check on the merged tree: passed, 71 s cold, 1.6 GB.
+        - The report text for a conflict and for a failed check, generated from the workflow's own script.
+        - The issue lookup against the repository: no open issue.
+        - The clean-up step: left no `canary/*` branch.
+        - `actionlint` 1.7.12 with `shellcheck` 0.11.0: clean except the `runner.workspace` note.
+        - The workflow itself can only run once it is on `main`.
+- **Links:**
+    - `.github/workflows/upstream-canary.yml`; pull request to follow.
+    - `development-roadmap.md`: "Track upstream weekly", the Step 0 CI-order and "Upstream canary" bullets, row 0.11.
+    - ADR-aacruzgon-0018; ADR-sam-michaels-0001, 0002.
