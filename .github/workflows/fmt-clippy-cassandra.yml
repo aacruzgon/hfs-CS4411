@@ -1,8 +1,8 @@
 name: fmt, clippy and Cassandra schema
 
-# Roadmap item 0.5: three jobs on the team's self-hosted runner
-# (ADR-aacruzgon-0018, ADR-sam-michaels-0001): rustfmt, the CONTRIBUTING.md
-# clippy command, and a single-node Cassandra that the schema is applied to.
+# Roadmap item 0.5 on the team's self-hosted runner (ADR-aacruzgon-0018,
+# ADR-sam-michaels-0001): rustfmt, the CONTRIBUTING.md clippy command split
+# into two jobs, and a single-node Cassandra that the schema is applied to.
 # The runner has one executor, so the jobs run one after another.
 
 on:
@@ -52,12 +52,20 @@ jobs:
       - name: cargo fmt --all -- --check
         run: cargo fmt --all -- --check
 
-  clippy:
-    name: cargo clippy (all features)
+  # Clippy is the CONTRIBUTING.md command split in two (ADR-sam-michaels-0003).
+  # With --all-features, helios-fhir holds all four FHIR versions, and its lib
+  # and lib-test units need about 12.8 GB each. In one command cargo builds
+  # them side by side, past the runner service's MemoryMax=20G. So helios-fhir
+  # is checked alone, one unit at a time, and the rest of the workspace after
+  # it, with helios-fhir only as a dependency. Together the two jobs lint the
+  # same crates and targets as the CONTRIBUTING.md command, with the same lint
+  # flags, at low priority because the runner is also Sam's desktop.
+  clippy-fhir:
+    name: cargo clippy (helios-fhir)
     # Fork guard (ADR-aacruzgon-0018).
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, hfs-cassandra]
-    timeout-minutes: 90
+    timeout-minutes: 60
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -71,8 +79,8 @@ jobs:
           components: clippy
 
       # Same bounded, persistent target directory as r4b-compile-check.yml
-      # (ADR-sam-michaels-0002), with its own folder and the ~30 GB cap that
-      # ADR records for this job.
+      # (ADR-sam-michaels-0002). Both clippy jobs share it, under the ~30 GB
+      # cap that ADR records for clippy; they never run at the same time.
       - name: Reset the target dir if it is stale or over its cap
         env:
           TARGET_DIR: ${{ runner.workspace }}/target/clippy
@@ -87,18 +95,11 @@ jobs:
           mkdir -p "$TARGET_DIR" && echo "$stamp" > "$TARGET_DIR/.stamp"
           echo "CARGO_TARGET_DIR=$TARGET_DIR" >> "$GITHUB_ENV"
 
-      # The exact command from CONTRIBUTING.md, at low priority, because the
-      # runner is also Sam's desktop (31 GB) and its service is capped at
-      # MemoryMax=20G (ADR-sam-michaels-0003). helios-fhir's lib and lib-test
-      # units need about 12.8 GB each, and cargo builds them side by side, so
-      # a cold build at 8 jobs is killed at the cap. The retry runs the same
-      # command at 1 job: everything already built is reused, and the
-      # remaining units, those two included, build one at a time. A real lint
-      # error fails both attempts.
-      - name: cargo clippy --all-targets --all-features -- -D warnings (CONTRIBUTING.md)
+      - name: cargo clippy -p helios-fhir --all-targets --all-features, one job at a time
+        env:
+          CARGO_BUILD_JOBS: 1
         run: |
-          clippy() {
-            CARGO_BUILD_JOBS="$1" nice -n 10 cargo clippy --all-targets --all-features -- -D warnings \
+          nice -n 10 cargo clippy -p helios-fhir --all-targets --all-features -- -D warnings \
               -A clippy::items_after_test_module \
               -A clippy::large_enum_variant \
               -A clippy::question_mark \
@@ -107,11 +108,65 @@ jobs:
               -A clippy::field_reassign_with_default \
               -A clippy::doc-overindented-list-items \
               -A clippy::doc-lazy-continuation
-          }
-          if ! clippy 8; then
-            echo "::warning::clippy failed at 8 jobs; retrying at 1 job. On a cold build this is the expected memory-cap kill of helios-fhir's two units (ADR-sam-michaels-0003)."
-            clippy 1
+
+  clippy-workspace:
+    name: cargo clippy (workspace)
+    # Runs only after helios-fhir passes: the order is what keeps the two
+    # 12.8 GB helios-fhir units apart. If clippy-fhir fails, this job is
+    # skipped, so both job names must be required checks (ADR-aacruzgon-0019).
+    needs: clippy-fhir
+    # Fork guard (ADR-aacruzgon-0018).
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, hfs-cassandra]
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master, 2026-10-09
+        with:
+          toolchain: stable
+          components: clippy
+
+      # Same bounded, persistent target directory as r4b-compile-check.yml
+      # (ADR-sam-michaels-0002). Both clippy jobs share it, under the ~30 GB
+      # cap that ADR records for clippy; they never run at the same time.
+      - name: Reset the target dir if it is stale or over its cap
+        env:
+          TARGET_DIR: ${{ runner.workspace }}/target/clippy
+          CAP_GB: 30
+        run: |
+          stamp="$(rustc -V) $(sha256sum Cargo.lock | cut -c1-16)"
+          size_gb=$(du -s --block-size=1G "$TARGET_DIR" 2>/dev/null | cut -f1)
+          if [ "$(cat "$TARGET_DIR/.stamp" 2>/dev/null)" != "$stamp" ] || [ "${size_gb:-0}" -gt "$CAP_GB" ]; then
+            echo "Resetting $TARGET_DIR (size ${size_gb:-0} GB, cap $CAP_GB GB, stamp: $stamp)"
+            rm -rf "$TARGET_DIR"
           fi
+          mkdir -p "$TARGET_DIR" && echo "$stamp" > "$TARGET_DIR/.stamp"
+          echo "CARGO_TARGET_DIR=$TARGET_DIR" >> "$GITHUB_ENV"
+
+      # helios-fhir is built here once, as a dependency, never its test target.
+      # helios-fhir/skip-r6-download gives it the same features as the
+      # CONTRIBUTING.md command (R4, R4B, R5, R6, xml, skip-r6-download);
+      # without it, helios-fhir's build script downloads R6 examples from
+      # build.fhir.org, because an excluded package gets no --all-features.
+      - name: cargo clippy --workspace --exclude helios-fhir --all-targets --all-features
+        env:
+          CARGO_BUILD_JOBS: 8
+        run: |
+          nice -n 10 cargo clippy --workspace --exclude helios-fhir --all-targets --all-features \
+            --features helios-fhir/skip-r6-download -- -D warnings \
+              -A clippy::items_after_test_module \
+              -A clippy::large_enum_variant \
+              -A clippy::question_mark \
+              -A clippy::collapsible_match \
+              -A clippy::collapsible_if \
+              -A clippy::field_reassign_with_default \
+              -A clippy::doc-overindented-list-items \
+              -A clippy::doc-lazy-continuation
 
   cassandra:
     name: Cassandra schema (single node)
